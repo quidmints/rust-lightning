@@ -47,10 +47,10 @@ use crate::chain::{BestBlock, WatchedOutput};
 use crate::events::bump_transaction::{AnchorDescriptor, BumpTransactionEvent};
 use crate::events::{ClosureReason, Event, EventHandler, PaidBolt12Invoice, ReplayEvent};
 use crate::ln::chan_utils::{
-	self, ChannelTransactionParameters, CommitmentTransaction, CounterpartyCommitmentSecrets,
-	HTLCClaim, HTLCOutputInCommitment, HolderCommitmentTransaction,
+	self, commit_tx_fee_sat, ChannelTransactionParameters, CommitmentTransaction,
+	CounterpartyCommitmentSecrets, HTLCClaim, HTLCOutputInCommitment, HolderCommitmentTransaction,
 };
-use crate::ln::channel::INITIAL_COMMITMENT_NUMBER;
+use crate::ln::channel::{ANCHOR_OUTPUT_VALUE_SATOSHI, INITIAL_COMMITMENT_NUMBER};
 use crate::ln::channel_keys::{
 	DelayedPaymentBasepoint, DelayedPaymentKey, HtlcBasepoint, HtlcKey, RevocationBasepoint,
 	RevocationKey,
@@ -825,6 +825,28 @@ pub struct HolderCommitmentTransactionBalance {
 	/// transaction fee) this value will be zero. For [`ChannelMonitor`]s created prior to LDK
 	/// 0.0.124, the channel is always treated as outbound (and thus this value is never zero).
 	pub transaction_fee_satoshis: u64,
+	/// Our balance lost to dust on inbound channels. When our output is below the dust limit
+	/// (354 sats), it is omitted from the commitment transaction. This reconstructs what that
+	/// output would have been. Only nonzero for inbound channels (where `transaction_fee_satoshis`
+	/// is 0), since the outbound party's dust is already captured in `transaction_fee_satoshis`.
+	///
+	/// The caller can compute an intuitive display balance as:
+	/// `amount_satoshis + transaction_fee_satoshis + our_inbound_dust_loss_satoshis - their_inbound_dust_loss_satoshis`
+	///
+	/// May be off by ~1-5 sats due to msat rounding.
+	///
+	/// NOTE(phlip9): added to the Lexe fork @ ldk-v0.2.2 2026-05-28
+	pub our_inbound_dust_loss_satoshis: u64,
+	/// The counterparty's balance lost to dust on our outbound channels. When their output is
+	/// below the dust limit (354 sats), it is omitted from the commitment transaction and
+	/// absorbed into [`Self::transaction_fee_satoshis`]. This reconstructs what their output
+	/// would have been, so the caller can subtract it from the display balance. Only nonzero for
+	/// outbound channels.
+	///
+	/// May be off by ~1-5 sats due to msat rounding.
+	///
+	/// NOTE(phlip9): added to the Lexe fork @ ldk-v0.2.2 2026-05-28
+	pub their_inbound_dust_loss_satoshis: u64,
 }
 
 /// Details about the balance(s) available for spending once the channel appears on chain.
@@ -3228,9 +3250,66 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 					} else {
 						0
 					};
+
+					let amount_satoshis = to_self_value_sat + claimable_inbound_htlc_value_sat;
+
+					// NOTE(phlip9): these two fields are different from upstream LDK.
+					//
+					// If the inbound side's output is below the dust limit, it's omitted from the
+					// commitment tx. Reconstruct the pre-dust value so the caller can include it
+					// in the display balance:
+					//
+					//   display = amount + fee + our_inbound_dust - their_inbound_dust
+					//
+					// - our_inbound_dust: only for inbound channels (fee = 0).
+					// - their_inbound_dust: only for outbound channels (fee absorbs
+					//   their dust, so we report it for subtraction).
+					//
+					// May be off by ~1-5 sats due to msat rounding.
+					let to_remote_value_sat = funding.current_holder_commitment_tx.to_countersignatory_value_sat();
+					let (our_inbound_dust_loss_satoshis, their_inbound_dust_loss_satoshis) =
+					if to_self_value_sat > 0 && to_remote_value_sat > 0 {
+						// Skip extra work below if both parties have outputs
+						(0, 0)
+					} else {
+						let holder_pays = us.holder_pays_commitment_tx_fee.unwrap_or(true);
+						let commitment_tx = &funding.current_holder_commitment_tx;
+						let channel_type = &funding.channel_parameters.channel_type_features;
+						let channel_value = funding.channel_parameters.channel_value_satoshis;
+						let fee = commit_tx_fee_sat(
+							commitment_tx.negotiated_feerate_per_kw(),
+							commitment_tx.nondust_htlcs().len(),
+							channel_type,
+						);
+						let anchor_cost = if channel_type.supports_anchors_zero_fee_htlc_tx() {
+							2 * ANCHOR_OUTPUT_VALUE_SATOSHI
+						} else {
+							0
+						};
+						let nondust_htlc_value: u64 = commitment_tx.nondust_htlcs()
+							.iter().map(|h| h.amount_msat / 1000).sum();
+						let fixed_costs = fee + anchor_cost + nondust_htlc_value;
+
+						let our_dust = if !holder_pays && to_self_value_sat == 0 {
+							channel_value.saturating_sub(to_remote_value_sat + fixed_costs)
+						} else { 0 };
+
+						let their_dust = if holder_pays && to_remote_value_sat == 0 {
+							let pre_dust = channel_value.saturating_sub(to_self_value_sat + fixed_costs);
+							// Cap at transaction_fee: for P2A channels the shared anchor
+							// captures some dust on-chain, so less ends up in transaction_fee
+							// than the full pre-dust balance.
+							core::cmp::min(pre_dust, transaction_fee_satoshis)
+						} else { 0 };
+
+						(our_dust, their_dust)
+					};
+
 					HolderCommitmentTransactionBalance {
-						amount_satoshis: to_self_value_sat + claimable_inbound_htlc_value_sat,
+						amount_satoshis,
 						transaction_fee_satoshis,
+						our_inbound_dust_loss_satoshis,
+						their_inbound_dust_loss_satoshis,
 					}
 				})
 				.collect::<Vec<_>>();

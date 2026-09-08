@@ -237,7 +237,7 @@ where
 		#[cfg(feature = "dnssec")]
 		{
 			let updated_time = timestamp.load(Ordering::Acquire) as u32;
-			self.hrn_resolver.new_best_block(_height, updated_time);
+			self.hrn_resolver.new_best_block(height, updated_time);
 		}
 	}
 }

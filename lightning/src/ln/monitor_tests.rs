@@ -339,6 +339,8 @@ fn do_chanmon_claim_value_coop_close(keyed_anchors: bool, p2a_anchor: bool) {
 			balance_candidates: vec![HolderCommitmentTransactionBalance {
 				amount_satoshis: 1_000_000 - 1_000 - commitment_tx_fee - anchor_outputs_value,
 				transaction_fee_satoshis: commitment_tx_fee,
+				our_inbound_dust_loss_satoshis: 0,
+				their_inbound_dust_loss_satoshis: 0,
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 0,
@@ -351,6 +353,8 @@ fn do_chanmon_claim_value_coop_close(keyed_anchors: bool, p2a_anchor: bool) {
 			balance_candidates: vec![HolderCommitmentTransactionBalance {
 				amount_satoshis: 1_000,
 				transaction_fee_satoshis: 0,
+				our_inbound_dust_loss_satoshis: 0,
+				their_inbound_dust_loss_satoshis: 0,
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 0,
@@ -434,10 +438,173 @@ fn do_chanmon_claim_value_coop_close(keyed_anchors: bool, p2a_anchor: bool) {
 }
 
 #[test]
-fn chanmon_claim_value_coop_close() {
+fn chanmon_claim_value_coop_close1() {
 	do_chanmon_claim_value_coop_close(false, false);
+}
+#[test]
+fn chanmon_claim_value_coop_close2() {
 	do_chanmon_claim_value_coop_close(true, false);
+}
+#[test]
+fn chanmon_claim_value_coop_close3() {
 	do_chanmon_claim_value_coop_close(false, true);
+}
+
+fn do_test_chanmon_dust_loss(
+	keyed_anchors: bool, p2a_anchor: bool, channel_value: u64, push_sats: u64,
+) {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut user_config = test_default_channel_config();
+	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = keyed_anchors;
+	user_config.channel_handshake_config.negotiate_anchor_zero_fee_commitments = p2a_anchor;
+	user_config.manually_accept_inbound_channels = keyed_anchors || p2a_anchor;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(user_config.clone()), Some(user_config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let push_msat = push_sats * 1000;
+	let (_, _, chan_id, funding_tx) =
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, channel_value, push_msat);
+	let funding_outpoint = OutPoint { txid: funding_tx.compute_txid(), index: 0 };
+	assert_eq!(ChannelId::v1_from_funding_outpoint(funding_outpoint), chan_id);
+
+	let chan_feerate = get_feerate!(nodes[0], nodes[1], chan_id) as u64;
+	let channel_type_features = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	let commit_fee = chan_feerate * chan_utils::commitment_tx_base_weight(&channel_type_features) / 1000;
+	let dust_limit = channel::MIN_CHAN_DUST_LIMIT_SATOSHIS;
+
+	// Funder (node 0) pays the commitment fee and keyed anchor cost.
+	let anchor_cost = if keyed_anchors { 2 * channel::ANCHOR_OUTPUT_VALUE_SATOSHI } else { 0 };
+
+	let node0_balance = channel_value - push_sats;
+	let node1_balance = push_sats;
+
+	// Node 0 (outbound): output = balance - fee - anchors, then dust check
+	let node0_pre_dust = node0_balance.saturating_sub(anchor_cost + commit_fee);
+	let node0_is_dust = node0_pre_dust < dust_limit;
+	let node0_output = if node0_is_dust { 0 } else { node0_pre_dust };
+
+	// Node 1 (inbound): output = balance (no fee deduction), then dust check
+	let node1_is_dust = node1_balance < dust_limit;
+	let node1_output = if node1_is_dust { 0 } else { node1_balance };
+
+	// On-chain anchor outputs (same total value on both commitments)
+	let keyed_anchors_on_chain = if keyed_anchors {
+		let a = channel::ANCHOR_OUTPUT_VALUE_SATOSHI;
+		(if node0_output > 0 { a } else { 0 }) + (if node1_output > 0 { a } else { 0 })
+	} else { 0 };
+	let p2a_anchor_on_chain = if p2a_anchor {
+		let trimmed = channel_value - node0_output - node1_output;
+		core::cmp::min(chan_utils::P2A_MAX_VALUE, trimmed)
+	} else { 0 };
+	let output_value = node0_output + node1_output + keyed_anchors_on_chain + p2a_anchor_on_chain;
+	let total_unaccounted = channel_value - output_value;
+
+	// For outbound channels, transaction_fee_satoshis absorbs everything
+	// not in outputs (fee + our dust + their dust + elided anchors).
+	// For display: amount + fee + our_dust - their_dust = our true balance.
+	//
+	// our_dust is only set for inbound (where fee = 0).
+	// their_dust is only set for outbound (where fee absorbs their dust).
+	// Node 0 (outbound): their_dust is capped at transaction_fee to handle
+	// P2A channels where the shared anchor captures some dust value on-chain.
+	let node0_their_dust = if node1_is_dust {
+		core::cmp::min(node1_balance, total_unaccounted)
+	} else { 0 };
+
+	assert_eq!(vec![Balance::ClaimableOnChannelClose {
+			balance_candidates: vec![HolderCommitmentTransactionBalance {
+				amount_satoshis: node0_output,
+				transaction_fee_satoshis: total_unaccounted,
+				our_inbound_dust_loss_satoshis: 0,
+				their_inbound_dust_loss_satoshis: node0_their_dust,
+			}],
+			confirmed_balance_candidate_index: 0,
+			outbound_payment_htlc_rounded_msat: 0,
+			outbound_forwarded_htlc_rounded_msat: 0,
+			inbound_claiming_htlc_rounded_msat: 0,
+			inbound_htlc_rounded_msat: 0,
+		}],
+		nodes[0].chain_monitor.chain_monitor.get_monitor(chan_id).unwrap().get_claimable_balances());
+
+	// Node 1 (inbound): our_dust is their full balance (the reconstruction
+	// gives this for all channel types).
+	let node1_our_dust = if node1_is_dust { node1_balance } else { 0 };
+
+	assert_eq!(vec![Balance::ClaimableOnChannelClose {
+			balance_candidates: vec![HolderCommitmentTransactionBalance {
+				amount_satoshis: node1_output,
+				transaction_fee_satoshis: 0,
+				our_inbound_dust_loss_satoshis: node1_our_dust,
+				their_inbound_dust_loss_satoshis: 0,
+			}],
+			confirmed_balance_candidate_index: 0,
+			outbound_payment_htlc_rounded_msat: 0,
+			outbound_forwarded_htlc_rounded_msat: 0,
+			inbound_claiming_htlc_rounded_msat: 0,
+			inbound_htlc_rounded_msat: 0,
+		}],
+		nodes[1].chain_monitor.chain_monitor.get_monitor(chan_id).unwrap().get_claimable_balances());
+
+	// Verify display = amount + fee + our_dust - their_dust ≈ our balance.
+	// For keyed anchors the display is reduced by the on-chain anchor value
+	// since those outputs are funded by the outbound party but tracked
+	// separately from amount_satoshis.
+	let node0_display = node0_output + total_unaccounted - node0_their_dust;
+	assert_eq!(node0_display, node0_balance - keyed_anchors_on_chain,
+		"node0 display (cv={channel_value}, push={push_sats})");
+
+	let node1_display = node1_output + node1_our_dust;
+	assert_eq!(node1_display, node1_balance,
+		"node1 display (cv={channel_value}, push={push_sats})");
+}
+
+// Inbound party (node 1) near dust, non-anchor
+#[test]
+fn test_chanmon_dust_loss1() {
+	for push_sats in [1, 9, 99, 251, 253, 254, 255, 300, 500, 999] {
+		do_test_chanmon_dust_loss(false, false, 1_000_000, push_sats);
+	}
+}
+// Inbound party near dust, keyed anchors
+#[test]
+fn test_chanmon_dust_loss2() {
+	for push_sats in [1, 9, 99, 251, 253, 254, 255, 300, 500, 999] {
+		do_test_chanmon_dust_loss(true, false, 1_000_000, push_sats);
+	}
+}
+// Inbound party near dust, P2A anchors
+#[test]
+fn test_chanmon_dust_loss3() {
+	for push_sats in [1, 9, 99, 251, 253, 254, 255, 300, 500, 999] {
+		do_test_chanmon_dust_loss(false, true, 1_000_000, push_sats);
+	}
+}
+// Outbound party (node 0) with small balance, keyed anchors.
+// The outbound party can never actually be dust at channel open due to
+// reserve + 4-HTLC fee requirements, but we verify the balance formula
+// holds for small outbound balances.
+// fee = 284, anchor_cost = 660, reserve = 1000
+// min node0_balance = 2118 -> node0_output = 2118 - 944 = 1174
+#[test]
+fn test_chanmon_dust_loss4() {
+	for push_sats in [95_000, 96_000, 97_000, 97_500, 97_882] {
+		do_test_chanmon_dust_loss(true, false, 100_000, push_sats);
+	}
+}
+// Outbound party with small balance, non-anchor.
+#[test]
+fn test_chanmon_dust_loss5() {
+	for push_sats in [97_000, 98_000, 98_500, 98_643, 99_999] {
+		do_test_chanmon_dust_loss(false, false, 100_000, push_sats);
+	}
+}
+// Outbound party with small balance, P2A.
+#[test]
+fn test_chanmon_dust_loss6() {
+	for push_sats in [97_000, 98_000, 98_500, 99_000, 99_999] {
+		do_test_chanmon_dust_loss(false, true, 100_000, push_sats);
+	}
 }
 
 fn sorted_vec<T: Ord>(mut v: Vec<T>) -> Vec<T> {
@@ -543,6 +710,8 @@ fn do_test_claim_value_force_close(keyed_anchors: bool, p2a_anchor: bool, prev_c
 				amount_satoshis,
 				// In addition to `commitment_tx_fee`, this also includes the dust HTLC, and the total msat amount rounded down from non-dust HTLCs
 				transaction_fee_satoshis: if p2a_anchor { 0 } else { 1_000_000 - 4_000 - 3_000 - 1_000 - amount_satoshis - anchor_outputs_value },
+				our_inbound_dust_loss_satoshis: 0,
+				their_inbound_dust_loss_satoshis: 0,
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 3300,
@@ -555,6 +724,8 @@ fn do_test_claim_value_force_close(keyed_anchors: bool, p2a_anchor: bool, prev_c
 			balance_candidates: vec![HolderCommitmentTransactionBalance {
 				amount_satoshis: 1_000,
 				transaction_fee_satoshis: 0,
+				our_inbound_dust_loss_satoshis: 0,
+				their_inbound_dust_loss_satoshis: 0,
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 0,
@@ -613,6 +784,8 @@ fn do_test_claim_value_force_close(keyed_anchors: bool, p2a_anchor: bool, prev_c
 				amount_satoshis, // Channel funding value in satoshis
 				// In addition to `commitment_tx_fee`, this also includes the dust HTLC, and the total msat amount rounded down from non-dust HTLCs
 				transaction_fee_satoshis: if p2a_anchor { 0 } else { 1_000_000 - 4_000 - 3_000 - 1_000 - amount_satoshis - anchor_outputs_value },
+				our_inbound_dust_loss_satoshis: 0,
+				their_inbound_dust_loss_satoshis: 0,
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 3000 + if prev_commitment_tx {
@@ -630,6 +803,8 @@ fn do_test_claim_value_force_close(keyed_anchors: bool, p2a_anchor: bool, prev_c
 			balance_candidates: vec![HolderCommitmentTransactionBalance {
 				amount_satoshis: 1_000 + 3_000 + 4_000,
 				transaction_fee_satoshis: 0,
+				our_inbound_dust_loss_satoshis: 0,
+				their_inbound_dust_loss_satoshis: 0,
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 0,
@@ -1169,6 +1344,8 @@ fn test_no_preimage_inbound_htlc_balances() {
 			balance_candidates: vec![HolderCommitmentTransactionBalance {
 				amount_satoshis: 1_000_000 - 500_000 - 10_000 - commitment_tx_fee,
 				transaction_fee_satoshis: commitment_tx_fee,
+				our_inbound_dust_loss_satoshis: 0,
+				their_inbound_dust_loss_satoshis: 0,
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 0,
@@ -1182,6 +1359,8 @@ fn test_no_preimage_inbound_htlc_balances() {
 			balance_candidates: vec![HolderCommitmentTransactionBalance {
 				amount_satoshis: 500_000 - 20_000,
 				transaction_fee_satoshis: 0,
+				our_inbound_dust_loss_satoshis: 0,
+				their_inbound_dust_loss_satoshis: 0,
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 0,
@@ -1481,6 +1660,8 @@ fn do_test_revoked_counterparty_commitment_balances(keyed_anchors: bool, p2a_anc
 				balance_candidates: vec![HolderCommitmentTransactionBalance {
 					amount_satoshis: 100_000 - 5_000 - 4_000 - 3 - 2_000 + 3_000 - 1 /* rounded up msat parts of HTLCs */,
 					transaction_fee_satoshis: 0,
+					our_inbound_dust_loss_satoshis: 0,
+				their_inbound_dust_loss_satoshis: 0,
 				}],
 				confirmed_balance_candidate_index: 0,
 				outbound_payment_htlc_rounded_msat: 3200,
@@ -2027,6 +2208,8 @@ fn do_test_revoked_counterparty_aggregated_claims(keyed_anchors: bool, p2a_ancho
 			balance_candidates: vec![HolderCommitmentTransactionBalance {
 				amount_satoshis: 100_000 - 4_000 - 3_000 - 1 /* rounded up msat parts of HTLCs */,
 				transaction_fee_satoshis: 0,
+				our_inbound_dust_loss_satoshis: 0,
+				their_inbound_dust_loss_satoshis: 0,
 			}],
 			confirmed_balance_candidate_index: 0,
 			outbound_payment_htlc_rounded_msat: 100,

@@ -1667,9 +1667,19 @@ where
 	fn read<R: io::Read>(reader: &mut R, logger: L) -> Result<NetworkGraph<L>, DecodeError> {
 		let _ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
 
+		const MAX_CHAN_COUNT_LIMIT: usize = 100_000_000;
+		const MAX_NODE_COUNT_LIMIT: usize = 10_000_000;
+
 		let chain_hash: ChainHash = Readable::read(reader)?;
 		let channels_count: u64 = Readable::read(reader)?;
-		let mut channels = IndexedMap::with_capacity(CHAN_COUNT_ESTIMATE);
+		// Pre-allocate + 2% of the known channel count to avoid unnecessary
+		// reallocations, but (hopefully) stay below next big HashMap threshold
+		// (cap=57345 -> buckets=131072).
+		let channels_map_capacity = (channels_count as u128 * 102 / 100)
+			.try_into()
+			.map(|v: usize| v.min(MAX_CHAN_COUNT_LIMIT))
+			.map_err(|_| DecodeError::InvalidValue)?;
+		let mut channels = IndexedMap::with_capacity(channels_map_capacity);
 		for _ in 0..channels_count {
 			let chan_id: u64 = Readable::read(reader)?;
 			let chan_info: ChannelInfo = Readable::read(reader)?;
@@ -1681,7 +1691,12 @@ where
 		if nodes_count > u32::max_value() as u64 / 2 {
 			return Err(DecodeError::InvalidValue);
 		}
-		let mut nodes = IndexedMap::with_capacity(NODE_COUNT_ESTIMATE);
+		// Pre-allocate + 2% of the known nodes count to avoid unnecessary reallocations.
+		let nodes_map_capacity: usize = (nodes_count as u128 * 102 / 100)
+			.try_into()
+			.map(|v: usize| v.min(MAX_NODE_COUNT_LIMIT))
+			.map_err(|_| DecodeError::InvalidValue)?;
+		let mut nodes = IndexedMap::with_capacity(nodes_map_capacity);
 		for i in 0..nodes_count {
 			let node_id = Readable::read(reader)?;
 			let mut node_info: NodeInfo = Readable::read(reader)?;
@@ -1757,14 +1772,42 @@ where
 	}
 }
 
-// In Jan, 2025 there were about 49K channels.
-// We over-allocate by a bit because 20% more is better than the double we get if we're slightly
-// too low
-const CHAN_COUNT_ESTIMATE: usize = 60_000;
-// In Jan, 2025 there were about 15K nodes
-// We over-allocate by a bit because 33% more is better than the double we get if we're slightly
-// too low
-const NODE_COUNT_ESTIMATE: usize = 20_000;
+// NOTE(phlip9): useful sizes for reference (as of 2026-07-21)
+//
+// ChannelInfo: size=1024 align=128
+// ChannelUpdateInfo: size=192 align=32
+// NodeInfo: size=264 align=8
+// NodeAnnouncementInfo: size=232 align=8
+// NodeAnnouncementDetails: size=88 align=8
+// ChannelAnnouncement: size=480 align=8
+// UnsignedChannelAnnouncement: size=224 align=8
+// ChannelUpdate: size=160 align=8
+// UnsignedChannelUpdate: size=96 align=8
+// NodeAnnouncement: size=232 align=8
+// UnsignedNodeAnnouncement: size=168 align=8
+// NodeId: size=33 align=1
+//
+// (u64, ChannelInfo) size=1152
+// (NodeId, NodeInfo) size=304
+
+/// In July, 2026 there were about 53K channels.
+//
+// NOTE(phlip9): I'm intentionally choosing a value below the HashMap buckets
+// growth boundary to save memory.
+//
+// HashMap::with_capacity(cap) -> actual # buckets
+// adjusted_cap := (cap * 8) / 7
+// buckets := adjusted_cap.next_power_of_two()
+//
+// - cap=57000 -> adjusted_cap=65142 -> buckets=65536
+// - cap=58000 -> adjusted_cap=66285 -> buckets=131072
+pub const CHAN_COUNT_ESTIMATE: usize = 57_000;
+/// In July, 2026 there were about 17K nodes
+//
+// NOTE(phlip9): the estimate here doesn't matter as much, both because NodeInfo
+// is smaller and all values between ~15K->28K get the same # of HashMap buckets
+// (32768 buckets).
+pub const NODE_COUNT_ESTIMATE: usize = 20_000;
 
 impl<L: Deref> NetworkGraph<L>
 where
@@ -1772,12 +1815,18 @@ where
 {
 	/// Creates a new, empty, network graph.
 	pub fn new(network: Network, logger: L) -> NetworkGraph<L> {
+		let (node_map_cap, chan_map_cap) = if matches!(network, Network::Bitcoin) {
+			(NODE_COUNT_ESTIMATE, CHAN_COUNT_ESTIMATE)
+		} else {
+			(0, 0)
+		};
+
 		Self {
 			secp_ctx: Secp256k1::verification_only(),
 			chain_hash: ChainHash::using_genesis_block(network),
 			logger,
-			channels: RwLock::new(IndexedMap::with_capacity(CHAN_COUNT_ESTIMATE)),
-			nodes: RwLock::new(IndexedMap::with_capacity(NODE_COUNT_ESTIMATE)),
+			channels: RwLock::new(IndexedMap::with_capacity(chan_map_cap)),
+			nodes: RwLock::new(IndexedMap::with_capacity(node_map_cap)),
 			next_node_counter: AtomicUsize::new(0),
 			removed_node_counters: Mutex::new(Vec::new()),
 			last_rapid_gossip_sync_timestamp: Mutex::new(None),

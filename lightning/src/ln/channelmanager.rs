@@ -1280,6 +1280,11 @@ enum BackgroundEvent {
 		channel_id: ChannelId,
 		highest_update_id_completed: u64,
 	},
+	/// A channel had blocked monitor updates waiting on startup. If the updates were blocked on
+	/// an MPP claim blocker not written to disk, we may be able to unblock them now.
+	///
+	/// This event is never written to disk.
+	AttemptUnblockMonitorUpdates { counterparty_node_id: PublicKey, channel_id: ChannelId },
 }
 
 /// A pointer to a channel that is unblocked when an event is surfaced
@@ -5460,7 +5465,7 @@ where
 			// Create a dummy route params since they're a required parameter but unused in this case
 			let (payee_node_id, cltv_delta) = route.paths.first()
 				.and_then(|path| path.hops.last().map(|hop| (hop.pubkey, hop.cltv_expiry_delta as u32)))
-				.unwrap_or_else(|| (PublicKey::from_slice(&[2; 32]).unwrap(), MIN_FINAL_CLTV_EXPIRY_DELTA as u32));
+				.unwrap_or_else(|| (PublicKey::from_slice(&[2; 33]).unwrap(), MIN_FINAL_CLTV_EXPIRY_DELTA as u32));
 			let dummy_payment_params = PaymentParameters::from_node_id(payee_node_id, cltv_delta);
 			RouteParameters::from_payment_params_and_value(dummy_payment_params, route.get_total_amount())
 		});
@@ -5691,6 +5696,49 @@ where
 			invoice,
 			payment_id,
 			&self.router,
+			self.list_usable_channels(),
+			features,
+			|| self.compute_inflight_htlcs(),
+			&self.entropy_source,
+			&self.node_signer,
+			&self,
+			&self.secp_ctx,
+			best_block_height,
+			&self.pending_events,
+			|args| self.send_payment_along_path(args),
+			&WithContext::from(&self.logger, None, None, None),
+		)
+	}
+
+	/// Pays the [`Bolt12Invoice`] associated with the `payment_id` encoded in its
+	/// `payer_metadata` along the given `route`, rather than having the [`Router`]
+	/// find one. See [`Self::send_payment_for_bolt12_invoice`] for the semantics
+	/// of invoice verification and [`Self::send_payment_with_route`] for the
+	/// semantics of paying along a fixed route (notably, LDK will not
+	/// automatically retry; re-send after an [`Event::PaymentFailed`]).
+	///
+	/// [`Event::PaymentFailed`]: events::Event::PaymentFailed
+	pub fn send_payment_for_bolt12_invoice_with_route(
+		&self, invoice: &Bolt12Invoice, context: Option<&OffersContext>, route: Route,
+	) -> Result<(), Bolt12PaymentError> {
+		match self.verify_bolt12_invoice(invoice, context) {
+			Ok(payment_id) => self
+				.send_payment_for_verified_bolt12_invoice_with_route(invoice, payment_id, route),
+			Err(()) => Err(Bolt12PaymentError::UnexpectedInvoice),
+		}
+	}
+
+	fn send_payment_for_verified_bolt12_invoice_with_route(
+		&self, invoice: &Bolt12Invoice, payment_id: PaymentId, route: Route,
+	) -> Result<(), Bolt12PaymentError> {
+		let best_block_height = self.best_block.read().unwrap().height;
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let features = self.bolt12_invoice_features();
+		let fixed_router = FixedRouter::new(route);
+		self.pending_outbound_payments.send_payment_for_bolt12_invoice(
+			invoice,
+			payment_id,
+			&&fixed_router,
 			self.list_usable_channels(),
 			features,
 			|| self.compute_inflight_htlcs(),
@@ -8139,6 +8187,12 @@ where
 						&counterparty_node_id,
 					);
 				},
+				BackgroundEvent::AttemptUnblockMonitorUpdates {
+					counterparty_node_id,
+					channel_id,
+				} => {
+					self.handle_monitor_update_release(counterparty_node_id, channel_id, None);
+				},
 			}
 		}
 		NotifyOption::DoPersist
@@ -8422,26 +8476,23 @@ where
 						debug_assert!(false);
 						return false;
 					}
-					if let OnionPayload::Invoice { .. } = payment.htlcs[0].onion_payload {
-						// Check if we've received all the parts we need for an MPP (the value of the parts adds to total_msat).
-						// In this case we're not going to handle any timeouts of the parts here.
-						// This condition determining whether the MPP is complete here must match
-						// exactly the condition used in `process_pending_htlc_forwards`.
-						let htlc_total_msat =
-							payment.htlcs.iter().map(|h| h.sender_intended_value).sum();
-						if payment.htlcs[0].total_msat <= htlc_total_msat {
-							return true;
-						} else if payment.htlcs.iter_mut().any(|htlc| {
-							htlc.timer_ticks += 1;
-							return htlc.timer_ticks >= MPP_TIMEOUT_TICKS;
-						}) {
-							let htlcs = payment
-								.htlcs
-								.drain(..)
-								.map(|htlc: ClaimableHTLC| (htlc.prev_hop, *payment_hash));
-							timed_out_mpp_htlcs.extend(htlcs);
-							return false;
-						}
+					// Check if we've received all the parts we need for an MPP.
+					// This condition determining whether the MPP is complete here must match
+					// exactly the condition used in `process_pending_htlc_forwards`.
+					let htlc_total_msat =
+						payment.htlcs.iter().map(|h| h.sender_intended_value).sum();
+					if payment.htlcs[0].total_msat <= htlc_total_msat {
+						return true;
+					} else if payment.htlcs.iter_mut().any(|htlc| {
+						htlc.timer_ticks += 1;
+						return htlc.timer_ticks >= MPP_TIMEOUT_TICKS;
+					}) {
+						let htlcs = payment
+							.htlcs
+							.drain(..)
+							.map(|htlc: ClaimableHTLC| (htlc.prev_hop, *payment_hash));
+						timed_out_mpp_htlcs.extend(htlcs);
+						return false;
 					}
 					true
 				},
@@ -9142,12 +9193,12 @@ where
 							{
 								if let Some(peer_state_mtx) = per_peer_state.get(&node_id) {
 									let mut peer_state = peer_state_mtx.lock().unwrap();
-									if let Some(blockers) = peer_state
+									let entry = peer_state
 										.actions_blocking_raa_monitor_updates
-										.get_mut(&channel_id)
-									{
+										.entry(channel_id);
+									if let btree_map::Entry::Occupied(mut entry) = entry {
 										let mut found_blocker = false;
-										blockers.retain(|iter| {
+										entry.get_mut().retain(|iter| {
 											// Note that we could actually be blocked, in
 											// which case we need to only remove the one
 											// blocker which was added duplicatively.
@@ -9157,6 +9208,9 @@ where
 											}
 											*iter != blocker || !first_blocker
 										});
+										if entry.get().is_empty() {
+											entry.remove();
+										}
 										debug_assert!(found_blocker);
 									}
 								} else {
@@ -9424,6 +9478,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 												channel_id, ..
 											} =>
 												*channel_id == prev_channel_id,
+											BackgroundEvent::AttemptUnblockMonitorUpdates { .. } => false,
 										}
 									});
 								assert!(
@@ -13707,10 +13762,12 @@ where
 				let peer_state = &mut *peer_state_lck;
 				if let Some(blocker) = completed_blocker.take() {
 					// Only do this on the first iteration of the loop.
-					if let Some(blockers) = peer_state.actions_blocking_raa_monitor_updates
-						.get_mut(&channel_id)
-					{
-						blockers.retain(|iter| iter != &blocker);
+					let entry = peer_state.actions_blocking_raa_monitor_updates.entry(channel_id);
+					if let btree_map::Entry::Occupied(mut entry) = entry {
+						entry.get_mut().retain(|iter| iter != &blocker);
+						if entry.get().is_empty() {
+							entry.remove();
+						}
 					}
 				}
 
@@ -17491,6 +17548,14 @@ where
 						log_error!(logger, " Without the latest ChannelMonitor we cannot continue without risking funds.");
 						log_error!(logger, " Please ensure the chain::Watch API requirements are met and file a bug report at https://github.com/lightningdevkit/rust-lightning");
 						return Err(DecodeError::DangerousValue);
+					}
+					if funded_chan.blocked_monitor_updates_pending() > 0 {
+						pending_background_events.push(
+							BackgroundEvent::AttemptUnblockMonitorUpdates {
+								counterparty_node_id: *counterparty_id,
+								channel_id: *chan_id,
+							},
+						);
 					}
 				} else {
 					// We shouldn't have persisted (or read) any unfunded channel types so none should have been
