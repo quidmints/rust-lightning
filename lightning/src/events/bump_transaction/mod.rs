@@ -33,7 +33,8 @@ use crate::ln::types::ChannelId;
 use crate::prelude::*;
 use crate::sign::ecdsa::EcdsaChannelSigner;
 use crate::sign::{
-	ChannelDerivationParameters, HTLCDescriptor, SignerProvider, P2WPKH_WITNESS_WEIGHT,
+	ChannelDerivationParameters, HTLCDescriptor, SignerProvider, P2TR_KEY_PATH_WITNESS_WEIGHT,
+	P2WPKH_WITNESS_WEIGHT,
 };
 use crate::sync::Mutex;
 use crate::util::async_poll::{AsyncResult, MaybeSend, MaybeSync};
@@ -62,14 +63,49 @@ pub struct AnchorDescriptor {
 	pub outpoint: OutPoint,
 	/// Zero-fee-commitment anchors have variable value, which is tracked here.
 	pub value: Amount,
+	/// M9g: for a SIMPLE-TAPROOT anchor, the holder commitment's per-commitment point.
+	/// The taproot anchor SPK is `P2TR(internal = the holder's per-commitment
+	/// `local_delayedpubkey`, leaf OP_16 OP_CSV)`, so we need this point to re-derive
+	/// the delayed key for both the prevout SPK and the key-path CPFP witness. `None`
+	/// for the legacy P2WSH keyed anchor / keyless P2A anchor.
+	pub per_commitment_point: Option<PublicKey>,
 }
 
 impl AnchorDescriptor {
+	/// M9g: re-derive the holder's per-commitment `local_delayedpubkey` (the taproot
+	/// anchor's internal key) from the channel's delayed-payment basepoint and the
+	/// stored `per_commitment_point`. Returns `None` for non-taproot anchors.
+	fn taproot_anchor_internal_key<C: secp256k1::Signing>(
+		&self, secp_ctx: &Secp256k1<C>,
+	) -> Option<PublicKey> {
+		let tx_params = &self.channel_derivation_parameters.transaction_parameters;
+		if !tx_params.channel_type_features.supports_simple_taproot() {
+			return None;
+		}
+		let per_commitment_point = self.per_commitment_point?;
+		let channel_params = tx_params.as_holder_broadcastable();
+		let delayed_base = &channel_params.broadcaster_pubkeys().delayed_payment_basepoint;
+		Some(
+			crate::ln::channel_keys::DelayedPaymentKey::from_basepoint(
+				secp_ctx, delayed_base, &per_commitment_point,
+			)
+			.to_public_key(),
+		)
+	}
+
 	/// Returns the UTXO to be spent by the anchor input, which can be obtained via
 	/// [`Self::unsigned_tx_input`].
 	pub fn previous_utxo(&self) -> TxOut {
 		let tx_params = &self.channel_derivation_parameters.transaction_parameters;
-		let script_pubkey = if tx_params.channel_type_features.supports_anchors_zero_fee_htlc_tx() {
+		let script_pubkey = if tx_params.channel_type_features.supports_simple_taproot() {
+			// M9g: simple-taproot anchor = P2TR(internal = holder's local_delayedpubkey,
+			// leaf OP_16 OP_CSV).
+			let secp = Secp256k1::new();
+			let internal_key = self
+				.taproot_anchor_internal_key(&secp)
+				.expect("simple-taproot anchor descriptor must carry a per-commitment point");
+			chan_utils::get_taproot_anchor_spk(&secp, &internal_key)
+		} else if tx_params.channel_type_features.supports_anchors_zero_fee_htlc_tx() {
 			let channel_params = tx_params.as_holder_broadcastable();
 			chan_utils::get_keyed_anchor_redeemscript(
 				&channel_params.broadcaster_pubkeys().funding_pubkey,
@@ -96,6 +132,10 @@ impl AnchorDescriptor {
 	/// transaction.
 	pub fn tx_input_witness(&self, signature: &Signature) -> Witness {
 		let tx_params = &self.channel_derivation_parameters.transaction_parameters;
+		debug_assert!(
+			!tx_params.channel_type_features.supports_simple_taproot(),
+			"simple-taproot anchors are CPFP-spent via taproot_tx_input_witness (BIP340 key-path), not ECDSA"
+		);
 		if tx_params.channel_type_features.supports_anchors_zero_fee_htlc_tx() {
 			let channel_params =
 				self.channel_derivation_parameters.transaction_parameters.as_holder_broadcastable();
@@ -107,6 +147,20 @@ impl AnchorDescriptor {
 			debug_assert!(tx_params.channel_type_features.supports_anchor_zero_fee_commitments());
 			Witness::from_slice(&[&[]])
 		}
+	}
+
+	/// M9g: the fully signed CPFP witness for a SIMPLE-TAPROOT anchor — a single
+	/// 64-byte BIP340 `SIGHASH_DEFAULT` Schnorr signature (key-path spend with the
+	/// holder's per-commitment `local_delayedpubkey` tweaked by the anchor TapTweak).
+	pub fn taproot_tx_input_witness(
+		&self, sig: &bitcoin::secp256k1::schnorr::Signature,
+	) -> Witness {
+		debug_assert!(self
+			.channel_derivation_parameters
+			.transaction_parameters
+			.channel_type_features
+			.supports_simple_taproot());
+		chan_utils::build_taproot_anchor_input_witness(sig)
 	}
 }
 
@@ -329,6 +383,17 @@ impl Utxo {
 			outpoint,
 			output: TxOut { value, script_pubkey: ScriptBuf::new_p2wpkh(pubkey_hash) },
 			satisfaction_weight: EMPTY_SCRIPT_SIG_WEIGHT + P2WPKH_WITNESS_WEIGHT,
+		}
+	}
+
+	/// Returns a `Utxo` with the `satisfaction_weight` estimate for a SegWit v1 P2TR
+	/// key-path output. `output` must already be a key-path P2TR scriptPubKey
+	/// (`OP_1 <32-byte x-only output key>`); the caller signs the key-path spend.
+	pub fn new_v1_p2tr_key_spend(outpoint: OutPoint, output: TxOut) -> Self {
+		Self {
+			outpoint,
+			output,
+			satisfaction_weight: EMPTY_SCRIPT_SIG_WEIGHT + P2TR_KEY_PATH_WITNESS_WEIGHT,
 		}
 	}
 }
@@ -959,8 +1024,20 @@ where
 			.channel_derivation_parameters
 			.transaction_parameters
 			.channel_type_features;
+		// M9e-4: a taproot HTLC output is claimed via a BIP341 script-path witness (Schnorr
+		// sigs + tapleaf + control block), NOT a P2WSH 2-of-2 witness — and that witness's
+		// weight varies with the tapleaf script length and control-block depth, so it can't
+		// be a constant. For taproot channels each HTLC input's satisfaction weight is
+		// computed DYNAMICALLY per-descriptor below (build-and-measure the real witness);
+		// `htlc_success_witness_weight`/`htlc_timeout_witness_weight` here are only the
+		// non-taproot (P2WSH) estimates.
+		let is_simple_taproot = channel_type.supports_simple_taproot();
 		let (htlc_success_witness_weight, htlc_timeout_witness_weight) =
-			if channel_type.supports_anchor_zero_fee_commitments() {
+			if is_simple_taproot {
+				// Unused for taproot (see the per-descriptor computation below); avoids the
+				// panic in the final arm.
+				(0, 0)
+			} else if channel_type.supports_anchor_zero_fee_commitments() {
 				(
 					HTLC_SUCCESS_INPUT_P2A_ANCHOR_WITNESS_WEIGHT,
 					HTLC_TIMEOUT_INPUT_P2A_ANCHOR_WITNESS_WEIGHT,
@@ -1023,15 +1100,22 @@ where
 				}
 				htlc_weight_sum += input_output_weight;
 				let htlc_input = htlc_descriptor.unsigned_tx_input();
+				// M9e-4: for taproot HTLCs, build-and-measure the real script-path witness
+				// weight (exact, adapts to the script/control-block); for P2WSH use the
+				// success/timeout constant estimate selected above.
+				let witness_weight = if is_simple_taproot {
+					htlc_descriptor
+						.taproot_max_witness_weight(&self.secp)
+						.map_err(|_| ())?
+				} else if htlc_descriptor.preimage.is_some() {
+					htlc_success_witness_weight
+				} else {
+					htlc_timeout_witness_weight
+				};
 				must_spend.push(Input {
 					outpoint: htlc_input.previous_output.clone(),
 					previous_utxo: htlc_descriptor.previous_utxo(&self.secp),
-					satisfaction_weight: EMPTY_SCRIPT_SIG_WEIGHT
-						+ if htlc_descriptor.preimage.is_some() {
-							htlc_success_witness_weight
-						} else {
-							htlc_timeout_witness_weight
-						},
+					satisfaction_weight: EMPTY_SCRIPT_SIG_WEIGHT + witness_weight,
 				});
 				htlc_tx.input.push(htlc_input);
 				let htlc_output = htlc_descriptor.tx_output(&self.secp);
@@ -1141,15 +1225,41 @@ where
 				let signer = signers
 					.entry(keys_id)
 					.or_insert_with(|| self.signer_provider.derive_channel_signer(keys_id));
-				let htlc_sig = signer.sign_holder_htlc_transaction(
-					&htlc_tx,
-					idx,
-					htlc_descriptor,
-					&self.secp,
-				)?;
-				let witness_script = htlc_descriptor.witness_script(&self.secp);
-				htlc_tx.input[idx].witness =
-					htlc_descriptor.tx_input_witness(&htlc_sig, &witness_script);
+				if htlc_descriptor
+					.channel_derivation_parameters
+					.transaction_parameters
+					.channel_type_features
+					.supports_simple_taproot()
+				{
+					// M9e-4: simple-taproot channels are ALWAYS anchor channels, so the
+					// holder-HTLC 2nd-level claim is zero-fee and routes through this CPFP
+					// bump path. The HTLC input is a taproot tapscript output, so it MUST be
+					// signed BIP340 Schnorr (`sign_holder_htlc_transaction_taproot`) and the
+					// witness built as the script-path 2-of-2 leaf witness — an ECDSA/P2WSH
+					// witness here would be invalid (validating signer panics
+					// `IncorrectSignature`). The HTLC sighash is
+					// SIGHASH_SINGLE|ANYONECANPAY, so the externally-funded CPFP inputs added
+					// above do not invalidate our signature. Mirrors the malleable-path
+					// witness at `chain::package::get_maybe_signed_htlc_tx`.
+					let htlc_sig = signer.sign_holder_htlc_transaction_taproot(
+						&htlc_tx,
+						idx,
+						htlc_descriptor,
+						&self.secp,
+					)?;
+					htlc_tx.input[idx].witness =
+						htlc_descriptor.taproot_tx_input_witness(&htlc_sig, &self.secp)?;
+				} else {
+					let htlc_sig = signer.sign_holder_htlc_transaction(
+						&htlc_tx,
+						idx,
+						htlc_descriptor,
+						&self.secp,
+					)?;
+					let witness_script = htlc_descriptor.witness_script(&self.secp);
+					htlc_tx.input[idx].witness =
+						htlc_descriptor.tx_input_witness(&htlc_sig, &witness_script);
+				}
 			}
 
 			#[cfg(debug_assertions)]
@@ -1379,6 +1489,7 @@ mod tests {
 				},
 				outpoint: OutPoint { txid: commitment_txid, vout: 0 },
 				value: Amount::from_sat(ANCHOR_OUTPUT_VALUE_SATOSHI),
+				per_commitment_point: None,
 			},
 			pending_htlcs: Vec::new(),
 		});

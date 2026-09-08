@@ -427,7 +427,6 @@ impl EntropySource for OnlyReadsKeysInterface {
 
 impl SignerProvider for OnlyReadsKeysInterface {
 	type EcdsaSigner = TestChannelSigner;
-	#[cfg(taproot)]
 	type TaprootSigner = TestChannelSigner;
 
 	fn generate_channel_keys_id(&self, _inbound: bool, _user_channel_id: u128) -> [u8; 32] {
@@ -435,6 +434,10 @@ impl SignerProvider for OnlyReadsKeysInterface {
 	}
 
 	fn derive_channel_signer(&self, _channel_keys_id: [u8; 32]) -> Self::EcdsaSigner {
+		unreachable!();
+	}
+
+	fn derive_taproot_channel_signer(&self, _channel_keys_id: [u8; 32]) -> Self::TaprootSigner {
 		unreachable!();
 	}
 
@@ -1868,7 +1871,6 @@ impl NodeSigner for TestKeysInterface {
 
 impl SignerProvider for TestKeysInterface {
 	type EcdsaSigner = TestChannelSigner;
-	#[cfg(taproot)]
 	type TaprootSigner = TestChannelSigner;
 
 	fn generate_channel_keys_id(&self, inbound: bool, user_channel_id: u128) -> [u8; 32] {
@@ -1884,6 +1886,28 @@ impl SignerProvider for TestKeysInterface {
 
 	fn derive_channel_signer(&self, channel_keys_id: [u8; 32]) -> TestChannelSigner {
 		let keys = self.backing.derive_channel_signer(channel_keys_id);
+		let state = self.make_enforcement_state_cell(keys.channel_keys_id());
+		let rev_checks = self.disable_revocation_policy_check;
+		let state_checks = self.disable_all_state_policy_checks;
+		let signer = TestChannelSigner::new_with_revoked(keys, state, rev_checks, state_checks);
+		#[cfg(test)]
+		if let Some(ops) = self.unavailable_signers_ops.lock().unwrap().get(&channel_keys_id) {
+			for &op in ops {
+				signer.disable_op(op);
+			}
+		}
+		#[cfg(test)]
+		for op in self.next_signer_disabled_ops.lock().unwrap().drain() {
+			signer.disable_op(op);
+		}
+		signer
+	}
+
+	fn derive_taproot_channel_signer(&self, channel_keys_id: [u8; 32]) -> TestChannelSigner {
+		// TestChannelSigner wraps the same InMemorySigner for both schemes; the
+		// taproot signer is derived from the identical key material. Reuse the
+		// ECDSA derivation path (same enforcement state + disabled-op handling).
+		let keys = self.backing.derive_taproot_channel_signer(channel_keys_id);
 		let state = self.make_enforcement_state_cell(keys.channel_keys_id());
 		let rev_checks = self.disable_revocation_policy_check;
 		let state_checks = self.disable_all_state_policy_checks;

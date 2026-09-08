@@ -4063,6 +4063,7 @@ mod tests {
 								msg: msgs::Shutdown {
 									channel_id: ChannelId::new_zero(),
 									scriptpubkey: bitcoin::ScriptBuf::new(),
+						shutdown_nonce: None,
 								},
 							};
 							cfgs[0].chan_handler.pending_events.lock().unwrap().push(msg_event_1);
@@ -4074,6 +4075,7 @@ mod tests {
 								msg: msgs::Shutdown {
 									channel_id: ChannelId::new_zero(),
 									scriptpubkey: bitcoin::ScriptBuf::new(),
+						shutdown_nonce: None,
 								},
 							};
 							cfgs[1].chan_handler.pending_events.lock().unwrap().push(msg_event_0);
@@ -4209,6 +4211,7 @@ mod tests {
 		let msg = msgs::Shutdown {
 			channel_id: ChannelId::from_bytes([42; 32]),
 			scriptpubkey: bitcoin::ScriptBuf::new(),
+			shutdown_nonce: None,
 		};
 		a_chan_handler
 			.pending_events

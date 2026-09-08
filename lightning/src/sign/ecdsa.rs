@@ -258,4 +258,60 @@ pub trait EcdsaChannelSigner: ChannelSigner {
 		&self, channel_parameters: &ChannelTransactionParameters, tx: &Transaction,
 		input_index: usize, secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Signature;
+
+	// --- Simple-taproot (BOLT #995) ON-CHAIN RESOLUTION (M9e) ---
+	//
+	// On a taproot channel, the commitment-output spends are BIP341 script-path
+	// spends, not P2WSH/ECDSA. The justice/HTLC-claim resolution sigs are plain
+	// BIP340 single-key Schnorr (only the funding spend is MuSig2). These mirror
+	// the ECDSA `sign_justice_*`/`sign_counterparty_htlc_transaction` methods but
+	// return a Schnorr signature over the script-path TapSighash of the leaf being
+	// taken. They carry `channel_parameters` (so the signer can rebuild the
+	// tapleaf + its prevout scriptPubKey) — the `TaprootChannelSigner` trait
+	// surface does not. Default `Err(())` for non-taproot signers.
+
+	/// Schnorr sig for a justice (breach) sweep of a revoked taproot `to_local`
+	/// output via the `revoke` tapleaf. Mirrors [`sign_justice_revoked_output`].
+	fn sign_justice_revoked_output_taproot(
+		&self, _channel_parameters: &ChannelTransactionParameters, _justice_tx: &Transaction,
+		_input: usize, _amount: u64, _per_commitment_key: &SecretKey,
+		_all_prevouts: &[bitcoin::TxOut], _secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature, ()> {
+		Err(())
+	}
+
+	/// Schnorr sig for a justice (breach) sweep of a revoked taproot HTLC output
+	/// via the HTLC tree's **key path** (internal key = revocation key). Mirrors
+	/// [`sign_justice_revoked_htlc`].
+	fn sign_justice_revoked_htlc_taproot(
+		&self, _channel_parameters: &ChannelTransactionParameters, _justice_tx: &Transaction,
+		_input: usize, _amount: u64, _per_commitment_key: &SecretKey,
+		_htlc: &HTLCOutputInCommitment, _all_prevouts: &[bitcoin::TxOut],
+		_secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature, ()> {
+		Err(())
+	}
+
+	/// Schnorr sig for OUR second-level HTLC-Success/Timeout tx spending our own
+	/// broadcast taproot commitment's HTLC output via its 2-of-2 leaf. Mirrors
+	/// [`sign_holder_htlc_transaction`] (which returns ECDSA). The counterparty's
+	/// matching pre-signed Schnorr sig completes the 2-of-2.
+	fn sign_holder_htlc_transaction_taproot(
+		&self, _htlc_tx: &Transaction, _input: usize, _htlc_descriptor: &HTLCDescriptor,
+		_secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature, ()> {
+		Err(())
+	}
+
+	/// Schnorr sig for claiming an HTLC output on the **counterparty's** broadcast
+	/// taproot commitment, via the 2-of-2 leaf (offered-timeout / received-success).
+	/// Mirrors [`sign_counterparty_htlc_transaction`].
+	fn sign_counterparty_htlc_transaction_taproot(
+		&self, _channel_parameters: &ChannelTransactionParameters, _htlc_tx: &Transaction,
+		_input: usize, _amount: u64, _per_commitment_point: &PublicKey,
+		_htlc: &HTLCOutputInCommitment, _all_prevouts: &[bitcoin::TxOut],
+		_secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature, ()> {
+		Err(())
+	}
 }

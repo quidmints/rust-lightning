@@ -484,6 +484,14 @@ pub struct ChannelDetails {
 	///
 	/// This field will be `None` for objects serialized with LDK versions prior to 0.2.0.
 	pub funding_redeem_script: Option<bitcoin::ScriptBuf>,
+	/// QU!D PATCH (see lib/rust-lightning/QUID_PATCHES.md): the counterparty's
+	/// committed upfront shutdown script, if negotiated with
+	/// `option_upfront_shutdown_script`. This is the exact output the
+	/// counterparty's balance is paid to at a cooperative close (LDK rejects a
+	/// differing `Shutdown`), so the hop reads it before driving
+	/// `BTCChannels.openChannel` to verify the LP payout matches the script the
+	/// EVM attributes balance to. `None` if the peer made no upfront commitment.
+	pub counterparty_shutdown_scriptpubkey: Option<bitcoin::ScriptBuf>,
 }
 
 impl ChannelDetails {
@@ -561,6 +569,9 @@ impl ChannelDetails {
 			funding_redeem_script: funding
 				.channel_transaction_parameters
 				.make_funding_redeemscript_opt(),
+			// QU!D PATCH: surface the counterparty's committed upfront shutdown
+			// script so the hop can verify the LP coop-close payout script.
+			counterparty_shutdown_scriptpubkey: context.counterparty_shutdown_scriptpubkey(),
 			// Note that accept_channel (or open_channel) is always the first message, so
 			// `have_received_message` indicates that type negotiation has completed.
 			channel_type: if context.have_received_message() {
@@ -636,6 +647,7 @@ impl_writeable_tlv_based!(ChannelDetails, {
 	(43, pending_inbound_htlcs, optional_vec),
 	(45, pending_outbound_htlcs, optional_vec),
 	(47, funding_redeem_script, option),
+	(49, counterparty_shutdown_scriptpubkey, option),
 	(_unused, user_channel_id, (static_value,
 		_user_channel_id_low.unwrap_or(0) as u128 | ((_user_channel_id_high.unwrap_or(0) as u128) << 64)
 	)),
@@ -716,6 +728,7 @@ mod tests {
 				&PublicKey::from_slice(&[2; 33]).unwrap(),
 				&PublicKey::from_slice(&[2; 33]).unwrap(),
 			)),
+			counterparty_shutdown_scriptpubkey: None,
 			channel_type: None,
 			short_channel_id: None,
 			outbound_scid_alias: None,

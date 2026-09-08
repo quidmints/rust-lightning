@@ -426,6 +426,16 @@ impl ConstructedTransaction {
 		&self.tx
 	}
 
+	/// All prevouts (spent `TxOut`s) of this transaction, in input order. Needed to
+	/// build the BIP341 key-path `Prevouts::All` sighash for a taproot splice's
+	/// shared funding input — a splice tx has MULTIPLE inputs (the shared funding
+	/// output + the contributor's funding inputs), and a taproot key-path sighash
+	/// commits to every input's amount + scriptPubKey (spec §9c). `input_metadata`
+	/// is built in lockstep with `tx.input` (zip/unzip), so the order matches.
+	pub fn all_prevouts(&self) -> Vec<TxOut> {
+		self.input_metadata.iter().map(|m| m.prev_output.clone()).collect()
+	}
+
 	fn input_metadata(&self) -> impl Iterator<Item = &TxInMetadata> {
 		self.input_metadata.iter()
 	}
@@ -467,35 +477,81 @@ impl ConstructedTransaction {
 		self.add_remote_witnesses(&mut tx, counterparty_tx_signatures.witnesses.clone());
 
 		if let Some(shared_input_index) = self.shared_input_index {
-			let holder_shared_input_sig =
-				holder_tx_signatures.shared_input_signature.or_else(|| {
-					debug_assert!(false);
-					None
-				})?;
-			let counterparty_shared_input_sig =
-				counterparty_tx_signatures.shared_input_signature.or_else(|| {
-					debug_assert!(false);
-					None
-				})?;
-
 			let shared_input_sig = shared_input_sig.or_else(|| {
 				debug_assert!(false);
 				None
 			})?;
 
-			let mut witness = Witness::new();
-			witness.push(Vec::new());
-			let holder_sig = BitcoinSignature::sighash_all(holder_shared_input_sig);
-			let counterparty_sig = BitcoinSignature::sighash_all(counterparty_shared_input_sig);
-			if shared_input_sig.holder_signature_first {
-				witness.push_ecdsa_signature(&holder_sig);
-				witness.push_ecdsa_signature(&counterparty_sig);
+			if let Some((holder_funding_pk, counterparty_funding_pk)) =
+				shared_input_sig.taproot_funding_pubkeys
+			{
+				// SIMPLE-TAPROOT splice: the old funding output is the key-path
+				// `0x5120||Q`. Aggregate OUR + the counterparty's MuSig2 key-path
+				// partials (each with its pubnonce) into the single 64-byte BIP340
+				// Schnorr witness that spends it (spec §9c). The two partials are
+				// commutative under nonce-sum, so the witness is identical on both
+				// sides regardless of who built it.
+				let holder = holder_tx_signatures.splice_partial_signature.as_ref().or_else(|| {
+					debug_assert!(false);
+					None
+				})?;
+				let counterparty =
+					counterparty_tx_signatures.splice_partial_signature.as_ref().or_else(|| {
+						debug_assert!(false);
+						None
+					})?;
+
+				// The taproot key-path sighash commits to ALL prevouts (a splice tx
+				// has > 1 input); recompute it the same way the signer did.
+				let all_prevouts = self.all_prevouts();
+				let sighash = crate::ln::chan_utils::taproot_splice_keyspend_sighash(
+					&tx,
+					shared_input_index as usize,
+					&all_prevouts,
+				)
+				.ok()?;
+				let message: [u8; 32] = *sighash.as_ref();
+
+				let agg_sig = crate::ln::chan_utils::verify_taproot_keyspend_partials(
+					&holder_funding_pk,
+					&counterparty_funding_pk,
+					&message,
+					holder.0,
+					holder.1.clone(),
+					counterparty.0,
+					counterparty.1.clone(),
+				)
+				.ok()?;
+
+				let mut witness = Witness::new();
+				witness.push(agg_sig.as_ref());
+				tx.input[shared_input_index as usize].witness = witness;
 			} else {
-				witness.push_ecdsa_signature(&counterparty_sig);
-				witness.push_ecdsa_signature(&holder_sig);
+				let holder_shared_input_sig =
+					holder_tx_signatures.shared_input_signature.or_else(|| {
+						debug_assert!(false);
+						None
+					})?;
+				let counterparty_shared_input_sig =
+					counterparty_tx_signatures.shared_input_signature.or_else(|| {
+						debug_assert!(false);
+						None
+					})?;
+
+				let mut witness = Witness::new();
+				witness.push(Vec::new());
+				let holder_sig = BitcoinSignature::sighash_all(holder_shared_input_sig);
+				let counterparty_sig = BitcoinSignature::sighash_all(counterparty_shared_input_sig);
+				if shared_input_sig.holder_signature_first {
+					witness.push_ecdsa_signature(&holder_sig);
+					witness.push_ecdsa_signature(&counterparty_sig);
+				} else {
+					witness.push_ecdsa_signature(&counterparty_sig);
+					witness.push_ecdsa_signature(&holder_sig);
+				}
+				witness.push(&shared_input_sig.witness_script);
+				tx.input[shared_input_index as usize].witness = witness;
 			}
-			witness.push(&shared_input_sig.witness_script);
-			tx.input[shared_input_index as usize].witness = witness;
 		}
 
 		Some(tx)
@@ -554,11 +610,18 @@ impl ConstructedTransaction {
 pub(crate) struct SharedInputSignature {
 	holder_signature_first: bool,
 	witness_script: ScriptBuf,
+	// For a **simple-taproot channel**: the (holder, counterparty) funding pubkeys of
+	// the OLD funding output, used to KeyAgg → `Q` and aggregate the two MuSig2
+	// key-path partials into ONE 64-byte BIP340 witness at finalize. `None` for
+	// legacy P2WSH splices, which concatenate two ECDSA sigs + `witness_script`
+	// (spec §9c).
+	taproot_funding_pubkeys: Option<(PublicKey, PublicKey)>,
 }
 
 impl_writeable_tlv_based!(SharedInputSignature, {
 	(1, holder_signature_first, required),
 	(3, witness_script, required),
+	(5, taproot_funding_pubkeys, option),
 });
 
 /// The InteractiveTxSigningSession coordinates the signing flow of interactively constructed
@@ -623,10 +686,28 @@ impl InteractiveTxSigningSession {
 		if self.remote_inputs_count() != tx_signatures.witnesses.len() {
 			return Err("Witness count did not match contributed input count".to_string());
 		}
-		if self.shared_input().is_some() && tx_signatures.shared_input_signature.is_none() {
+		// A splice's shared (old-funding) input carries the counterparty's signature.
+		// For a SIMPLE-TAPROOT channel it's a MuSig2 key-path partial
+		// (`splice_partial_signature`); for legacy P2WSH it's the ECDSA
+		// `shared_input_signature`. Validate the right one is present iff the shared
+		// input exists (spec §9c).
+		let is_taproot_splice = self
+			.shared_input_signature
+			.as_ref()
+			.map(|s| s.taproot_funding_pubkeys.is_some())
+			.unwrap_or(false);
+		let counterparty_shared_sig_present = if is_taproot_splice {
+			tx_signatures.splice_partial_signature.is_some()
+		} else {
+			tx_signatures.shared_input_signature.is_some()
+		};
+		if self.shared_input().is_some() && !counterparty_shared_sig_present {
 			return Err("Missing shared input signature".to_string());
 		}
-		if self.shared_input().is_none() && tx_signatures.shared_input_signature.is_some() {
+		if self.shared_input().is_none()
+			&& (tx_signatures.shared_input_signature.is_some()
+				|| tx_signatures.splice_partial_signature.is_some())
+		{
 			return Err("Unexpected shared input signature".to_string());
 		}
 
@@ -1472,6 +1553,7 @@ macro_rules! define_state_transitions {
 					.map(|shared_input| SharedInputSignature {
 						holder_signature_first: shared_input.holder_sig_first,
 						witness_script: shared_input.witness_script.clone(),
+						taproot_funding_pubkeys: shared_input.taproot_funding_pubkeys,
 					});
 				let holder_node_id = context.holder_node_id;
 				let counterparty_node_id = context.counterparty_node_id;
@@ -1657,12 +1739,18 @@ pub(super) struct SharedOwnedInput {
 	local_owned: u64,
 	holder_sig_first: bool,
 	witness_script: ScriptBuf,
+	// For a **simple-taproot channel**, the (holder, counterparty) funding pubkeys of
+	// the OLD funding output this splice spends, so the signing session can KeyAgg →
+	// `Q` and aggregate the two MuSig2 key-path partials into the single 64-byte
+	// witness (the old funding output is `0x5120||Q`, not a P2WSH 2-of-2, so there is
+	// no `witness_script` to push). `None` for legacy P2WSH splices (spec §9c).
+	taproot_funding_pubkeys: Option<(PublicKey, PublicKey)>,
 }
 
 impl SharedOwnedInput {
 	pub fn new(
 		input: TxIn, prev_output: TxOut, local_owned: u64, holder_sig_first: bool,
-		witness_script: ScriptBuf,
+		witness_script: ScriptBuf, taproot_funding_pubkeys: Option<(PublicKey, PublicKey)>,
 	) -> Self {
 		let value = prev_output.value.to_sat();
 		debug_assert!(
@@ -1671,7 +1759,7 @@ impl SharedOwnedInput {
 			local_owned,
 			value,
 		);
-		Self { input, prev_output, local_owned, holder_sig_first, witness_script }
+		Self { input, prev_output, local_owned, holder_sig_first, witness_script, taproot_funding_pubkeys }
 	}
 
 	fn remote_owned(&self) -> u64 {
@@ -2532,6 +2620,7 @@ mod tests {
 					lo,
 					true,                             // holder_sig_first
 					generate_funding_script_pubkey(), // witness_script for test
+					None,                             // taproot_funding_pubkeys (legacy P2WSH test)
 				)
 			}),
 			shared_funding_output: SharedOwnedOutput::new(
@@ -2571,6 +2660,7 @@ mod tests {
 					lo,
 					false,                            // holder_sig_first
 					generate_funding_script_pubkey(), // witness_script for test
+					None,                             // taproot_funding_pubkeys (legacy P2WSH test)
 				)
 			}),
 			shared_funding_output: SharedOwnedOutput::new(

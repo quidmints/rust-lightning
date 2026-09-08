@@ -99,6 +99,9 @@ pub(crate) fn verify_channel_type_features(channel_type_features: &Option<Channe
 		supported_feature_set.set_scid_privacy_required();
 		supported_feature_set.set_zero_conf_required();
 		supported_feature_set.set_anchor_zero_fee_commitments_required();
+		// Simple-taproot channels (BOLT bits 80/81) persist a `simple_taproot_required`
+		// channel type in their monitor; recognise it on deserialization.
+		supported_feature_set.set_simple_taproot_required();
 
 		// allow the passing of an additional necessary permitted flag
 		if let Some(additional_permitted_features) = additional_permitted_features {
@@ -115,6 +118,39 @@ pub(crate) fn verify_channel_type_features(channel_type_features: &Option<Channe
 
 // number_of_witness_elements + sig_length + revocation_sig + true_length + op_true + witness_script_length + witness_script
 pub(crate) const WEIGHT_REVOKED_OUTPUT: u64 = 1 + 1 + 73 + 1 + 1 + 1 + 77;
+
+/// Witness weight of a justice (breach-remedy) spend of a **simple-taproot**
+/// revoked `to_local` output.
+///
+/// `RevokedOutput::finalize_input` takes the BIP341 *script path* through the
+/// revoke tapleaf, so the witness is `[schnorr_sig, revoke_leaf, control_block]`:
+///
+/// - `number_of_witness_elements`: 1
+/// - `sig_length` + `schnorr_sig`: 1 + 64 (`SIGHASH_DEFAULT`, no sighash byte —
+///   see `taproot_schnorr_witness_element`)
+/// - `leaf_length` + `revoke_leaf`: 1 + 68, where the leaf built by
+///   `get_taproot_to_local_revoke_script` is
+///   `<32B delayed> OP_DROP <32B revocation> OP_CHECKSIG` = 33 + 1 + 33 + 1
+/// - `control_block_length` + `control_block`: 1 + 65, where the control block is
+///   `33 + 32 * depth` and the `to_local` tree (`taproot_to_local_spend_info`) has
+///   two leaves, so depth = 1.
+///
+/// This is LARGER than the legacy P2WSH [`WEIGHT_REVOKED_OUTPUT`] (155), so using
+/// the legacy constant on a taproot channel under-estimates the justice tx and
+/// trips the `predicted_weight >= tx.weight()` assertion in
+/// `OnchainTxHandler::generate_claim` — i.e. it panics the breach-remedy path
+/// instead of broadcasting. Keep this an exact-or-over estimate.
+pub(crate) const WEIGHT_REVOKED_OUTPUT_TAPROOT: u64 = 1 + 1 + 64 + 1 + 68 + 1 + 65;
+
+/// Witness weight of a justice spend of a revoked `to_local` output, for the
+/// commitment format actually in use on this channel.
+pub(crate) fn weight_revoked_output(channel_type_features: &ChannelTypeFeatures) -> u64 {
+	if channel_type_features.supports_simple_taproot() {
+		WEIGHT_REVOKED_OUTPUT_TAPROOT
+	} else {
+		WEIGHT_REVOKED_OUTPUT
+	}
+}
 
 #[cfg(not(any(test, feature = "_test_utils")))]
 /// Height delay at which transactions are fee-bumped/rebroadcasted with a low priority.
@@ -159,12 +195,17 @@ impl RevokedOutput {
 		let counterparty_delayed_payment_base_key = counterparty_keys.delayed_payment_basepoint;
 		let counterparty_htlc_base_key = counterparty_keys.htlc_basepoint;
 		let on_counterparty_tx_csv = directed_params.contest_delay();
+		// The justice witness shape depends on the commitment format: legacy P2WSH ECDSA
+		// vs. a BIP341 script-path Schnorr spend of the revoke tapleaf (M9e). Using the
+		// legacy constant on a taproot channel under-estimates the tx and panics
+		// `generate_claim`'s `predicted_weight >= tx.weight()` assertion.
+		let weight = weight_revoked_output(&channel_parameters.channel_type_features);
 		RevokedOutput {
 			per_commitment_point,
 			counterparty_delayed_payment_base_key,
 			counterparty_htlc_base_key,
 			per_commitment_key,
-			weight: WEIGHT_REVOKED_OUTPUT,
+			weight,
 			amount,
 			on_counterparty_tx_csv,
 			channel_parameters: Some(channel_parameters),
@@ -530,6 +571,19 @@ impl HolderHTLCOutput {
 				htlc: htlc.clone(),
 				preimage: self.preimage.clone(),
 				counterparty_sig: *counterparty_sig,
+				// M9e-4: the malleable (self-funded) HTLC-claim path used by this
+				// descriptor looks the Schnorr sig up via `find_taproot_counterparty_htlc_sig`
+				// at finalize time, so it does not need it carried on the descriptor.
+				counterparty_sig_taproot: holder_commitment
+					.taproot_counterparty_htlc_sigs
+					.as_ref()
+					.and_then(|sigs| {
+						trusted_tx
+							.nondust_htlcs()
+							.iter()
+							.position(|h| h.transaction_output_index == Some(outp.vout))
+							.and_then(|idx| sigs.get(idx).copied())
+					}),
 			})
 		};
 
@@ -554,8 +608,36 @@ impl HolderHTLCOutput {
 			&htlc_descriptor.commitment_txid, htlc_descriptor.feerate_per_kw,
 			directed_parameters.contest_delay(), &htlc_descriptor.htlc,
 			&channel_parameters.channel_type_features, &keys.broadcaster_delayed_payment_key,
-			&keys.revocation_key
+			&keys.revocation_key, &onchain_tx_handler.secp_ctx
 		);
+
+		if channel_parameters.channel_type_features.supports_simple_taproot() {
+			// Holder second-level HTLC tx (M9e): spend the holder commitment HTLC
+			// output via its 2-of-2 leaf with OUR Schnorr sig + the counterparty's
+			// pre-signed Schnorr sig (from `commitment_signed`, stored on the holder
+			// commitment as `taproot_counterparty_htlc_sigs`). The 2nd-level tx's
+			// own output is the taproot to_self_delay output (built by
+			// `build_htlc_transaction` for taproot).
+			let remote_schnorr = self.find_taproot_counterparty_htlc_sig(onchain_tx_handler, outp)?;
+			if let Ok(htlc_sig) = onchain_tx_handler.signer.sign_holder_htlc_transaction_taproot(
+				&htlc_tx, 0, &htlc_descriptor, &onchain_tx_handler.secp_ctx,
+			) {
+				let leaf = chan_utils::taproot_htlc_remote_sig_leaf(
+					&htlc_descriptor.htlc, &keys.broadcaster_htlc_key, &keys.countersignatory_htlc_key,
+				);
+				let spend_info = chan_utils::taproot_htlc_spend_info(
+					&onchain_tx_handler.secp_ctx, &htlc_descriptor.htlc, &keys.broadcaster_htlc_key,
+					&keys.countersignatory_htlc_key, &keys.revocation_key,
+				);
+				match chan_utils::build_taproot_htlc_input_witness(
+					&htlc_sig, &remote_schnorr, &htlc_descriptor.preimage, &leaf, &spend_info,
+				) {
+					Ok(w) => htlc_tx.input[0].witness = w,
+					Err(_) => return Some(MaybeSignedTransaction(htlc_tx)),
+				}
+			}
+			return Some(MaybeSignedTransaction(htlc_tx));
+		}
 
 		if let Ok(htlc_sig) = onchain_tx_handler.signer.sign_holder_htlc_transaction(
 			&htlc_tx, 0, &htlc_descriptor, &onchain_tx_handler.secp_ctx,
@@ -571,6 +653,27 @@ impl HolderHTLCOutput {
 		}
 
 		Some(MaybeSignedTransaction(htlc_tx))
+	}
+
+	/// Look up the counterparty's pre-signed BIP340 Schnorr signature over our
+	/// second-level HTLC tx (taproot, M9b/M9e), matching the HTLC at `outp` on the
+	/// current or previous holder commitment.
+	#[rustfmt::skip]
+	fn find_taproot_counterparty_htlc_sig<ChannelSigner: EcdsaChannelSigner>(
+		&self, onchain_tx_handler: &OnchainTxHandler<ChannelSigner>, outp: &::bitcoin::OutPoint,
+	) -> Option<bitcoin::secp256k1::schnorr::Signature> {
+		let lookup = |holder_commitment: &HolderCommitmentTransaction| {
+			let trusted_tx = holder_commitment.trust();
+			if outp.txid != trusted_tx.txid() {
+				return None;
+			}
+			let sigs = holder_commitment.taproot_counterparty_htlc_sigs.as_ref()?;
+			trusted_tx.nondust_htlcs().iter().enumerate()
+				.find(|(_, htlc)| htlc.transaction_output_index == Some(outp.vout))
+				.and_then(|(idx, _)| sigs.get(idx).copied())
+		};
+		lookup(onchain_tx_handler.current_holder_commitment_tx())
+			.or_else(|| onchain_tx_handler.prev_holder_commitment_tx().and_then(|c| lookup(c)))
 	}
 }
 
@@ -665,6 +768,14 @@ impl HolderFundingOutput {
 			.unwrap_or(onchain_tx_handler.channel_parameters());
 		let commitment_tx = self.commitment_tx.as_ref()
 			.unwrap_or(onchain_tx_handler.current_holder_commitment_tx());
+		// Simple-taproot (BOLT #995) force-close: the funding spend is a key-path
+		// MuSig2 aggregate Schnorr sig formed interactively at `commitment_signed`
+		// and stored on the holder commitment (spec §9a) — there is no holder ECDSA
+		// sig to add at broadcast time. Emit the single-64-byte key-path witness.
+		if self.channel_type_features.supports_simple_taproot() {
+			let signed = commitment_tx.get_taproot_signed_tx();
+			return MaybeSignedTransaction(signed);
+		}
 		let maybe_signed_tx = onchain_tx_handler.signer
 			.sign_holder_commitment(channel_parameters, commitment_tx, &onchain_tx_handler.secp_ctx)
 			.map(|holder_sig| {
@@ -875,8 +986,97 @@ impl PackageSolvingData {
 			witness: Witness::new(),
 		}
 	}
+	/// Whether the output being spent lives on a simple-taproot (BOLT #995)
+	/// commitment, so its spend is a BIP341 script-/key-path Schnorr spend (M9e)
+	/// rather than a P2WSH ECDSA spend.
+	fn supports_simple_taproot(&self, fallback: &ChannelTransactionParameters) -> bool {
+		let features = match self {
+			PackageSolvingData::RevokedOutput(o) =>
+				o.channel_parameters.as_ref().map(|p| &p.channel_type_features),
+			PackageSolvingData::RevokedHTLCOutput(o) =>
+				o.channel_parameters.as_ref().map(|p| &p.channel_type_features),
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(o) => Some(&o.channel_type_features),
+			PackageSolvingData::CounterpartyReceivedHTLCOutput(o) => Some(&o.channel_type_features),
+			PackageSolvingData::HolderHTLCOutput(o) => Some(&o.channel_type_features),
+			PackageSolvingData::HolderFundingOutput(o) => Some(&o.channel_type_features),
+		};
+		features.unwrap_or(&fallback.channel_type_features).supports_simple_taproot()
+	}
+
+	/// The prevout [`TxOut`] (value + taproot scriptPubKey) of the output this
+	/// input spends, reconstructed from its channel keys. Needed because the
+	/// BIP341 script-/key-path TapSighash (`SIGHASH_DEFAULT`) commits to ALL of
+	/// the spending tx's prevouts (`Prevouts::All`). Returns `None` for non-taproot
+	/// outputs (the legacy BIP143 path commits only the witness_script + amount).
 	#[rustfmt::skip]
-	fn finalize_input<Signer: EcdsaChannelSigner>(&self, bumped_tx: &mut Transaction, i: usize, onchain_handler: &mut OnchainTxHandler<Signer>) -> bool {
+	fn taproot_prevout<Signer: EcdsaChannelSigner>(
+		&self, onchain_handler: &OnchainTxHandler<Signer>,
+	) -> Option<TxOut> {
+		let secp_ctx = &onchain_handler.secp_ctx;
+		let fallback = onchain_handler.channel_parameters();
+		if !self.supports_simple_taproot(fallback) {
+			return None;
+		}
+		match self {
+			PackageSolvingData::RevokedOutput(ref outp) => {
+				let channel_parameters = outp.channel_parameters.as_ref().unwrap_or(fallback);
+				let directed = channel_parameters.as_counterparty_broadcastable();
+				let chan_keys = TxCreationKeys::from_channel_static_keys(
+					&outp.per_commitment_point, directed.broadcaster_pubkeys(),
+					directed.countersignatory_pubkeys(), secp_ctx,
+				);
+				let spk = crate::ln::chan_utils::get_taproot_to_local_spk(
+					secp_ctx, &chan_keys.revocation_key, outp.on_counterparty_tx_csv,
+					&chan_keys.broadcaster_delayed_payment_key,
+				);
+				Some(TxOut { value: outp.amount, script_pubkey: spk })
+			},
+			PackageSolvingData::RevokedHTLCOutput(ref outp) => {
+				let channel_parameters = outp.channel_parameters.as_ref().unwrap_or(fallback);
+				let directed = channel_parameters.as_counterparty_broadcastable();
+				let chan_keys = TxCreationKeys::from_channel_static_keys(
+					&outp.per_commitment_point, directed.broadcaster_pubkeys(),
+					directed.countersignatory_pubkeys(), secp_ctx,
+				);
+				let spk = crate::ln::chan_utils::get_taproot_htlc_spk(
+					secp_ctx, &outp.htlc, &chan_keys.broadcaster_htlc_key,
+					&chan_keys.countersignatory_htlc_key, &chan_keys.revocation_key,
+				);
+				Some(TxOut { value: Amount::from_sat(outp.amount), script_pubkey: spk })
+			},
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(ref outp) => {
+				let channel_parameters = outp.channel_parameters.as_ref().unwrap_or(fallback);
+				let directed = channel_parameters.as_counterparty_broadcastable();
+				let chan_keys = TxCreationKeys::from_channel_static_keys(
+					&outp.per_commitment_point, directed.broadcaster_pubkeys(),
+					directed.countersignatory_pubkeys(), secp_ctx,
+				);
+				let spk = crate::ln::chan_utils::get_taproot_htlc_spk(
+					secp_ctx, &outp.htlc, &chan_keys.broadcaster_htlc_key,
+					&chan_keys.countersignatory_htlc_key, &chan_keys.revocation_key,
+				);
+				Some(TxOut { value: Amount::from_sat(outp.htlc.amount_msat / 1000), script_pubkey: spk })
+			},
+			PackageSolvingData::CounterpartyReceivedHTLCOutput(ref outp) => {
+				let channel_parameters = outp.channel_parameters.as_ref().unwrap_or(fallback);
+				let directed = channel_parameters.as_counterparty_broadcastable();
+				let chan_keys = TxCreationKeys::from_channel_static_keys(
+					&outp.per_commitment_point, directed.broadcaster_pubkeys(),
+					directed.countersignatory_pubkeys(), secp_ctx,
+				);
+				let spk = crate::ln::chan_utils::get_taproot_htlc_spk(
+					secp_ctx, &outp.htlc, &chan_keys.broadcaster_htlc_key,
+					&chan_keys.countersignatory_htlc_key, &chan_keys.revocation_key,
+				);
+				Some(TxOut { value: Amount::from_sat(outp.htlc.amount_msat / 1000), script_pubkey: spk })
+			},
+			// Holder HTLC / funding outputs follow the untractable / pre-signed
+			// path (`get_maybe_finalized_tx`), not this malleable finalize path.
+			PackageSolvingData::HolderHTLCOutput(_) | PackageSolvingData::HolderFundingOutput(_) => None,
+		}
+	}
+	#[rustfmt::skip]
+	fn finalize_input<Signer: EcdsaChannelSigner>(&self, bumped_tx: &mut Transaction, i: usize, all_prevouts: &[TxOut], onchain_handler: &mut OnchainTxHandler<Signer>) -> bool {
 		let channel_parameters = onchain_handler.channel_parameters();
 		match self {
 			PackageSolvingData::RevokedOutput(ref outp) => {
@@ -894,6 +1094,34 @@ impl PackageSolvingData {
 					&outp.per_commitment_point, directed_parameters.broadcaster_pubkeys(),
 					directed_parameters.countersignatory_pubkeys(), &onchain_handler.secp_ctx,
 				);
+				if self.supports_simple_taproot(channel_parameters) {
+					// BIP341 script-path sweep of the revoked `to_local` via the revoke
+					// tapleaf (`<delayed> OP_DROP <revocation> OP_CHECKSIG`).
+					let counterparty_delayed = {
+						let cp = channel_parameters.counterparty_pubkeys();
+						match cp {
+							Some(cp) => crate::ln::channel_keys::DelayedPaymentKey::from_basepoint(
+								&onchain_handler.secp_ctx, &cp.delayed_payment_basepoint, &outp.per_commitment_point,
+							),
+							None => return false,
+						}
+					};
+					let leaf = chan_utils::get_taproot_to_local_revoke_script(
+						&chan_keys.revocation_key, &counterparty_delayed,
+					);
+					let spend_info = chan_utils::taproot_to_local_spend_info(
+						&onchain_handler.secp_ctx, &chan_keys.revocation_key,
+						outp.on_counterparty_tx_csv, &chan_keys.broadcaster_delayed_payment_key,
+					);
+					if let Ok(sig) = onchain_handler.signer.sign_justice_revoked_output_taproot(channel_parameters, &bumped_tx, i, outp.amount.to_sat(), &outp.per_commitment_key, all_prevouts, &onchain_handler.secp_ctx) {
+						let elem = chan_utils::taproot_schnorr_witness_element(&sig, bitcoin::sighash::TapSighashType::Default);
+						match chan_utils::build_taproot_script_path_witness(elem, &leaf, &spend_info) {
+							Ok(w) => bumped_tx.input[i].witness = w,
+							Err(_) => return false,
+						}
+					} else { return false; }
+					return true;
+				}
 				let witness_script = chan_utils::get_revokeable_redeemscript(&chan_keys.revocation_key, outp.on_counterparty_tx_csv, &chan_keys.broadcaster_delayed_payment_key);
 				//TODO: should we panic on signer failure ?
 				if let Ok(sig) = onchain_handler.signer.sign_justice_revoked_output(channel_parameters, &bumped_tx, i, outp.amount.to_sat(), &outp.per_commitment_key, &onchain_handler.secp_ctx) {
@@ -919,6 +1147,17 @@ impl PackageSolvingData {
 					&outp.per_commitment_point, directed_parameters.broadcaster_pubkeys(),
 					directed_parameters.countersignatory_pubkeys(), &onchain_handler.secp_ctx,
 				);
+				if self.supports_simple_taproot(channel_parameters) {
+					// Revoked taproot HTLC output: the HTLC tree's internal key IS the
+					// revocation key, so the breach path is a BIP341 KEY-PATH spend —
+					// witness is a single 64-byte Schnorr sig, no leaf/control block.
+					if let Ok(sig) = onchain_handler.signer.sign_justice_revoked_htlc_taproot(channel_parameters, &bumped_tx, i, outp.amount, &outp.per_commitment_key, &outp.htlc, all_prevouts, &onchain_handler.secp_ctx) {
+						let mut witness = Witness::new();
+						witness.push(sig.serialize().to_vec());
+						bumped_tx.input[i].witness = witness;
+					} else { return false; }
+					return true;
+				}
 				let witness_script = chan_utils::get_htlc_redeemscript(
 					&outp.htlc, &channel_parameters.channel_type_features, &chan_keys
 				);
@@ -946,6 +1185,29 @@ impl PackageSolvingData {
 					&outp.per_commitment_point, directed_parameters.broadcaster_pubkeys(),
 					directed_parameters.countersignatory_pubkeys(), &onchain_handler.secp_ctx,
 				);
+				if self.supports_simple_taproot(channel_parameters) {
+					// Claim a counterparty-OFFERED HTLC via the success tapleaf, revealing
+					// the preimage. Witness = [sig, preimage, leaf, control_block].
+					let leaf = chan_utils::get_taproot_offered_htlc_success_script(
+						&chan_keys.countersignatory_htlc_key, &outp.htlc.payment_hash,
+					);
+					let spend_info = chan_utils::taproot_htlc_spend_info(
+						&onchain_handler.secp_ctx, &outp.htlc, &chan_keys.broadcaster_htlc_key,
+						&chan_keys.countersignatory_htlc_key, &chan_keys.revocation_key,
+					);
+					if let Ok(sig) = onchain_handler.signer.sign_counterparty_htlc_transaction_taproot(channel_parameters, &bumped_tx, i, outp.htlc.amount_msat / 1000, &outp.per_commitment_point, &outp.htlc, all_prevouts, &onchain_handler.secp_ctx) {
+						let elem = chan_utils::taproot_schnorr_witness_element(&sig, bitcoin::sighash::TapSighashType::Default);
+						if let Some(control_block) = spend_info.control_block(&(leaf.clone(), bitcoin::taproot::LeafVersion::TapScript)) {
+							let mut witness = Witness::new();
+							witness.push(elem);
+							witness.push(outp.preimage.0.to_vec());
+							witness.push(leaf.as_bytes());
+							witness.push(control_block.serialize());
+							bumped_tx.input[i].witness = witness;
+						} else { return false; }
+					}
+					return true;
+				}
 				let witness_script = chan_utils::get_htlc_redeemscript(
 					&outp.htlc, &channel_parameters.channel_type_features, &chan_keys,
 				);
@@ -973,6 +1235,25 @@ impl PackageSolvingData {
 					&outp.per_commitment_point, directed_parameters.broadcaster_pubkeys(),
 					directed_parameters.countersignatory_pubkeys(), &onchain_handler.secp_ctx,
 				);
+				if self.supports_simple_taproot(channel_parameters) {
+					// Reclaim a counterparty-RECEIVED HTLC via the timeout tapleaf after
+					// the CLTV (the offerer = us). Witness = [sig, leaf, control_block].
+					let leaf = chan_utils::get_taproot_received_htlc_timeout_script(
+						&chan_keys.countersignatory_htlc_key, outp.htlc.cltv_expiry,
+					);
+					let spend_info = chan_utils::taproot_htlc_spend_info(
+						&onchain_handler.secp_ctx, &outp.htlc, &chan_keys.broadcaster_htlc_key,
+						&chan_keys.countersignatory_htlc_key, &chan_keys.revocation_key,
+					);
+					if let Ok(sig) = onchain_handler.signer.sign_counterparty_htlc_transaction_taproot(channel_parameters, &bumped_tx, i, outp.htlc.amount_msat / 1000, &outp.per_commitment_point, &outp.htlc, all_prevouts, &onchain_handler.secp_ctx) {
+						let elem = chan_utils::taproot_schnorr_witness_element(&sig, bitcoin::sighash::TapSighashType::Default);
+						match chan_utils::build_taproot_script_path_witness(elem, &leaf, &spend_info) {
+							Ok(w) => bumped_tx.input[i].witness = w,
+							Err(_) => return false,
+						}
+					}
+					return true;
+				}
 				let witness_script = chan_utils::get_htlc_redeemscript(
 					&outp.htlc, &channel_parameters.channel_type_features, &chan_keys,
 				);
@@ -1409,9 +1690,18 @@ impl PackageTemplate {
 		for (outpoint, outp) in self.inputs.iter() {
 			bumped_tx.input.push(outp.as_tx_input(*outpoint));
 		}
+		// BIP341 script-/key-path TapSighash (SIGHASH_DEFAULT) commits to ALL of
+		// the spending tx's prevouts. For a simple-taproot package, reconstruct
+		// every input's prevout TxOut (value + taproot scriptPubKey) up front so
+		// each `finalize_input` can compute its sighash over the full prevout set.
+		let all_prevouts: Vec<TxOut> = self.inputs.iter()
+			.map(|(_, outp)| outp.taproot_prevout(onchain_handler).unwrap_or(TxOut {
+				value: Amount::ZERO, script_pubkey: ScriptBuf::new(),
+			}))
+			.collect();
 		for (i, (outpoint, out)) in self.inputs.iter().enumerate() {
 			log_debug!(logger, "Adding claiming input for outpoint {}:{}", outpoint.txid, outpoint.vout);
-			if !out.finalize_input(&mut bumped_tx, i, onchain_handler) { continue; }
+			if !out.finalize_input(&mut bumped_tx, i, &all_prevouts, onchain_handler) { continue; }
 		}
 		Some(MaybeSignedTransaction(bumped_tx))
 	}
@@ -1777,6 +2067,7 @@ mod tests {
 		feerate_bump, weight_offered_htlc, weight_received_htlc, CounterpartyOfferedHTLCOutput,
 		CounterpartyReceivedHTLCOutput, HolderFundingOutput, HolderHTLCOutput, PackageSolvingData,
 		PackageTemplate, RevokedHTLCOutput, RevokedOutput, WEIGHT_REVOKED_OUTPUT,
+		WEIGHT_REVOKED_OUTPUT_TAPROOT,
 	};
 	use crate::chain::Txid;
 	use crate::ln::chan_utils::{
@@ -1825,6 +2116,30 @@ mod tests {
 				let dumb_scalar = SecretKey::from_slice(&<Vec<u8>>::from_hex("0101010101010101010101010101010101010101010101010101010101010101").unwrap()[..]).unwrap();
 				let dumb_point = PublicKey::from_secret_key(&secp_ctx, &dumb_scalar);
 				let channel_parameters = ChannelTransactionParameters::test_dummy(0);
+				PackageSolvingData::RevokedOutput(RevokedOutput::build(dumb_point, dumb_scalar, Amount::ZERO, channel_parameters, 0))
+			}
+		}
+	}
+
+	/// The channel type an `option_simple_taproot` channel actually negotiates
+	/// (`only_static_remote_key` + taproot + anchors) — see
+	/// `channel::channel_type_from_open_channel`.
+	fn simple_taproot_channel_type() -> ChannelTypeFeatures {
+		let mut features = ChannelTypeFeatures::only_static_remote_key();
+		features.set_simple_taproot_required();
+		features.set_anchors_zero_fee_htlc_tx_required();
+		features
+	}
+
+	#[rustfmt::skip]
+	macro_rules! dumb_taproot_revk_output {
+		() => {
+			{
+				let secp_ctx = Secp256k1::new();
+				let dumb_scalar = SecretKey::from_slice(&<Vec<u8>>::from_hex("0101010101010101010101010101010101010101010101010101010101010101").unwrap()[..]).unwrap();
+				let dumb_point = PublicKey::from_secret_key(&secp_ctx, &dumb_scalar);
+				let mut channel_parameters = ChannelTransactionParameters::test_dummy(0);
+				channel_parameters.channel_type_features = simple_taproot_channel_type();
 				PackageSolvingData::RevokedOutput(RevokedOutput::build(dumb_point, dumb_scalar, Amount::ZERO, channel_parameters, 0))
 			}
 		}
@@ -1917,6 +2232,7 @@ mod tests {
 						htlc,
 						preimage: Some(preimage),
 						counterparty_sig: commitment_tx.counterparty_htlc_sigs[0].clone(),
+						counterparty_sig_taproot: None,
 					},
 					0,
 				))
@@ -1954,6 +2270,7 @@ mod tests {
 						htlc,
 						preimage: None,
 						counterparty_sig: commitment_tx.counterparty_htlc_sigs[0].clone(),
+						counterparty_sig_taproot: None,
 					},
 					0,
 				))
@@ -2205,6 +2522,75 @@ mod tests {
 				assert_eq!(package.package_weight(&ScriptBuf::new()), weight_sans_output + weight_offered_htlc(channel_type_features));
 			}
 		}
+
+		{
+			// AUDIT-JUSTICE-WEIGHT: a simple-taproot revoked `to_local` must be predicted
+			// with the taproot script-path witness size, not the legacy P2WSH one.
+			let revk_outp = dumb_taproot_revk_output!();
+			let package = PackageTemplate::build_package(fake_txid(1), 0, revk_outp, 0);
+			assert_eq!(
+				package.package_weight(&ScriptBuf::new()),
+				weight_sans_output + WEIGHT_REVOKED_OUTPUT_TAPROOT,
+			);
+			// ...and it must NOT be the legacy value, which is an *under*-estimate here.
+			assert!(WEIGHT_REVOKED_OUTPUT_TAPROOT > WEIGHT_REVOKED_OUTPUT);
+		}
+	}
+
+	/// The predicted justice weight for a simple-taproot revoked `to_local` must be
+	/// at least the weight of the witness `finalize_input` actually assembles
+	/// (`[schnorr_sig, revoke_leaf, control_block]`). If it is not,
+	/// `OnchainTxHandler::generate_claim`'s release-mode
+	/// `assert!(predicted_weight >= transaction.weight())` panics on the breach-remedy
+	/// path — the justice transaction is never broadcast.
+	#[test]
+	fn test_taproot_revoked_output_weight_matches_real_witness() {
+		use crate::ln::chan_utils::{
+			build_taproot_script_path_witness, get_taproot_to_local_revoke_script,
+			taproot_to_local_spend_info, TxCreationKeys,
+		};
+
+		let secp_ctx = Secp256k1::new();
+		let dumb_scalar = SecretKey::from_slice(
+			&<Vec<u8>>::from_hex(
+				"0101010101010101010101010101010101010101010101010101010101010101",
+			)
+			.unwrap()[..],
+		)
+		.unwrap();
+		let per_commitment_point = PublicKey::from_secret_key(&secp_ctx, &dumb_scalar);
+
+		let mut channel_parameters = ChannelTransactionParameters::test_dummy(0);
+		channel_parameters.channel_type_features = simple_taproot_channel_type();
+		let directed = channel_parameters.as_counterparty_broadcastable();
+		let on_counterparty_tx_csv = directed.contest_delay();
+		let chan_keys = TxCreationKeys::from_channel_static_keys(
+			&per_commitment_point,
+			directed.broadcaster_pubkeys(),
+			directed.countersignatory_pubkeys(),
+			&secp_ctx,
+		);
+
+		// Exactly the leaf + tree `RevokedOutput::finalize_input` uses.
+		let leaf = get_taproot_to_local_revoke_script(
+			&chan_keys.revocation_key,
+			&chan_keys.broadcaster_delayed_payment_key,
+		);
+		let spend_info = taproot_to_local_spend_info(
+			&secp_ctx,
+			&chan_keys.revocation_key,
+			on_counterparty_tx_csv,
+			&chan_keys.broadcaster_delayed_payment_key,
+		);
+		// `SIGHASH_DEFAULT` ⇒ the sig element is the bare 64 bytes.
+		let witness = build_taproot_script_path_witness(vec![0u8; 64], &leaf, &spend_info)
+			.expect("revoke leaf is in the to_local tree");
+
+		// `package_weight` already accounts for the 2 WU segwit marker+flag separately,
+		// so the per-input contribution is exactly the serialized witness.
+		assert_eq!(witness.size() as u64, WEIGHT_REVOKED_OUTPUT_TAPROOT);
+		// The legacy constant would under-predict by 46 WU and trip the assertion.
+		assert!(WEIGHT_REVOKED_OUTPUT < witness.size() as u64);
 	}
 
 	struct TestFeeEstimator {

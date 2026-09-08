@@ -63,7 +63,7 @@ use crate::ln::interactivetxs::{
 	TX_COMMON_FIELDS_WEIGHT,
 };
 use crate::ln::msgs;
-use crate::ln::msgs::{ClosingSigned, ClosingSignedFeeRange, DecodeError, OnionErrorPacket};
+use crate::ln::msgs::{ClosingSigned, ClosingSignedFeeRange, DecodeError, OnionErrorPacket, PartialSignatureWithNonce};
 use crate::ln::onion_utils::{
 	AttributionData, HTLCFailReason, LocalHTLCFailureReason, HOLD_TIME_UNIT_MILLIS,
 };
@@ -73,6 +73,7 @@ use crate::ln::LN_MAX_MSG_LEN;
 use crate::offers::static_invoice::StaticInvoice;
 use crate::routing::gossip::NodeId;
 use crate::sign::ecdsa::EcdsaChannelSigner;
+use crate::sign::taproot::TaprootChannelSigner;
 use crate::sign::tx_builder::{HTLCAmountDirection, NextCommitmentStats, SpecTxBuilder, TxBuilder};
 use crate::sign::{ChannelSigner, EntropySource, NodeSigner, Recipient, SignerProvider};
 use crate::types::features::{ChannelTypeFeatures, InitFeatures};
@@ -871,6 +872,21 @@ impl ChannelState {
 }
 
 pub const INITIAL_COMMITMENT_NUMBER: u64 = (1 << 48) - 1;
+
+/// The placeholder value for the legacy ECDSA `signature` field of
+/// `funding_created`/`funding_signed`/`commitment_signed`/`closing_signed` on a
+/// **simple taproot channel**, where the real authorization is carried in
+/// `partial_signature_with_nonce` instead (`bolt-simple-taproot.md` §1 mandates a
+/// 0-byte-array of length 64). A bare all-zero `secp256k1::ecdsa::Signature` is not
+/// a representable/decodable value, so we use a fixed low-S DER-valid dummy; the
+/// receiving taproot path ignores this field entirely (it verifies the partial).
+fn taproot_unused_ecdsa_sig() -> Signature {
+	// r = s = 1 — the smallest valid compact signature; deterministic + decodable.
+	let mut compact = [0u8; 64];
+	compact[31] = 1;
+	compact[63] = 1;
+	Signature::from_compact(&compact).expect("constant compact signature is valid")
+}
 
 pub const DEFAULT_MAX_HTLCS: u16 = 50;
 
@@ -1897,7 +1913,7 @@ where
 		let commitment_signed = self
 			.funding_tx_constructed(funding_outpoint, logger)
 			.map_err(|abort_reason| self.fail_interactive_tx_negotiation(abort_reason, logger))?;
-		Ok((interactive_tx_msg_send, Some(commitment_signed)))
+		Ok((interactive_tx_msg_send, commitment_signed))
 	}
 
 	pub fn tx_abort<L: Deref>(
@@ -2005,7 +2021,7 @@ where
 
 	fn funding_tx_constructed<L: Deref>(
 		&mut self, funding_outpoint: OutPoint, logger: &L,
-	) -> Result<msgs::CommitmentSigned, AbortReason>
+	) -> Result<Option<msgs::CommitmentSigned>, AbortReason>
 	where
 		L::Target: Logger,
 	{
@@ -2034,8 +2050,12 @@ where
 					.take()
 					.expect("PendingV2Channel::interactive_tx_constructor should be set");
 
-				let commitment_signed =
-					chan.context.get_initial_commitment_signed_v2(&chan.funding, &&logger);
+				// V2 dual-funding OPEN: taproot is deferred here (no splice parent), so
+				// the holder commitment number is unused by the taproot arm; pass the
+				// initial number.
+				let commitment_signed = chan.context.get_initial_commitment_signed_v2(
+					&chan.funding, INITIAL_COMMITMENT_NUMBER, &&logger,
+				);
 				let commitment_signed = match commitment_signed {
 					Some(commitment_signed) => commitment_signed,
 					// TODO(dual_funding): Support async signing
@@ -2046,7 +2066,7 @@ where
 					},
 				};
 
-				(interactive_tx_constructor, commitment_signed)
+				(interactive_tx_constructor, Some(commitment_signed))
 			},
 			ChannelPhase::Funded(chan) => {
 				if let Some(pending_splice) = chan.pending_splice.as_mut() {
@@ -2075,8 +2095,41 @@ where
 						.and_then(|(is_initiator, mut funding, interactive_tx_constructor)| {
 							funding.channel_transaction_parameters.funding_outpoint =
 								Some(funding_outpoint);
-							match chan.context.get_initial_commitment_signed_v2(&funding, &&logger)
-							{
+							// Our holder commitment height for the splice's new commitment
+							// (taproot: our Q'-bound `next_local_nonce` is derived here).
+							let holder_commitment_number =
+								chan.holder_commitment_point.current_transaction_number();
+							// SIMPLE-TAPROOT SPLICE (spec §9c / §9f-0): the splice acceptor must
+							// partial-sign the INITIATOR's new commitment against the initiator's
+							// Q'-bound verification nonce, but that nonce only arrives in the
+							// initiator's `commitment_signed` (`next_local_nonce`), which the
+							// acceptor receives AFTER this `tx_complete`. The acceptor cannot
+							// pre-compute it: the rotated funding keys (hence `Q'`, into which the
+							// MuSig2 nonce is bound) require BOTH parties' splice pubkeys, and the
+							// initiator can't advertise its `Q'`-bound nonce until it learns the
+							// acceptor's rotated key from `splice_ack`. So the acceptor DEFERS its
+							// `commitment_signed` until `splice_initial_commitment_signed`, where
+							// it has stored the initiator's nonce — mirroring how a V1 taproot
+							// OPEN fundee signs in `funding_signed` (after `funding_created`
+							// carried the funder's nonce). The initiator already has the acceptor's
+							// `Q'`-bound nonce from `splice_ack`, so it signs here as normal.
+							let defer_taproot_acceptor_commitment_signed = !is_initiator
+								&& funding.get_channel_type().supports_simple_taproot()
+								&& funding
+									.channel_transaction_parameters
+									.splice_parent_funding_txid
+									.is_some();
+							if defer_taproot_acceptor_commitment_signed {
+								pending_splice.funding_negotiation =
+									Some(FundingNegotiation::AwaitingSignatures {
+										is_initiator,
+										funding,
+									});
+								return Ok((interactive_tx_constructor, None));
+							}
+							match chan.context.get_initial_commitment_signed_v2(
+								&funding, holder_commitment_number, &&logger,
+							) {
 								Some(commitment_signed) => {
 									// Advance the state
 									pending_splice.funding_negotiation =
@@ -2084,7 +2137,7 @@ where
 											is_initiator,
 											funding,
 										});
-									Ok((interactive_tx_constructor, commitment_signed))
+									Ok((interactive_tx_constructor, Some(commitment_signed)))
 								},
 								// TODO(splicing): Support async signing
 								None => {
@@ -2127,7 +2180,7 @@ where
 	#[rustfmt::skip]
 	pub fn commitment_signed<F: Deref, L: Deref>(
 		&mut self, msg: &msgs::CommitmentSigned, best_block: BestBlock, signer_provider: &SP, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L
-	) -> Result<(Option<ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>>, Option<ChannelMonitorUpdate>), ChannelError>
+	) -> Result<(Option<ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>>, Option<ChannelMonitorUpdate>, Option<msgs::CommitmentSigned>), ChannelError>
 	where
 		F::Target: FeeEstimator,
 		L::Target: Logger
@@ -2153,7 +2206,7 @@ where
 					quiescent_action: None,
 				};
 				let res = funded_channel.initial_commitment_signed_v2(msg, best_block, signer_provider, logger)
-					.map(|monitor| (Some(monitor), None))
+					.map(|monitor| (Some(monitor), None, None))
 					// TODO: Change to `inspect_err` when MSRV is high enough.
 					.map_err(|err| {
 						// We always expect a `ChannelError` close.
@@ -2182,10 +2235,10 @@ where
 				let res = if has_negotiated_pending_splice && !session_received_commitment_signed {
 					funded_channel
 						.splice_initial_commitment_signed(msg, fee_estimator, logger)
-						.map(|monitor_update_opt| (None, monitor_update_opt))
+						.map(|(monitor_update_opt, commitment_signed_opt)| (None, monitor_update_opt, commitment_signed_opt))
 				} else {
 					funded_channel.commitment_signed(msg, fee_estimator, logger)
-						.map(|monitor_update_opt| (None, monitor_update_opt))
+						.map(|monitor_update_opt| (None, monitor_update_opt, None))
 				};
 
 				self.phase = ChannelPhase::Funded(funded_channel);
@@ -2472,6 +2525,24 @@ impl FundingScope {
 		self.channel_transaction_parameters.make_funding_redeemscript()
 	}
 
+	/// The funding output **scriptPubKey** the funding transaction must pay to.
+	///
+	/// For simple-taproot channels (M6) this is the P2TR `0x5120 || Q` key-path
+	/// output ([`channel_taproot_script_pubkey`], spec §2); for all other channel
+	/// types it is the legacy P2WSH 2-of-2 (`get_funding_redeemscript().to_p2wsh()`).
+	/// Panics if called before accept_channel/InboundV1Channel::new.
+	pub fn get_funding_spk(&self) -> ScriptBuf {
+		if self.get_channel_type().supports_simple_taproot() {
+			chan_utils::channel_taproot_script_pubkey(
+				self.holder_funding_pubkey(),
+				self.counterparty_funding_pubkey(),
+			)
+			.expect("funding pubkeys are valid points")
+		} else {
+			self.get_funding_redeemscript().to_p2wsh()
+		}
+	}
+
 	fn holder_funding_pubkey(&self) -> &PublicKey {
 		&self.get_holder_pubkeys().funding_pubkey
 	}
@@ -2612,12 +2683,21 @@ impl FundingScope {
 
 		let prev_output = TxOut {
 			value: Amount::from_sat(self.get_value_satoshis()),
-			script_pubkey: self.get_funding_redeemscript().to_p2wsh(),
+			script_pubkey: self.get_funding_spk(),
 		};
 
 		let local_owned = self.value_to_self_msat / 1000;
 		let holder_sig_first = self.holder_funding_pubkey().serialize()[..]
 			< self.counterparty_funding_pubkey().serialize()[..];
+
+		// For a simple-taproot channel the old funding output is `0x5120||Q` (key-path),
+		// so carry the funding pubkeys for MuSig2 aggregation at finalize rather than a
+		// P2WSH `witness_script` (spec §9c).
+		let taproot_funding_pubkeys = if self.get_channel_type().supports_simple_taproot() {
+			Some((*self.holder_funding_pubkey(), *self.counterparty_funding_pubkey()))
+		} else {
+			None
+		};
 
 		SharedOwnedInput::new(
 			input,
@@ -2625,6 +2705,7 @@ impl FundingScope {
 			local_owned,
 			holder_sig_first,
 			self.get_funding_redeemscript(),
+			taproot_funding_pubkeys,
 		)
 	}
 }
@@ -2723,6 +2804,7 @@ impl FundingNegotiation {
 impl PendingFunding {
 	fn check_get_splice_locked<SP: Deref>(
 		&mut self, context: &ChannelContext<SP>, confirmed_funding_index: usize, height: u32,
+		holder_next_commitment_number: u64,
 	) -> Option<msgs::SpliceLocked>
 	where
 		SP::Target: SignerProvider,
@@ -2745,9 +2827,20 @@ impl PendingFunding {
 		match self.sent_funding_txid {
 			Some(sent_funding_txid) if confirmed_funding_txid == sent_funding_txid => None,
 			_ => {
+				// Simple-taproot (§10 audit, HTLC↔splice): advertise our fresh Q'-bound
+				// verification nonce for the FIRST post-splice commitment, at the next
+				// holder commitment height. The splice-initial `commitment_signed`
+				// exchange has no `revoke_and_ack`, so its `next_local_nonce` (consumed
+				// by the peer's splice-initial REVERSE commitment) cannot also serve the
+				// following commitment; `splice_locked` is the post-splice analog of
+				// `channel_ready`'s nonce advertisement. Bound to Q' via the CANDIDATE
+				// (spliced) funding scope, which carries the rotated funding pubkeys.
+				let next_local_nonce = context
+					.generate_holder_next_local_nonce(funding, holder_next_commitment_number);
 				let splice_locked = msgs::SpliceLocked {
 					channel_id: context.channel_id(),
 					splice_txid: confirmed_funding_txid,
+					next_local_nonce,
 				};
 				self.sent_funding_txid = Some(splice_locked.splice_txid);
 				Some(splice_locked)
@@ -2870,6 +2963,43 @@ where
 	holder_signer: ChannelSignerType<SP>,
 	shutdown_scriptpubkey: Option<ShutdownScript>,
 	destination_script: ScriptBuf,
+
+	// === Simple taproot channels (M6) ===
+	// The counterparty's current MuSig2 *verification* nonce — the most recent
+	// `next_local_nonce` we received (from open_channel/accept_channel, then
+	// refreshed by funding_created/funding_signed/commitment_signed/channel_ready
+	// per `bolt-simple-taproot.md` §4). We partial-sign the counterparty's next
+	// commitment against this nonce. `None` for non-taproot channels and until the
+	// first nonce is received. Never persisted across a reconnect (re-exchanged
+	// fresh); re-derivable on our side from the shachain root.
+	cur_counterparty_taproot_nonce: Option<musig2::PubNonce>,
+	// The counterparty's current cooperative-close nonce (their `shutdown_nonce`,
+	// then the `next_closee_nonce` from each RBF `closing_sig`). Spec §5.
+	cur_counterparty_closing_nonce: Option<musig2::PubNonce>,
+	// Our cooperative-close ROUND index (taproot only). `0` for the `shutdown` /
+	// first `closing_signed`; bumped for every subsequent fee-negotiation round so
+	// each distinct close tx we sign uses a FRESH MuSig2 nonce derived at
+	// `closing_nonce_height(closing_round)`. Reusing a nonce across two different
+	// close txs (different fees) leaks the funding private key — spec §9f-0. The
+	// advertised `shutdown_nonce`/`next_closee_nonce` and the partial we sign each
+	// round MUST use this same round so the advertised nonce equals the signing one.
+	// PERSISTED (TLV 71) so the monotonic guarantee survives a process restart —
+	// otherwise a reload resets it to 0 and a re-signed close at a different fee
+	// reuses round 0's nonce (funding-key leak). See `closing_partial_sent_at_round`.
+	closing_round: u64,
+	// Whether we have already produced+sent a cooperative-close MuSig2 partial at
+	// the CURRENT `closing_round` (i.e. that round's deterministic nonce is
+	// consumed). PERSISTED (TLV 73). `last_sent_closing_fee` is connection state and
+	// is reset to `None` on both reconnect AND reload, so it cannot tell a restarted
+	// node that round N's nonce was already used in a prior life; this flag can, so
+	// the reconnect bump fires after a restart and never re-signs a consumed round.
+	closing_partial_sent_at_round: bool,
+	// The counterparty's MuSig2 splice nonce (their `splice_init`/`splice_ack`
+	// `splice_nonce`) for the interactive key-path sign of the splice's shared
+	// (old-funding) input (spec §9c). Stored on splice handshake; consumed when we
+	// produce our splice partial at `funding_tx_signed`. `None` outside an active
+	// taproot splice; re-exchanged fresh on reconnect.
+	cur_counterparty_splice_nonce: Option<musig2::PubNonce>,
 
 	// Our commitment numbers start at 2^48-1 and count down, whereas the ones used in transaction
 	// generation start at 0 and count up...this simplifies some parts of implementation at the
@@ -3132,16 +3262,61 @@ where
 
 	#[rustfmt::skip]
 	fn check_counterparty_commitment_signature<L: Deref>(
-		&self, sig: &Signature, holder_commitment_point: &HolderCommitmentPoint, logger: &L
-	) -> Result<CommitmentTransaction, ChannelError> where L::Target: Logger {
-		let funding_script = self.funding().get_funding_redeemscript();
-
+		&self, sig: &Signature, taproot_partial: Option<&PartialSignatureWithNonce>,
+		holder_commitment_point: &HolderCommitmentPoint, logger: &L
+	) -> Result<(CommitmentTransaction, Option<bitcoin::secp256k1::schnorr::Signature>), ChannelError> where L::Target: Logger {
 		let commitment_data = self.context().build_commitment_transaction(self.funding(),
 			holder_commitment_point.next_transaction_number(), &holder_commitment_point.next_point(),
 			true, false, logger);
 		let initial_commitment_tx = commitment_data.tx;
 		let trusted_tx = initial_commitment_tx.trust();
 		let initial_commitment_bitcoin_tx = trusted_tx.built_transaction();
+
+		if self.funding().get_channel_type().supports_simple_taproot() {
+			// Simple taproot: verify the counterparty's MuSig2 key-path partial over
+			// our holder commitment by aggregating with our own partial and checking
+			// the resulting BIP340 sig against the tweaked aggregate Q (spec §3).
+			let psn = taproot_partial.ok_or_else(|| ChannelError::close(
+				format!("Missing partial_signature_with_nonce in {}", self.received_msg())))?;
+			let funding_spk = self.funding().get_funding_spk();
+			let bitcoin_tx = &initial_commitment_bitcoin_tx.transaction;
+			let sighash = chan_utils::taproot_funding_keyspend_sighash(
+				bitcoin_tx, 0, bitcoin::Amount::from_sat(self.funding().get_value_satoshis()), &funding_spk,
+			).map_err(|_| ChannelError::close("taproot sighash computation failed".to_owned()))?;
+			let message: [u8; 32] = *sighash.as_ref();
+
+			// Produce OUR partial over the same holder-commitment sighash so we can
+			// aggregate. `finalize_holder_commitment` derives our deterministic nonce
+			// for this holder commitment height and signs against the counterparty's
+			// nonce (carried in their `partial_signature_with_nonce`).
+			self.context().provide_taproot_context_to_signer(self.funding());
+			let holder_commitment_tx = HolderCommitmentTransaction::new(
+				initial_commitment_tx.clone(), taproot_unused_ecdsa_sig(), Vec::new(),
+				&self.funding().get_holder_pubkeys().funding_pubkey,
+				&self.funding().counterparty_funding_pubkey(),
+			);
+			let taproot_signer = self.context().holder_signer.as_taproot()
+				.ok_or_else(|| ChannelError::close("taproot channel without taproot signer".to_owned()))?;
+			let our_partial = taproot_signer.finalize_holder_commitment(
+				&holder_commitment_tx, psn.clone(), &self.context().secp_ctx,
+			).map_err(|_| ChannelError::close("failed to produce holder taproot partial".to_owned()))?;
+			// Re-derive our pubnonce for this height (deterministic) to aggregate.
+			let our_pubnonce = taproot_signer.generate_local_nonce_pair(
+				holder_commitment_point.next_transaction_number(), &self.context().secp_ctx,
+			);
+			let PartialSignatureWithNonce(cp_partial, cp_pubnonce) = psn.clone();
+			// Aggregate → the BIP340 key-path sig and RETURN it (don't discard): it is
+			// the funding witness for a later unilateral force-close (spec §9a).
+			let agg_sig = chan_utils::verify_taproot_keyspend_partials(
+				&self.funding().get_holder_pubkeys().funding_pubkey,
+				self.funding().counterparty_funding_pubkey(),
+				&message, our_partial, our_pubnonce, cp_partial, cp_pubnonce,
+			).map_err(|e| ChannelError::close(format!("Invalid {} taproot signature from peer: {}", self.received_msg(), e)))?;
+
+			return Ok((initial_commitment_tx, Some(agg_sig)));
+		}
+
+		let funding_script = self.funding().get_funding_redeemscript();
 		let sighash = initial_commitment_bitcoin_tx.get_sighash_all(&funding_script, self.funding().get_value_satoshis());
 		// They sign the holder commitment transaction...
 		log_trace!(logger, "Checking {} tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} for channel {}.",
@@ -3150,18 +3325,20 @@ where
 			encode::serialize_hex(&funding_script), &self.context().channel_id());
 		secp_check!(self.context().secp_ctx.verify_ecdsa(&sighash, sig, self.funding().counterparty_funding_pubkey()), format!("Invalid {} signature from peer", self.received_msg()));
 
-		Ok(initial_commitment_tx)
+		Ok((initial_commitment_tx, None))
 	}
 
 	#[rustfmt::skip]
 	fn initial_commitment_signed<L: Deref>(
-		&mut self, channel_id: ChannelId, counterparty_signature: Signature, holder_commitment_point: &mut HolderCommitmentPoint,
+		&mut self, channel_id: ChannelId, counterparty_signature: Signature,
+		counterparty_taproot_partial: Option<PartialSignatureWithNonce>,
+		holder_commitment_point: &mut HolderCommitmentPoint,
 		best_block: BestBlock, signer_provider: &SP, logger: &L,
 	) -> Result<(ChannelMonitor<<SP::Target as SignerProvider>::EcdsaSigner>, CommitmentTransaction), ChannelError>
 	where
 		L::Target: Logger
 	{
-		let initial_commitment_tx = match self.check_counterparty_commitment_signature(&counterparty_signature, holder_commitment_point, logger) {
+		let (initial_commitment_tx, taproot_holder_keyspend_sig) = match self.check_counterparty_commitment_signature(&counterparty_signature, counterparty_taproot_partial.as_ref(), holder_commitment_point, logger) {
 			Ok(res) => res,
 			Err(ChannelError::Close(e)) => {
 				// TODO(dual_funding): Update for V2 established channels.
@@ -3187,13 +3364,18 @@ where
 		log_trace!(logger, "Initial counterparty tx for channel {} is: txid {} tx {}",
 			&context.channel_id(), counterparty_initial_bitcoin_tx.txid, encode::serialize_hex(&counterparty_initial_bitcoin_tx.transaction));
 
-		let holder_commitment_tx = HolderCommitmentTransaction::new(
+		let mut holder_commitment_tx = HolderCommitmentTransaction::new(
 			initial_commitment_tx,
 			counterparty_signature,
 			Vec::new(),
 			&self.funding().get_holder_pubkeys().funding_pubkey,
 			&self.funding().counterparty_funding_pubkey()
 		);
+		// Persist the aggregated key-path funding sig for the INITIAL holder
+		// commitment so a force-close right after open can still broadcast it (§9a).
+		if let Some(sig) = taproot_holder_keyspend_sig {
+			holder_commitment_tx = holder_commitment_tx.with_taproot_key_path_sig(sig);
+		}
 
 		if context.holder_signer.as_ref().validate_holder_commitment(&holder_commitment_tx, Vec::new()).is_err() {
 			return Err(ChannelError::close("Failed to validate our commitment".to_owned()));
@@ -3383,7 +3565,15 @@ where
 		let channel_value_satoshis = our_funding_satoshis.saturating_add(open_channel_fields.funding_satoshis);
 
 		let channel_keys_id = signer_provider.generate_channel_keys_id(true, user_id);
-		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
+		// Simple-taproot channels (M6) hold a `ChannelSignerType::Taproot(_)` so the
+		// MuSig2 key-path send-arms are reachable; everything else keeps `Ecdsa(_)`.
+		let holder_signer = if channel_type.supports_simple_taproot() {
+			ChannelSignerType::Taproot(
+				signer_provider.derive_taproot_channel_signer(channel_keys_id),
+			)
+		} else {
+			ChannelSignerType::Ecdsa(signer_provider.derive_channel_signer(channel_keys_id))
+		};
 
 		if config.channel_handshake_config.our_to_self_delay < BREAKDOWN_TIMEOUT {
 			return Err(ChannelError::close(format!("Configured with an unreasonable our_to_self_delay ({}) putting user funds at risks. It must be greater than {}", config.channel_handshake_config.our_to_self_delay, BREAKDOWN_TIMEOUT)));
@@ -3542,7 +3732,7 @@ where
 
 		// TODO(dual_funding): Checks for `funding_feerate_sat_per_1000_weight`?
 
-		let pubkeys = holder_signer.pubkeys(&secp_ctx);
+		let pubkeys = holder_signer.as_ref().pubkeys(&secp_ctx);
 
 		let funding = FundingScope {
 			value_to_self_msat,
@@ -3601,9 +3791,14 @@ where
 
 			latest_monitor_update_id: 0,
 
-			holder_signer: ChannelSignerType::Ecdsa(holder_signer),
+			holder_signer,
 			shutdown_scriptpubkey,
 			destination_script,
+			cur_counterparty_taproot_nonce: None,
+			cur_counterparty_closing_nonce: None,
+			closing_round: 0,
+			closing_partial_sent_at_round: false,
+			cur_counterparty_splice_nonce: None,
 
 			counterparty_next_commitment_transaction_number: INITIAL_COMMITMENT_NUMBER,
 
@@ -3780,7 +3975,18 @@ where
 			Err(_) => return Err(APIError::ChannelUnavailable { err: "Failed to get destination script".to_owned()}),
 		};
 
-		let pubkeys = holder_signer.pubkeys(&secp_ctx);
+		// Simple-taproot channels (M6) hold a `ChannelSignerType::Taproot(_)` so the
+		// MuSig2 key-path send-arms are reachable; everything else keeps `Ecdsa(_)`.
+		// The passed-in (ECDSA) `holder_signer` is keyed identically, so for taproot
+		// we re-derive the taproot signer from the same `channel_keys_id`.
+		let holder_signer = if channel_type.supports_simple_taproot() {
+			ChannelSignerType::Taproot(
+				signer_provider.derive_taproot_channel_signer(channel_keys_id),
+			)
+		} else {
+			ChannelSignerType::Ecdsa(holder_signer)
+		};
+		let pubkeys = holder_signer.as_ref().pubkeys(&secp_ctx);
 		let temporary_channel_id = temporary_channel_id_fn.map(|f| f(&pubkeys))
 			.unwrap_or_else(|| ChannelId::temporary_from_entropy_source(entropy_source));
 
@@ -3839,9 +4045,14 @@ where
 
 			latest_monitor_update_id: 0,
 
-			holder_signer: ChannelSignerType::Ecdsa(holder_signer),
+			holder_signer,
 			shutdown_scriptpubkey,
 			destination_script,
+			cur_counterparty_taproot_nonce: None,
+			cur_counterparty_closing_nonce: None,
+			closing_round: 0,
+			closing_partial_sent_at_round: false,
+			cur_counterparty_splice_nonce: None,
 
 			counterparty_next_commitment_transaction_number: INITIAL_COMMITMENT_NUMBER,
 
@@ -4943,9 +5154,56 @@ where
 			false,
 			logger,
 		);
+		// For a simple-taproot channel, the aggregated key-path funding Schnorr sig
+		// over OUR holder commitment, formed here from both partials so it can be
+		// stored for a later unilateral force-close broadcast (spec §9a).
+		let mut taproot_holder_keyspend_sig: Option<bitcoin::secp256k1::schnorr::Signature> = None;
 		let commitment_txid = {
 			let trusted_tx = commitment_data.tx.trust();
 			let bitcoin_tx = trusted_tx.built_transaction();
+
+			if funding.get_channel_type().supports_simple_taproot() {
+				// Simple taproot: verify the counterparty's MuSig2 key-path partial
+				// over our holder commitment by aggregating with our own partial and
+				// checking the BIP340 sig against the tweaked aggregate Q (spec §3).
+				let psn = msg.partial_signature_with_nonce.as_ref().ok_or_else(|| {
+					ChannelError::close("Missing partial_signature_with_nonce in commitment_signed".to_owned())
+				})?;
+				let funding_spk = funding.get_funding_spk();
+				let sighash = chan_utils::taproot_funding_keyspend_sighash(
+					&bitcoin_tx.transaction, 0,
+					bitcoin::Amount::from_sat(funding.get_value_satoshis()), &funding_spk,
+				).map_err(|_| ChannelError::close("taproot sighash computation failed".to_owned()))?;
+				let message: [u8; 32] = *sighash.as_ref();
+
+				self.provide_taproot_context_to_signer(funding);
+				let placeholder_holder_tx = HolderCommitmentTransaction::new(
+					commitment_data.tx.clone(), taproot_unused_ecdsa_sig(), Vec::new(),
+					&funding.get_holder_pubkeys().funding_pubkey, funding.counterparty_funding_pubkey(),
+				);
+				let taproot_signer = self.holder_signer.as_taproot().ok_or_else(|| {
+					ChannelError::close("taproot channel without taproot signer".to_owned())
+				})?;
+				let our_partial = taproot_signer.finalize_holder_commitment(
+					&placeholder_holder_tx, psn.clone(), &self.secp_ctx,
+				).map_err(|_| ChannelError::close("failed to produce holder taproot partial".to_owned()))?;
+				let our_pubnonce = taproot_signer.generate_local_nonce_pair(
+					transaction_number, &self.secp_ctx,
+				);
+				let PartialSignatureWithNonce(cp_partial, cp_pubnonce) = psn.clone();
+				// Aggregate both partials → the BIP340 key-path sig. We STORE it (below,
+				// on the holder commitment) instead of discarding it: MuSig2 funding
+				// signing is interactive, so this is the only moment we can form the sig
+				// that lets us force-close unilaterally later (spec §9a).
+				let agg_sig = chan_utils::verify_taproot_keyspend_partials(
+					&funding.get_holder_pubkeys().funding_pubkey,
+					funding.counterparty_funding_pubkey(),
+					&message, our_partial, our_pubnonce, cp_partial, cp_pubnonce,
+				).map_err(|e| ChannelError::close(
+					format!("Invalid commitment tx taproot signature from peer: {}", e)))?;
+				taproot_holder_keyspend_sig = Some(agg_sig);
+				bitcoin_tx.txid
+			} else {
 			let sighash = bitcoin_tx.get_sighash_all(&funding_script, funding.get_value_satoshis());
 
 			log_trace!(logger, "Checking commitment tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} in channel {}",
@@ -4965,6 +5223,7 @@ where
 				));
 			}
 			bitcoin_tx.txid
+			}
 		};
 
 		// If our counterparty updated the channel fee in this commitment transaction, check that
@@ -4975,73 +5234,147 @@ where
 			self.validate_update_fee(funding, fee_estimator, new_feerate_per_kw)?;
 		}
 
-		if msg.htlc_signatures.len() != commitment_data.tx.nondust_htlcs().len() {
-			return Err(ChannelError::close(format!(
-				"Got wrong number of HTLC signatures ({}) from remote. It must be {}",
-				msg.htlc_signatures.len(),
-				commitment_data.tx.nondust_htlcs().len()
-			)));
-		}
-
+		let channel_type = funding.get_channel_type();
 		let holder_keys = commitment_data.tx.trust().keys();
-		for (htlc, counterparty_sig) in
-			commitment_data.tx.nondust_htlcs().iter().zip(msg.htlc_signatures.iter())
-		{
-			assert!(htlc.transaction_output_index.is_some());
-			let htlc_tx = chan_utils::build_htlc_transaction(
-				&commitment_txid,
-				commitment_data.tx.negotiated_feerate_per_kw(),
-				funding.get_counterparty_selected_contest_delay().unwrap(),
-				&htlc,
-				funding.get_channel_type(),
-				&holder_keys.broadcaster_delayed_payment_key,
-				&holder_keys.revocation_key,
-			);
+		let nondust_count = commitment_data.tx.nondust_htlcs().len();
 
-			let htlc_redeemscript =
-				chan_utils::get_htlc_redeemscript(&htlc, funding.get_channel_type(), &holder_keys);
-			let channel_type = funding.get_channel_type();
-			let htlc_sighashtype = if channel_type.supports_anchors_zero_fee_htlc_tx()
-				|| channel_type.supports_anchor_zero_fee_commitments()
+		if channel_type.supports_simple_taproot() {
+			// Simple-taproot channels (spec §3, M9b): the per-HTLC sigs are plain
+			// BIP340 Schnorr over the second-level HTLC tx (script-path spend of
+			// the 2-of-2 leaf), carried in `htlc_partial_signatures`. The ECDSA
+			// `htlc_signatures` vec is empty for taproot.
+			if msg.htlc_partial_signatures.len() != nondust_count {
+				return Err(ChannelError::close(format!(
+					"Got wrong number of taproot HTLC signatures ({}) from remote. It must be {}",
+					msg.htlc_partial_signatures.len(),
+					nondust_count
+				)));
+			}
+			let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+			for (htlc, counterparty_sig) in
+				commitment_data.tx.nondust_htlcs().iter().zip(msg.htlc_partial_signatures.iter())
 			{
-				EcdsaSighashType::SinglePlusAnyoneCanPay
-			} else {
-				EcdsaSighashType::All
-			};
-			let htlc_sighash = hash_to_message!(
-				&sighash::SighashCache::new(&htlc_tx)
-					.p2wsh_signature_hash(
-						0,
-						&htlc_redeemscript,
-						htlc.to_bitcoin_amount(),
-						htlc_sighashtype
-					)
-					.unwrap()[..]
-			);
-			log_trace!(logger, "Checking HTLC tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} in channel {}.",
-				log_bytes!(counterparty_sig.serialize_compact()[..]),
-				log_bytes!(holder_keys.countersignatory_htlc_key.to_public_key().serialize()),
-				encode::serialize_hex(&htlc_tx),
-				log_bytes!(htlc_sighash[..]),
-				encode::serialize_hex(&htlc_redeemscript),
-				&self.channel_id(),
-			);
-			if let Err(_) = self.secp_ctx.verify_ecdsa(
-				&htlc_sighash,
-				&counterparty_sig,
-				&holder_keys.countersignatory_htlc_key.to_public_key(),
-			) {
-				return Err(ChannelError::close("Invalid HTLC tx signature from peer".to_owned()));
+				assert!(htlc.transaction_output_index.is_some());
+				let htlc_tx = chan_utils::build_htlc_transaction(
+					&commitment_txid,
+					commitment_data.tx.negotiated_feerate_per_kw(),
+					funding.get_counterparty_selected_contest_delay().unwrap(),
+					&htlc,
+					channel_type,
+					&holder_keys.broadcaster_delayed_payment_key,
+					&holder_keys.revocation_key,
+					&self.secp_ctx,
+				);
+				// The HTLC commitment output's P2TR scriptPubKey + the 2-of-2 leaf
+				// the counterparty's signature covers.
+				let htlc_spk = chan_utils::get_taproot_htlc_spk(
+					&self.secp_ctx,
+					&htlc,
+					&holder_keys.broadcaster_htlc_key,
+					&holder_keys.countersignatory_htlc_key,
+					&holder_keys.revocation_key,
+				);
+				let leaf = chan_utils::taproot_htlc_remote_sig_leaf(
+					&htlc,
+					&holder_keys.broadcaster_htlc_key,
+					&holder_keys.countersignatory_htlc_key,
+				);
+				let htlc_sighash = chan_utils::taproot_htlc_leaf_sighash(
+					&htlc_tx,
+					0,
+					htlc.to_bitcoin_amount(),
+					&htlc_spk,
+					&leaf,
+					bitcoin::sighash::TapSighashType::SinglePlusAnyoneCanPay,
+				).map_err(|e| ChannelError::close(format!("Taproot HTLC sighash failed: {}", e)))?;
+				let msg340 = bitcoin::secp256k1::Message::from_digest(*htlc_sighash.as_ref());
+				let cp_xonly =
+					holder_keys.countersignatory_htlc_key.to_public_key().x_only_public_key().0;
+				if secp.verify_schnorr(counterparty_sig, &msg340, &cp_xonly).is_err() {
+					return Err(ChannelError::close(
+						"Invalid taproot HTLC tx signature from peer".to_owned(),
+					));
+				}
+			}
+		} else {
+			if msg.htlc_signatures.len() != nondust_count {
+				return Err(ChannelError::close(format!(
+					"Got wrong number of HTLC signatures ({}) from remote. It must be {}",
+					msg.htlc_signatures.len(),
+					nondust_count
+				)));
+			}
+
+			for (htlc, counterparty_sig) in
+				commitment_data.tx.nondust_htlcs().iter().zip(msg.htlc_signatures.iter())
+			{
+				assert!(htlc.transaction_output_index.is_some());
+				let htlc_tx = chan_utils::build_htlc_transaction(
+					&commitment_txid,
+					commitment_data.tx.negotiated_feerate_per_kw(),
+					funding.get_counterparty_selected_contest_delay().unwrap(),
+					&htlc,
+					channel_type,
+					&holder_keys.broadcaster_delayed_payment_key,
+					&holder_keys.revocation_key,
+					&self.secp_ctx,
+				);
+
+				let htlc_redeemscript =
+					chan_utils::get_htlc_redeemscript(&htlc, channel_type, &holder_keys);
+				let htlc_sighashtype = if channel_type.supports_anchors_zero_fee_htlc_tx()
+					|| channel_type.supports_anchor_zero_fee_commitments()
+				{
+					EcdsaSighashType::SinglePlusAnyoneCanPay
+				} else {
+					EcdsaSighashType::All
+				};
+				let htlc_sighash = hash_to_message!(
+					&sighash::SighashCache::new(&htlc_tx)
+						.p2wsh_signature_hash(
+							0,
+							&htlc_redeemscript,
+							htlc.to_bitcoin_amount(),
+							htlc_sighashtype
+						)
+						.unwrap()[..]
+				);
+				log_trace!(logger, "Checking HTLC tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} in channel {}.",
+					log_bytes!(counterparty_sig.serialize_compact()[..]),
+					log_bytes!(holder_keys.countersignatory_htlc_key.to_public_key().serialize()),
+					encode::serialize_hex(&htlc_tx),
+					log_bytes!(htlc_sighash[..]),
+					encode::serialize_hex(&htlc_redeemscript),
+					&self.channel_id(),
+				);
+				if let Err(_) = self.secp_ctx.verify_ecdsa(
+					&htlc_sighash,
+					&counterparty_sig,
+					&holder_keys.countersignatory_htlc_key.to_public_key(),
+				) {
+					return Err(ChannelError::close("Invalid HTLC tx signature from peer".to_owned()));
+				}
 			}
 		}
 
-		let holder_commitment_tx = HolderCommitmentTransaction::new(
+		let mut holder_commitment_tx = HolderCommitmentTransaction::new(
 			commitment_data.tx,
 			msg.signature,
 			msg.htlc_signatures.clone(),
 			&funding.get_holder_pubkeys().funding_pubkey,
 			funding.counterparty_funding_pubkey(),
 		);
+		// Carry the aggregated key-path funding sig so the monitor persists it and a
+		// later force-close can broadcast this holder commitment unilaterally (§9a).
+		if let Some(sig) = taproot_holder_keyspend_sig {
+			holder_commitment_tx = holder_commitment_tx.with_taproot_key_path_sig(sig);
+		}
+		// Carry the counterparty's second-level HTLC Schnorr sigs (M9b) so they are
+		// persisted with the holder commitment and available at resolution.
+		if channel_type.supports_simple_taproot() && !msg.htlc_partial_signatures.is_empty() {
+			holder_commitment_tx = holder_commitment_tx
+				.with_taproot_htlc_sigs(msg.htlc_partial_signatures.clone());
+		}
 
 		self.holder_signer
 			.as_ref()
@@ -5440,6 +5773,18 @@ where
 	/// Get forwarding information for the counterparty.
 	pub fn counterparty_forwarding_info(&self) -> Option<CounterpartyForwardingInfo> {
 		self.counterparty_forwarding_info.clone()
+	}
+
+	// QU!D PATCH (see lib/rust-lightning/QUID_PATCHES.md): the counterparty's
+	// committed upfront shutdown script, if any. Once negotiated at open with
+	// `option_upfront_shutdown_script`, LDK rejects any cooperative-close
+	// `Shutdown` whose script differs (see `Channel::shutdown`), so this is the
+	// exact output the counterparty's balance will be paid to at a coop close.
+	// The hop reads it before driving `BTCChannels.openChannel` to verify the LP
+	// payout will land on `P2WPKH(funding_pubkey)` — the script the EVM's
+	// `_lpFinalBalance` attributes balance to. None = no upfront commitment.
+	pub fn counterparty_shutdown_scriptpubkey(&self) -> Option<ScriptBuf> {
+		self.counterparty_shutdown_scriptpubkey.clone()
 	}
 
 	/// Returns a HTLCStats about pending htlcs
@@ -6123,6 +6468,116 @@ where
 		}
 	}
 
+	// === Simple taproot channels (M6c) MuSig2 nonce-exchange + key-path signing ===
+
+	/// Supply the late-bound per-channel MuSig2 signing context to the taproot
+	/// signer (counterparty funding pubkey + funding amount + the counterparty's
+	/// current cooperative-close nonce). MUST be called before any taproot
+	/// partial-sign / nonce generation so the signer can build the KeyAggContext
+	/// and compute the key-path sighash. No-op for non-taproot channels.
+	fn provide_taproot_context_to_signer(&self, funding: &FundingScope) {
+		if !funding.get_channel_type().supports_simple_taproot() {
+			return;
+		}
+		// Pass the funding scope's splice parent so the signer derives the ROTATED
+		// holder funding key + the matching `Q'` aggregate for a spliced scope (spec
+		// §9c). `None` for the original funding.
+		self.provide_taproot_context_raw_with_splice(
+			*funding.counterparty_funding_pubkey(),
+			funding.get_value_satoshis(),
+			funding.channel_transaction_parameters.splice_parent_funding_txid,
+		);
+	}
+
+	/// As [`Self::provide_taproot_context_to_signer`], but driven from raw
+	/// channel-transaction parameters (used by `get_funding_signed_msg`, which is
+	/// handed `&ChannelTransactionParameters` rather than a `FundingScope`). Assumes
+	/// the ORIGINAL (un-spliced) funding scope (no key rotation).
+	fn provide_taproot_context_raw(
+		&self, counterparty_funding_pubkey: PublicKey, funding_value_sat: u64,
+	) {
+		self.provide_taproot_context_raw_with_splice(
+			counterparty_funding_pubkey,
+			funding_value_sat,
+			None,
+		);
+	}
+
+	fn provide_taproot_context_raw_with_splice(
+		&self, counterparty_funding_pubkey: PublicKey, funding_value_sat: u64,
+		splice_parent_funding_txid: Option<Txid>,
+	) {
+		if let Some(taproot_signer) = self.holder_signer.as_taproot() {
+			let ctx = crate::sign::TaprootSignerContext {
+				counterparty_funding_pubkey,
+				funding_value_sat,
+				counterparty_closing_nonce: self.cur_counterparty_closing_nonce.clone(),
+				closing_round: self.closing_round,
+				splice_parent_funding_txid,
+			};
+			taproot_signer.provide_taproot_context(ctx);
+		}
+	}
+
+	/// Generate **our** deterministic per-commitment MuSig2 verification nonce
+	/// (`next_local_nonce`) for the holder commitment at `commitment_number`, to be
+	/// advertised in `open_channel`/`accept_channel`/`channel_ready`/
+	/// `commitment_signed`/`revoke_and_ack` so the counterparty can partial-sign our
+	/// next commitment against it (spec §5/§6). `None` for non-taproot channels.
+	fn generate_holder_next_local_nonce(
+		&self, funding: &FundingScope, commitment_number: u64,
+	) -> Option<musig2::PubNonce> {
+		if !funding.get_channel_type().supports_simple_taproot() {
+			return None;
+		}
+		self.provide_taproot_context_to_signer(funding);
+		self.holder_signer
+			.as_taproot()
+			.map(|s| s.generate_local_nonce_pair(commitment_number, &self.secp_ctx))
+	}
+
+	/// Generate **our** cooperative-close MuSig2 nonce (`shutdown_nonce` for round 0,
+	/// `next_closee_nonce` for each subsequent fee-negotiation round) — the public
+	/// nonce we will use to produce our closing partial signature this round (spec
+	/// §4/§5). `None` for non-taproot channels. Derived deterministically at the
+	/// PER-ROUND height `closing_nonce_height(self.closing_round)`, matching what
+	/// `partially_sign_closing_transaction` uses (the signer reads the same
+	/// `closing_round` from its supplied context), so the advertised nonce equals
+	/// the one our partial is actually computed with — AND each distinct close tx
+	/// gets a fresh nonce so reuse can never leak the funding key (spec §9f-0).
+	fn generate_holder_shutdown_nonce(&self, funding: &FundingScope) -> Option<musig2::PubNonce> {
+		if !funding.get_channel_type().supports_simple_taproot() {
+			return None;
+		}
+		self.provide_taproot_context_to_signer(funding);
+		let height = crate::sign::closing_nonce_height(self.closing_round);
+		self.holder_signer
+			.as_taproot()
+			.map(|s| s.generate_local_nonce_pair(height, &self.secp_ctx))
+	}
+
+	/// Generate **our** MuSig2 splice nonce (the `splice_init`/`splice_ack`
+	/// `splice_nonce`) for the splice that spends `prev_funding_txid`, advertised
+	/// during the splice handshake (spec §9c). Derived at the per-splice-unique
+	/// `splice_nonce_height(prev_funding_txid)`, the SAME height
+	/// `partially_sign_splice_shared_input` uses, so the advertised nonce equals the
+	/// one we sign the shared input with — and two distinct splices never reuse a
+	/// nonce (the §9f-0 funding-key-leak guard). The KeyAggContext is the CURRENT
+	/// (old) funding-key aggregate, since the splice spends the OLD funding output;
+	/// `provide_taproot_context_to_signer` supplies it from `funding` (the current
+	/// scope). `None` for non-taproot channels.
+	fn generate_holder_splice_nonce(
+		&self, funding: &FundingScope, prev_funding_txid: &Txid,
+	) -> Option<musig2::PubNonce> {
+		if !funding.get_channel_type().supports_simple_taproot() {
+			return None;
+		}
+		self.provide_taproot_context_to_signer(funding);
+		self.holder_signer
+			.as_taproot()
+			.and_then(|s| s.generate_splice_nonce(prev_funding_txid, &self.secp_ctx))
+	}
+
 	/// Only allowed after [`FundingScope::channel_transaction_parameters`] is set.
 	#[rustfmt::skip]
 	fn get_funding_signed_msg<L: Deref>(
@@ -6135,14 +6590,39 @@ where
 			&self.channel_id(), counterparty_initial_bitcoin_tx.txid, encode::serialize_hex(&counterparty_initial_bitcoin_tx.transaction));
 
 		// We sign "counterparty" commitment transaction, allowing them to broadcast the tx if they wish.
-		let signature = match &self.holder_signer {
-			// TODO (arik): move match into calling method for Taproot
-			ChannelSignerType::Ecdsa(ecdsa) => ecdsa.sign_counterparty_commitment(
-				channel_parameters, &counterparty_initial_commitment_tx, Vec::new(), Vec::new(), &self.secp_ctx
-			).ok(),
-			// TODO (taproot|arik)
-			#[cfg(taproot)]
-			_ => todo!()
+		// For simple-taproot channels we instead produce a MuSig2 key-path
+		// `partial_signature_with_nonce` over the counterparty commitment (spec §1),
+		// signing against their `next_local_nonce` (received in `open_channel`).
+		let is_taproot = channel_parameters.channel_type_features.supports_simple_taproot();
+		let (signature, partial_signature_with_nonce) = if is_taproot {
+			let cp_funding = channel_parameters.counterparty_parameters.as_ref()
+				.expect("counterparty params set").pubkeys.funding_pubkey;
+			self.provide_taproot_context_raw(cp_funding, channel_parameters.channel_value_satoshis);
+			let cp_nonce = match self.cur_counterparty_taproot_nonce.clone() {
+				Some(n) => n,
+				None => {
+					log_trace!(logger, "Counterparty taproot nonce not yet received for funding_signed; setting signer_pending_funding");
+					self.signer_pending_funding = true;
+					return None;
+				}
+			};
+			let partial = self.holder_signer.as_taproot().and_then(|s|
+				s.partially_sign_counterparty_commitment(
+					cp_nonce, &counterparty_initial_commitment_tx, Vec::new(), Vec::new(), &self.secp_ctx
+				).ok()
+			);
+			match partial {
+				Some((psn, _htlc_sigs)) => (Some(taproot_unused_ecdsa_sig()), Some(psn)),
+				None => (None, None),
+			}
+		} else {
+			let sig = match &self.holder_signer {
+				ChannelSignerType::Ecdsa(ecdsa) => ecdsa.sign_counterparty_commitment(
+					channel_parameters, &counterparty_initial_commitment_tx, Vec::new(), Vec::new(), &self.secp_ctx
+				).ok().map(|(sig, _)| sig),
+				_ => unreachable!("non-taproot channel always has an Ecdsa signer"),
+			};
+			(sig, None)
 		};
 
 		if signature.is_some() && self.signer_pending_funding {
@@ -6153,11 +6633,10 @@ where
 			self.signer_pending_funding = true;
 		}
 
-		signature.map(|(signature, _)| msgs::FundingSigned {
+		signature.map(|signature| msgs::FundingSigned {
 			channel_id: self.channel_id(),
 			signature,
-			#[cfg(taproot)]
-			partial_signature_with_nonce: None,
+			partial_signature_with_nonce,
 		})
 	}
 
@@ -6196,7 +6675,11 @@ where
 		// it in our order of preference, allowing us to negotiate the "next best" based on the
 		// counterparty's remaining features per our ranking in `get_initial_channel_type`.
 		let mut eligible_features = their_features.clone();
-		if channel_type.supports_anchor_zero_fee_commitments() {
+		if channel_type.supports_simple_taproot() {
+			// `option_simple_taproot` is our most-preferred type when opted in; if the
+			// counterparty rejected it, drop it so we retry on the next-best (non-taproot) type.
+			eligible_features.clear_simple_taproot();
+		} else if channel_type.supports_anchor_zero_fee_commitments() {
 			eligible_features.clear_anchor_zero_fee_commitments();
 		} else if channel_type.supports_anchors_zero_fee_htlc_tx() {
 			eligible_features.clear_anchor_zero_fee_commitments();
@@ -6272,19 +6755,98 @@ where
 					)
 					.ok()
 			},
-			// TODO (taproot|arik)
-			#[cfg(taproot)]
-			_ => todo!(),
+			// V2/dual-funding taproot initial commitment signatures are not part of
+			// the M6c (V1 open/commitment/close) milestone; HTLC/dual-funding taproot
+			// signing is deferred.
+			ChannelSignerType::Taproot(_) => None,
 		}
 	}
 
 	fn get_initial_commitment_signed_v2<L: Deref>(
-		&self, funding: &FundingScope, logger: &L,
+		&self, funding: &FundingScope, holder_commitment_number: u64, logger: &L,
 	) -> Option<msgs::CommitmentSigned>
 	where
 		SP::Target: SignerProvider,
 		L::Target: Logger,
 	{
+		// SIMPLE-TAPROOT (M9c SPLICE): the initial commitment over the SPLICE's new
+		// funding scope is a MuSig2 key-path `partial_signature_with_nonce` (spec §1),
+		// not an ECDSA `signature`. Mirror `get_funding_signed_msg`: supply the taproot
+		// context for the NEW funding scope (new counterparty funding pubkey + new
+		// value → the new `0x5120||Q'`), then partial-sign the counterparty's initial
+		// commitment against their CURRENT verification nonce (the peer's Q'-bound
+		// `splice_commitment_nonce`/`next_local_nonce`, stored as
+		// `cur_counterparty_taproot_nonce`). Gated to SPLICEs (a rotated funding key) —
+		// V2 dual-funding taproot OPEN stays deferred (it has no `splice_parent`).
+		let is_taproot_splice = funding.get_channel_type().supports_simple_taproot()
+			&& funding.channel_transaction_parameters.splice_parent_funding_txid.is_some();
+		if is_taproot_splice {
+			let mut commitment_number = self.counterparty_next_commitment_transaction_number;
+			let mut commitment_point = self.counterparty_next_commitment_point?;
+			if commitment_number != INITIAL_COMMITMENT_NUMBER {
+				commitment_number += 1;
+				commitment_point = self.counterparty_current_commitment_point?;
+			}
+			let commitment_data = self.build_commitment_transaction(
+				funding, commitment_number, &commitment_point, false, true, logger,
+			);
+			let counterparty_initial_commitment_tx = commitment_data.tx;
+
+			// The new funding scope's counterparty funding pubkey + value + splice
+			// parent define Q' (the signer rotates the holder key by the splice parent).
+			self.provide_taproot_context_raw_with_splice(
+				*funding.counterparty_funding_pubkey(),
+				funding.get_value_satoshis(),
+				funding.channel_transaction_parameters.splice_parent_funding_txid,
+			);
+			let cp_nonce = self.cur_counterparty_taproot_nonce.clone()?;
+			// §10 audit (HTLC ↔ splice): a splice can happen with HTLCs COMMITTED + in
+			// flight (quiescence freezes the HTLC set but doesn't clear it), so the
+			// post-splice commitment over `Q'` carries the existing HTLC outputs AND
+			// MUST carry one BIP340 Schnorr sig per non-dust HTLC (spec §3, M9b) in
+			// `htlc_partial_signatures` — exactly as the normal commitment path does
+			// (`get_commitment_signed` Taproot arm). Previously this dropped the HTLC
+			// sigs (`_htlc_sigs`) and sent an empty vec, so a splice with an in-flight
+			// HTLC failed the peer's "wrong number of taproot HTLC signatures" check
+			// and force-closed the channel.
+			let (psn, htlc_sigs) = self.holder_signer.as_taproot().and_then(|s| {
+				s.partially_sign_counterparty_commitment(
+					cp_nonce,
+					&counterparty_initial_commitment_tx,
+					Vec::new(),
+					Vec::new(),
+					&self.secp_ctx,
+				)
+				.ok()
+			})?;
+			debug_assert_eq!(
+				htlc_sigs.len(),
+				counterparty_initial_commitment_tx.trust().nondust_htlcs().len()
+			);
+			// Advertise OUR fresh Q'-bound verification nonce for our new holder
+			// commitment, so the peer's reverse `commitment_signed` partial-signs our
+			// new commitment against the right (Q'-bound) nonce (spec §9c). Bound to Q'
+			// via the just-supplied context, at our holder commitment height.
+			let next_local_nonce = self
+				.holder_signer
+				.as_taproot()
+				.map(|s| s.generate_local_nonce_pair(holder_commitment_number, &self.secp_ctx));
+			log_info!(
+				logger,
+				"Generated taproot splice commitment_signed for peer for channel {}",
+				&self.channel_id()
+			);
+			return Some(msgs::CommitmentSigned {
+				channel_id: self.channel_id,
+				htlc_signatures: Vec::new(),
+				htlc_partial_signatures: htlc_sigs,
+				signature: taproot_unused_ecdsa_sig(),
+				funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
+				partial_signature_with_nonce: Some(psn),
+				next_local_nonce,
+			});
+		}
+
 		let signatures = self.get_initial_counterparty_commitment_signatures(funding, logger);
 		if let Some((signature, htlc_signatures)) = signatures {
 			log_info!(
@@ -6299,10 +6861,11 @@ where
 			Some(msgs::CommitmentSigned {
 				channel_id: self.channel_id,
 				htlc_signatures,
+				htlc_partial_signatures: Vec::new(),
 				signature,
 				funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
-				#[cfg(taproot)]
 				partial_signature_with_nonce: None,
+				next_local_nonce: None,
 			})
 		} else {
 			// TODO(splicing): Support async signing
@@ -6355,7 +6918,7 @@ where
 			if tx.txid() == funding_txo.txid {
 				let tx = tx.tx();
 				let txo_idx = funding_txo.index as usize;
-				if txo_idx >= tx.output.len() || tx.output[txo_idx].script_pubkey != funding.get_funding_redeemscript().to_p2wsh() ||
+				if txo_idx >= tx.output.len() || tx.output[txo_idx].script_pubkey != funding.get_funding_spk() ||
 						tx.output[txo_idx].value.to_sat() != funding.get_value_satoshis() {
 					if funding.is_outbound() {
 						// If we generated the funding transaction and it doesn't match what it
@@ -6652,7 +7215,7 @@ impl FundingNegotiationContext {
 
 		let shared_funding_output = TxOut {
 			value: Amount::from_sat(funding.get_value_satoshis()),
-			script_pubkey: funding.get_funding_redeemscript().to_p2wsh(),
+			script_pubkey: funding.get_funding_spk(),
 		};
 
 		// Optionally add change output
@@ -7643,6 +8206,15 @@ where
 			}
 		}
 
+		// Simple taproot: refresh the counterparty's verification nonce so our first
+		// post-funding `commitment_signed` partial-signs their next commitment against
+		// it (spec §4).
+		if self.funding.get_channel_type().supports_simple_taproot() {
+			if let Some(nonce) = msg.next_local_nonce.clone() {
+				self.context.cur_counterparty_taproot_nonce = Some(nonce);
+			}
+		}
+
 		// Our channel_ready shouldn't have been sent if we are waiting for other channels in the
 		// batch, but we can receive channel_ready messages.
 		let mut check_reconnection = false;
@@ -7859,7 +8431,7 @@ where
 		self.context.assert_no_commitment_advancement(holder_commitment_point.next_transaction_number(), "initial commitment_signed");
 
 		let (channel_monitor, _) = self.initial_commitment_signed(
-			self.context.channel_id(), msg.signature, holder_commitment_point, best_block, signer_provider, logger)?;
+			self.context.channel_id(), msg.signature, msg.partial_signature_with_nonce.clone(), holder_commitment_point, best_block, signer_provider, logger)?;
 		self.holder_commitment_point = *holder_commitment_point;
 
 		log_info!(logger, "Received initial commitment_signed from peer for channel {}", &self.context.channel_id());
@@ -7884,7 +8456,7 @@ where
 	fn splice_initial_commitment_signed<F: Deref, L: Deref>(
 		&mut self, msg: &msgs::CommitmentSigned, fee_estimator: &LowerBoundedFeeEstimator<F>,
 		logger: &L,
-	) -> Result<Option<ChannelMonitorUpdate>, ChannelError>
+	) -> Result<(Option<ChannelMonitorUpdate>, Option<msgs::CommitmentSigned>), ChannelError>
 	where
 		F::Target: FeeEstimator,
 		L::Target: Logger,
@@ -7895,6 +8467,61 @@ where
 			.as_ref()
 			.map(|signing_session| !signing_session.has_received_tx_signatures())
 			.unwrap_or(false));
+
+		// Simple-taproot: store the peer's Q'-BOUND verification nonce from this splice
+		// `commitment_signed` so OUR reverse `get_initial_commitment_signed_v2`
+		// partial-signs the peer's new commitment against the right (Q'-bound) nonce
+		// (spec §9c). The acceptor receives this for the initiator's commitment; the
+		// initiator already stored the acceptor's nonce from `splice_ack`.
+		if self.funding.get_channel_type().supports_simple_taproot() {
+			if let Some(nonce) = msg.next_local_nonce.clone() {
+				self.context.cur_counterparty_taproot_nonce = Some(nonce);
+			}
+		}
+
+		// SIMPLE-TAPROOT SPLICE (spec §9c): the acceptor DEFERRED its own
+		// `commitment_signed` at `tx_complete` because it lacked the initiator's
+		// `Q'`-bound verification nonce (just stored above from `msg.next_local_nonce`).
+		// Now that we have it, the acceptor produces and sends its splice
+		// `commitment_signed`, partial-signing the initiator's new commitment against
+		// that nonce. The initiator already sent its `commitment_signed` at `tx_complete`
+		// (it had the acceptor's nonce from `splice_ack`), so it has nothing to send here.
+		let deferred_commitment_signed = {
+			let is_taproot_splice_acceptor = self.funding.get_channel_type().supports_simple_taproot()
+				&& self
+					.pending_splice
+					.as_ref()
+					.and_then(|pending_splice| pending_splice.funding_negotiation.as_ref())
+					.and_then(|funding_negotiation| match funding_negotiation {
+						FundingNegotiation::AwaitingSignatures { is_initiator, .. } => {
+							Some(!*is_initiator)
+						},
+						_ => None,
+					})
+					.unwrap_or(false);
+			if is_taproot_splice_acceptor {
+				let funding = self
+					.pending_splice
+					.as_ref()
+					.and_then(|pending_splice| pending_splice.funding_negotiation.as_ref())
+					.and_then(|funding_negotiation| funding_negotiation.as_funding())
+					.expect("Funding must exist for negotiated pending splice");
+				let holder_commitment_number =
+					self.holder_commitment_point.current_transaction_number();
+				Some(
+					self.context
+						.get_initial_commitment_signed_v2(funding, holder_commitment_number, logger)
+						.ok_or_else(|| {
+							ChannelError::close(
+								"Failed to compute deferred taproot splice commitment_signed"
+									.to_owned(),
+							)
+						})?,
+				)
+			} else {
+				None
+			}
+		};
 
 		let pending_splice_funding = self
 			.pending_splice
@@ -7968,7 +8595,7 @@ where
 			.received_commitment_signed();
 		self.monitor_updating_paused(false, false, false, Vec::new(), Vec::new(), Vec::new());
 
-		Ok(self.push_ret_blockable_mon_update(monitor_update))
+		Ok((self.push_ret_blockable_mon_update(monitor_update), deferred_commitment_signed))
 	}
 
 	fn get_commitment_htlc_data<'a>(
@@ -8560,21 +9187,17 @@ where
 			return Err(ChannelError::close("Received an unexpected revoke_and_ack".to_owned()));
 		}
 
-		match &self.context.holder_signer {
-			ChannelSignerType::Ecdsa(ecdsa) => {
-				ecdsa
-					.validate_counterparty_revocation(
-						self.context.counterparty_next_commitment_transaction_number + 1,
-						&secret,
-					)
-					.map_err(|_| {
-						ChannelError::close("Failed to validate revocation from peer".to_owned())
-					})?;
-			},
-			// TODO (taproot|arik)
-			#[cfg(taproot)]
-			_ => todo!(),
-		};
+		// Revocation validation is scheme-agnostic (it only checks the per-commitment
+		// secret), so it lives on the base `ChannelSigner` and is shared by the ECDSA
+		// and taproot signers.
+		self.context.holder_signer.as_ref()
+			.validate_counterparty_revocation(
+				self.context.counterparty_next_commitment_transaction_number + 1,
+				&secret,
+			)
+			.map_err(|_| {
+				ChannelError::close("Failed to validate revocation from peer".to_owned())
+			})?;
 
 		self.context
 			.commitment_secrets
@@ -8605,6 +9228,14 @@ where
 			self.context.counterparty_next_commitment_point;
 		self.context.counterparty_next_commitment_point = Some(msg.next_per_commitment_point);
 		self.context.counterparty_next_commitment_transaction_number -= 1;
+
+		// Simple taproot: refresh the counterparty's verification nonce so our next
+		// `commitment_signed` partial-signs their next commitment against it (spec §6).
+		if self.funding.get_channel_type().supports_simple_taproot() {
+			if let Some(nonce) = msg.next_local_nonce.clone() {
+				self.context.cur_counterparty_taproot_nonce = Some(nonce);
+			}
+		}
 
 		if self.context.announcement_sigs_state == AnnouncementSigsState::Committed {
 			self.context.announcement_sigs_state = AnnouncementSigsState::PeerReceived;
@@ -8928,6 +9559,8 @@ where
 		debug_assert!(!self.context.channel_state.is_monitor_update_in_progress());
 		debug_assert!(!self.context.channel_state.is_awaiting_remote_revoke());
 
+		let holder_next_commitment_number =
+			self.holder_commitment_point.next_transaction_number();
 		if let Some(pending_splice) = self.pending_splice.as_mut() {
 			self.context.channel_state.clear_quiescent();
 			if let Some(FundingNegotiation::AwaitingSignatures { mut funding, .. }) =
@@ -8952,6 +9585,7 @@ where
 					&self.context,
 					pending_splice.negotiated_candidates.len() - 1,
 					best_block_height,
+					holder_next_commitment_number,
 				);
 				if let Some(splice_txid) =
 					splice_locked.as_ref().map(|splice_locked| splice_locked.splice_txid)
@@ -8984,8 +9618,15 @@ where
 	where
 		L::Target: Logger,
 	{
-		let signing_session =
-			if let Some(signing_session) = self.context.interactive_tx_signing_session.as_mut() {
+		// Validate the signing session + extract OWNED copies of the splice tx + its
+		// prevouts + shared-input index, then DROP the session borrow. This lets the
+		// splice-input signing below borrow `self.context` (taproot context / signer)
+		// — disjoint fields of `self.context`, but the borrow checker cannot see
+		// through the `interactive_tx_signing_session.as_mut()` borrow, so we must not
+		// hold it across the signer calls. The session is re-acquired before
+		// `provide_holder_witnesses`.
+		let (tx_owned, shared_input_index_opt, all_prevouts) =
+			if let Some(signing_session) = self.context.interactive_tx_signing_session.as_ref() {
 				if let Some(pending_splice) = self.pending_splice.as_ref() {
 					debug_assert!(pending_splice
 						.funding_negotiation
@@ -9008,7 +9649,11 @@ where
 					});
 				}
 
-				signing_session
+				(
+					signing_session.unsigned_tx().tx().clone(),
+					signing_session.unsigned_tx().shared_input_index(),
+					signing_session.unsigned_tx().all_prevouts(),
+				)
 			} else {
 				if Some(funding_txid_signed) == self.funding.get_funding_txid() {
 					// We may be handling a duplicate call and the funding was already locked so we
@@ -9025,37 +9670,86 @@ where
 				return Err(APIError::APIMisuseError { err });
 			};
 
-		let tx = signing_session.unsigned_tx().tx();
-		if funding_txid_signed != tx.compute_txid() {
+		if funding_txid_signed != tx_owned.compute_txid() {
 			return Err(APIError::APIMisuseError {
 				err: "Transaction was malleated prior to signing".to_owned(),
 			});
 		}
 
-		let shared_input_signature =
-			if let Some(splice_input_index) = signing_session.unsigned_tx().shared_input_index() {
-				let sig = match &self.context.holder_signer {
-					ChannelSignerType::Ecdsa(signer) => signer.sign_splice_shared_input(
-						&self.funding.channel_transaction_parameters,
-						tx,
-						splice_input_index as usize,
-						&self.context.secp_ctx,
-					),
-					#[cfg(taproot)]
-					ChannelSignerType::Taproot(_) => todo!(),
-				};
-				Some(sig)
+		// Sign the splice's shared (old-funding) input. For a legacy P2WSH channel this
+		// is OUR ECDSA half of the 2-of-2 (`shared_input_signature`); for a
+		// simple-taproot channel the old funding output is the key-path `0x5120||Q`, so
+		// we produce OUR MuSig2 key-path PARTIAL + pubnonce over the splice tx
+		// (`splice_partial_signature`) — interactive, both parties online, identical
+		// machinery to coop-close, and the two partials aggregate into ONE 64-byte
+		// BIP340 witness in the signing session (spec §9c).
+		let is_taproot = self.funding.get_channel_type().supports_simple_taproot();
+		let (shared_input_signature, splice_partial_signature) =
+			if let Some(splice_input_index) = shared_input_index_opt {
+				if is_taproot {
+					// The KeyAggContext is the CURRENT (old) funding-key aggregate; the
+					// splice spends the OLD funding output. Supply it to the signer.
+					self.context.provide_taproot_context_to_signer(&self.funding);
+					let prev_funding_txid =
+						tx_owned.input[splice_input_index as usize].previous_output.txid;
+					let cp_nonce = self
+						.context
+						.cur_counterparty_splice_nonce
+						.clone()
+						.ok_or_else(|| APIError::APIMisuseError {
+							err: "Missing counterparty splice nonce for taproot splice signing"
+								.to_owned(),
+						})?;
+					let taproot_signer = self.context.holder_signer.as_taproot().ok_or_else(|| {
+						APIError::APIMisuseError {
+							err: "Taproot channel without a taproot signer".to_owned(),
+						}
+					})?;
+					let (partial, our_pubnonce) = taproot_signer
+						.partially_sign_splice_shared_input(
+							&tx_owned,
+							splice_input_index as usize,
+							&all_prevouts,
+							cp_nonce,
+							&prev_funding_txid,
+							&self.context.secp_ctx,
+						)
+						.map_err(|()| APIError::APIMisuseError {
+							err: "Failed to produce taproot splice key-path partial".to_owned(),
+						})?;
+					(None, Some(msgs::PartialSignatureWithNonce(partial, our_pubnonce)))
+				} else {
+					let sig = match &self.context.holder_signer {
+						ChannelSignerType::Ecdsa(signer) => signer.sign_splice_shared_input(
+							&self.funding.channel_transaction_parameters,
+							&tx_owned,
+							splice_input_index as usize,
+							&self.context.secp_ctx,
+						),
+						ChannelSignerType::Taproot(_) => unreachable!("handled above"),
+					};
+					(Some(sig), None)
+				}
 			} else {
-				None
+				(None, None)
 			};
-		debug_assert_eq!(self.pending_splice.is_some(), shared_input_signature.is_some());
+		debug_assert_eq!(
+			self.pending_splice.is_some(),
+			shared_input_signature.is_some() || splice_partial_signature.is_some()
+		);
 
 		let tx_signatures = msgs::TxSignatures {
 			channel_id: self.context.channel_id,
 			tx_hash: funding_txid_signed,
 			witnesses,
 			shared_input_signature,
+			splice_partial_signature,
 		};
+		let signing_session = self
+			.context
+			.interactive_tx_signing_session
+			.as_mut()
+			.expect("signing session present (validated above)");
 		let (tx_signatures, funding_tx) = signing_session
 			.provide_holder_witnesses(tx_signatures, &self.context.secp_ctx)
 			.map_err(|err| APIError::APIMisuseError { err })?;
@@ -9248,6 +9942,32 @@ where
 
 		// Upon reconnect we have to start the closing_signed dance over, but shutdown messages
 		// will be retransmitted.
+		//
+		// SECURITY (spec §9f-0): for a simple-taproot channel, if we already SENT a
+		// cooperative-close MuSig2 partial this connection (`last_sent_closing_fee.is_some()`),
+		// the restarted dance MUST NOT reuse that round's deterministic nonce. The
+		// post-reconnect dance restarts with `last_sent_closing_fee = None`, so the per-round
+		// guard in `get_closing_signed_msg` (which only advances on a fee CHANGE vs the last
+		// sent fee) would NOT advance — it would re-derive `closing_nonce_height(closing_round)`
+		// and sign a DIFFERENT close tx (the renegotiated fee ⇒ different sighash message) with
+		// the SAME nonce already used+sent pre-disconnect. Two partials sharing a nonce over two
+		// distinct messages leak the funding private key (`x = (s1−s2)/(e1−e2)`). Bump the round
+		// here so the re-advertised `shutdown_nonce` and every post-reconnect closing partial use
+		// a fresh, never-before-sent nonce. Deterministic/crash-safe: `closing_round` is monotonic
+		// channel state. Only matters for taproot (ECDSA closing sigs have no nonce-reuse leak).
+		//
+		// `last_sent_closing_fee` covers an in-connection reconnect, but it is reset to `None` on a
+		// process RELOAD too — so a node that signed a closing partial pre-crash would NOT bump and
+		// would re-sign the same round's nonce over a different-fee tx (key leak). `closing_partial_
+		// sent_at_round` is PERSISTED, so it still reports the consumed round after a restart; bump on
+		// either signal. (A restart always triggers a reconnect, so this path runs.)
+		if (self.context.last_sent_closing_fee.is_some()
+			|| self.context.closing_partial_sent_at_round)
+			&& self.funding.get_channel_type().supports_simple_taproot()
+		{
+			self.context.closing_round = self.context.closing_round.saturating_add(1);
+			self.context.closing_partial_sent_at_round = false;
+		}
 		self.context.last_sent_closing_fee = None;
 		self.context.pending_counterparty_closing_signed = None;
 		self.context.closing_fee_limits = None;
@@ -9624,12 +10344,16 @@ where
 				}
 
 				self.context.signer_pending_revoke_and_ack = false;
+				// Simple taproot: advertise our fresh verification nonce for the next
+				// holder commitment the counterparty will sign (spec §6).
+				let next_local_nonce = self.context.generate_holder_next_local_nonce(
+					&self.funding, self.holder_commitment_point.next_transaction_number(),
+				);
 				return Some(msgs::RevokeAndACK {
 					channel_id: self.context.channel_id,
 					per_commitment_secret,
 					next_per_commitment_point: self.holder_commitment_point.next_point(),
-					#[cfg(taproot)]
-					next_local_nonce: None,
+					next_local_nonce,
 					release_htlc_message_paths,
 				});
 			}
@@ -9769,6 +10493,7 @@ where
 			Some(msgs::Shutdown {
 				channel_id: self.context.channel_id,
 				scriptpubkey: self.get_closing_scriptpubkey(),
+				shutdown_nonce: self.context.generate_holder_shutdown_nonce(&self.funding),
 			})
 		} else {
 			None
@@ -9848,6 +10573,28 @@ where
 		self.context.channel_state.clear_peer_disconnected();
 		self.mark_response_received();
 
+		// Simple-taproot reconnect nonce resync (spec §9d): the peer re-sent a FRESH
+		// verification nonce (MuSig2 nonces are forgotten on disconnect, spec §1).
+		// Store it as `cur_counterparty_taproot_nonce` (mirroring the
+		// `channel_ready`/`revoke_and_ack` store) so our next post-reconnect
+		// `commitment_signed` partial-signs the peer's commitment against an exchanged
+		// nonce. For a spliced channel the peer sends a per-funding-txid map; pick the
+		// nonce for our current funding scope.
+		if self.funding.get_channel_type().supports_simple_taproot() {
+			let resync_nonce = if !msg.next_local_nonces.is_empty() {
+				let our_funding_txid = self.funding.get_funding_txid();
+				msg.next_local_nonces
+					.iter()
+					.find(|(txid, _)| Some(*txid) == our_funding_txid)
+					.map(|(_, nonce)| nonce.clone())
+			} else {
+				msg.next_local_nonce.clone()
+			};
+			if let Some(nonce) = resync_nonce {
+				self.context.cur_counterparty_taproot_nonce = Some(nonce);
+			}
+		}
+
 		let shutdown_msg = self.get_outbound_shutdown();
 
 		// A receiving node:
@@ -9917,7 +10664,9 @@ where
 							)
 						})?;
 
-					let commitment_signed = self.context.get_initial_commitment_signed_v2(&funding, logger)
+					let holder_commitment_number =
+						self.holder_commitment_point.current_transaction_number();
+					let commitment_signed = self.context.get_initial_commitment_signed_v2(&funding, holder_commitment_number, logger)
 						// TODO(splicing): Support async signing
 						.ok_or_else(|| {
 							let message = "Failed to get signatures for new commitment_signed".to_owned();
@@ -10052,19 +10801,26 @@ where
 		//     those splice transactions, for which it hasn't received `splice_locked` yet:
 		//     - MUST process `my_current_funding_locked` as if it was receiving `splice_locked`
 		//       for this `txid`.
+		let holder_next_commitment_number = self.holder_commitment_point.next_transaction_number();
 		let inferred_splice_locked = msg.my_current_funding_locked.as_ref().and_then(|funding_locked| {
 			self.pending_funding()
 				.iter()
 				.find(|funding| funding.get_funding_txid() == Some(funding_locked.txid))
-				.and_then(|_| {
+				.and_then(|candidate_funding| {
 					self.pending_splice.as_ref().and_then(|pending_splice| {
 						(Some(funding_locked.txid) != pending_splice.received_funding_txid)
-							.then(|| funding_locked.txid)
+							.then(|| (funding_locked.txid, candidate_funding))
 					})
 				})
-				.map(|splice_txid| msgs::SpliceLocked {
+				.map(|(splice_txid, candidate_funding)| msgs::SpliceLocked {
 					channel_id: self.context.channel_id,
 					splice_txid,
+					// Simple-taproot (§10 audit): post-splice next verification nonce,
+					// bound to Q' via the candidate (spliced) funding scope.
+					next_local_nonce: self.context.generate_holder_next_local_nonce(
+						candidate_funding,
+						holder_next_commitment_number,
+					),
 				})
 		});
 
@@ -10364,6 +11120,15 @@ where
 			// can do that via error message without getting a connection fail anyway...
 			return Err(ChannelError::close("Shutdown before funding was broadcasted".to_owned()));
 		}
+
+		// Simple taproot: store the counterparty's cooperative-close nonce
+		// (`shutdown_nonce`) so we can produce / verify the closing partial signature
+		// against it (spec §4).
+		if self.funding.get_channel_type().supports_simple_taproot() {
+			if let Some(nonce) = msg.shutdown_nonce.clone() {
+				self.context.cur_counterparty_closing_nonce = Some(nonce);
+			}
+		}
 		for htlc in self.context.pending_inbound_htlcs.iter() {
 			if let InboundHTLCState::RemoteAnnounced(_) = htlc.state {
 				return Err(ChannelError::close(
@@ -10454,6 +11219,7 @@ where
 			Some(msgs::Shutdown {
 				channel_id: self.context.channel_id,
 				scriptpubkey: self.get_closing_scriptpubkey(),
+				shutdown_nonce: self.context.generate_holder_shutdown_nonce(&self.funding),
 			})
 		} else {
 			None
@@ -10504,6 +11270,54 @@ where
 		tx
 	}
 
+	/// Build the broadcast-ready cooperative-close transaction for a **simple
+	/// taproot channel**: a single 64-byte BIP340 key-path Schnorr witness spending
+	/// the `0x5120||Q` funding output (spec §5). `agg_sig` is the aggregated MuSig2
+	/// signature produced by [`Self::verify_taproot_closing_partial`].
+	fn build_signed_taproot_closing_transaction(
+		&self, closing_tx: &ClosingTransaction, agg_sig: &bitcoin::secp256k1::schnorr::Signature,
+	) -> Transaction {
+		let mut tx = closing_tx.trust().built_transaction().clone();
+		tx.input[0].witness = bitcoin::Witness::new();
+		tx.input[0].witness.push(agg_sig.as_ref().to_vec());
+		tx
+	}
+
+	/// Verify the counterparty's cooperative-close MuSig2 key-path partial by
+	/// producing our own partial over the closing-tx key-spend sighash and
+	/// aggregating both into the final BIP340 signature, checked against the tweaked
+	/// aggregate `Q` (spec §3/§5). Returns the aggregated signature (the witness sig)
+	/// on success.
+	fn verify_taproot_closing_partial(
+		&self, closing_tx: &ClosingTransaction, counterparty_psn: PartialSignatureWithNonce,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature, ChannelError> {
+		self.context.provide_taproot_context_to_signer(&self.funding);
+		let taproot_signer = self.context.holder_signer.as_taproot().ok_or_else(|| {
+			ChannelError::close("taproot channel without taproot signer".to_owned())
+		})?;
+		// Our partial over the closing tx (signs against the counterparty's closing
+		// nonce, which `provide_taproot_context_to_signer` placed into the signer).
+		let our_partial = taproot_signer
+			.partially_sign_closing_transaction(closing_tx, &self.context.secp_ctx)
+			.map_err(|_| ChannelError::close("failed to produce holder closing partial".to_owned()))?;
+		let our_pubnonce = taproot_signer.generate_local_nonce_pair(
+			crate::sign::closing_nonce_height(self.context.closing_round),
+			&self.context.secp_ctx,
+		);
+		let funding_spk = self.funding.get_funding_spk();
+		let sighash = chan_utils::taproot_funding_keyspend_sighash(
+			&closing_tx.trust().built_transaction().clone(), 0,
+			bitcoin::Amount::from_sat(self.funding.get_value_satoshis()), &funding_spk,
+		).map_err(|_| ChannelError::close("taproot closing sighash computation failed".to_owned()))?;
+		let message: [u8; 32] = *sighash.as_ref();
+		let PartialSignatureWithNonce(cp_partial, cp_pubnonce) = counterparty_psn;
+		chan_utils::verify_taproot_keyspend_partials(
+			&self.funding.get_holder_pubkeys().funding_pubkey,
+			self.funding.counterparty_funding_pubkey(),
+			&message, our_partial, our_pubnonce, cp_partial, cp_pubnonce,
+		).map_err(|e| ChannelError::close(format!("Invalid closing tx taproot signature from peer: {}", e)))
+	}
+
 	fn get_closing_signed_msg<L: Deref>(
 		&mut self, closing_tx: &ClosingTransaction, skip_remote_output: bool, fee_satoshis: u64,
 		min_fee_satoshis: u64, max_fee_satoshis: u64, logger: &L,
@@ -10511,17 +11325,58 @@ where
 	where
 		L::Target: Logger,
 	{
-		let sig = match &self.context.holder_signer {
-			ChannelSignerType::Ecdsa(ecdsa) => ecdsa
-				.sign_closing_transaction(
-					&self.funding.channel_transaction_parameters,
-					closing_tx,
+		let is_taproot = self.funding.get_channel_type().supports_simple_taproot();
+		// (ECDSA signature, taproot partial_signature_with_nonce). For taproot we
+		// sign a MuSig2 key-path partial over the closing tx against the
+		// counterparty's cooperative-close nonce (their `shutdown_nonce`), and carry
+		// our partial + our closing pubnonce (spec §4/§5). The ECDSA `signature`
+		// field is the unused placeholder.
+		let (sig, partial_signature_with_nonce) = if is_taproot {
+			// Spec §9f-0: every distinct close tx we sign+send must use a FRESH
+			// MuSig2 nonce — signing two DIFFERENT close txs (different fees ⇒
+			// different sighash messages) with one nonce leaks the funding key. But
+			// the nonce we sign with must ALSO equal the one we last ADVERTISED (round
+			// 0 = our `shutdown_nonce`), because the counterparty builds its partial
+			// against that advertised nonce and the aggregate must verify. So:
+			//   * round 0 (our first `closing_signed`) reuses the `shutdown_nonce`;
+			//   * we advance to a fresh round ONLY when we sign a fee DIFFERENT from
+			//     the last fee we signed (a genuine RBF re-proposal) — that is the
+			//     only case where one party signs two distinct messages.
+			// `closing_round` thus advances per DISTINCT close tx, never per message,
+			// keeping the advertised nonce == the signing nonce while guaranteeing no
+			// two distinct close txs ever share a nonce.
+			let last_signed_fee = self.context.last_sent_closing_fee.as_ref().map(|(f, ..)| *f);
+			if last_signed_fee.is_some_and(|f| f != fee_satoshis) {
+				self.context.closing_round = self.context.closing_round.saturating_add(1);
+				// New round → its nonce is not yet consumed.
+				self.context.closing_partial_sent_at_round = false;
+			}
+			self.context.provide_taproot_context_to_signer(&self.funding);
+			let taproot = self.context.holder_signer.as_taproot();
+			let result = taproot.and_then(|s| {
+				let partial = s.partially_sign_closing_transaction(closing_tx, &self.context.secp_ctx).ok()?;
+				let our_nonce = s.generate_local_nonce_pair(
+					crate::sign::closing_nonce_height(self.context.closing_round),
 					&self.context.secp_ctx,
-				)
-				.ok(),
-			// TODO (taproot|arik)
-			#[cfg(taproot)]
-			_ => todo!(),
+				);
+				Some(msgs::PartialSignatureWithNonce(partial, our_nonce))
+			});
+			match result {
+				Some(psn) => (Some(taproot_unused_ecdsa_sig()), Some(psn)),
+				None => (None, None),
+			}
+		} else {
+			let sig = match &self.context.holder_signer {
+				ChannelSignerType::Ecdsa(ecdsa) => ecdsa
+					.sign_closing_transaction(
+						&self.funding.channel_transaction_parameters,
+						closing_tx,
+						&self.context.secp_ctx,
+					)
+					.ok(),
+				_ => unreachable!("non-taproot channel always has an Ecdsa signer"),
+			};
+			(sig, None)
 		};
 		if sig.is_none() {
 			log_trace!(logger, "Closing transaction signature unavailable, waiting on signer");
@@ -10532,11 +11387,19 @@ where
 		let fee_range = msgs::ClosingSignedFeeRange { min_fee_satoshis, max_fee_satoshis };
 		self.context.last_sent_closing_fee =
 			Some((fee_satoshis, skip_remote_output, fee_range.clone(), sig.clone()));
+		// A taproot closing partial was produced+sent at the current `closing_round`,
+		// consuming that round's deterministic nonce. Mark it PERSISTED so a later
+		// reconnect/restart bumps to a fresh round before signing a different-fee
+		// close tx (funding-key-leak guard, spec §9f-0).
+		if is_taproot && partial_signature_with_nonce.is_some() {
+			self.context.closing_partial_sent_at_round = true;
+		}
 		sig.map(|signature| msgs::ClosingSigned {
 			channel_id: self.context.channel_id,
 			fee_satoshis,
 			signature,
 			fee_range: Some(fee_range),
+			partial_signature_with_nonce,
 		})
 	}
 
@@ -10611,6 +11474,7 @@ where
 			return Ok((None, None));
 		}
 
+		let is_taproot = self.funding.get_channel_type().supports_simple_taproot();
 		let funding_redeemscript = self.funding.get_funding_redeemscript();
 		let mut skip_remote_output = false;
 		let (mut closing_tx, used_total_fee) =
@@ -10618,33 +11482,76 @@ where
 		if used_total_fee != msg.fee_satoshis {
 			return Err(ChannelError::close(format!("Remote sent us a closing_signed with a fee other than the value they can claim. Fee in message: {}. Actual closing tx fee: {}", msg.fee_satoshis, used_total_fee)));
 		}
-		let sighash = closing_tx
-			.trust()
-			.get_sighash_all(&funding_redeemscript, self.funding.get_value_satoshis());
 
-		match self.context.secp_ctx.verify_ecdsa(
-			&sighash,
-			&msg.signature,
-			&self.funding.get_counterparty_pubkeys().funding_pubkey,
-		) {
-			Ok(_) => {},
-			Err(_e) => {
-				// The remote end may have decided to revoke their output due to inconsistent dust
-				// limits, so check for that case by re-checking the signature here.
-				skip_remote_output = true;
-				closing_tx =
-					self.build_closing_transaction(msg.fee_satoshis, skip_remote_output)?.0;
-				let sighash = closing_tx
-					.trust()
-					.get_sighash_all(&funding_redeemscript, self.funding.get_value_satoshis());
-				let res = self.context.secp_ctx.verify_ecdsa(
-					&sighash,
-					&msg.signature,
-					self.funding.counterparty_funding_pubkey(),
-				);
-				secp_check!(res, "Invalid closing tx signature from peer".to_owned());
-			},
+		// The aggregated BIP340 key-path closing signature (taproot only). Verifying
+		// the counterparty's closing partial *produces* the aggregate sig, which is
+		// exactly the witness signature spending the `0x5120||Q` funding output.
+		// `None` for non-taproot channels.
+		let taproot_closing_sig: Option<bitcoin::secp256k1::schnorr::Signature> = if is_taproot {
+			let psn = msg.partial_signature_with_nonce.clone().ok_or_else(|| {
+				ChannelError::close("Missing partial_signature_with_nonce in closing_signed".to_owned())
+			})?;
+			// The counterparty advertises a FRESH cooperative-close nonce every round
+			// (their `shutdown_nonce`, then the `next_closee_nonce` carried in each
+			// `closing_signed`; spec §4/§5). Adopt the nonce from THIS message before
+			// signing/verifying so our own closing partial is finalized against the
+			// SAME counterparty nonce that the aggregation below checks — otherwise our
+			// partial commits to their stale (shutdown-round) nonce while the aggregate
+			// uses this round's nonce, and aggregation fails ("bad partial"). Spec §9f-0.
+			// DEFENSE-IN-DEPTH (MuSig2 nonce-reuse / funding-key-leak, layer 3 of 3):
+			// if we ALREADY produced a closing partial at this `closing_round` (its
+			// deterministic secret nonce is consumed) and the peer now presents a
+			// DIFFERENT nonce for the SAME round, re-signing would reuse our secret nonce
+			// across two challenges e0 != e1 -> x = (s0 - s1)/((e0 - e1)*a) leaks the
+			// funding key. Already caught within a process by `bind_nonce` (layer 2) and
+			// across a restart by the persisted `closing_round` advance-on-reload (layer
+			// 1); refuse HERE too — fail fast at the protocol layer, before the signer,
+			// independent of the (ephemeral) guard. The honest benign case never fires:
+			// the peer's partial for this round is over the same nonce our sent partial
+			// committed to, and a fee change advances the round + clears the flag first.
+			if self.context.closing_partial_sent_at_round {
+				if let Some(prev) = self.context.cur_counterparty_closing_nonce.as_ref() {
+					if prev.serialize() != psn.1.serialize() {
+						return Err(ChannelError::close(
+							"Peer rotated its cooperative-close nonce within a round whose secret nonce we already consumed (MuSig2 nonce-reuse / funding-key-leak guard)".to_owned()
+						));
+					}
+				}
+			}
+			self.context.cur_counterparty_closing_nonce = Some(psn.1.clone());
+			Some(self.verify_taproot_closing_partial(&closing_tx, psn)?)
+		} else {
+			let sighash = closing_tx
+				.trust()
+				.get_sighash_all(&funding_redeemscript, self.funding.get_value_satoshis());
+
+			match self.context.secp_ctx.verify_ecdsa(
+				&sighash,
+				&msg.signature,
+				&self.funding.get_counterparty_pubkeys().funding_pubkey,
+			) {
+				Ok(_) => {},
+				Err(_e) => {
+					// The remote end may have decided to revoke their output due to inconsistent dust
+					// limits, so check for that case by re-checking the signature here.
+					skip_remote_output = true;
+					closing_tx =
+						self.build_closing_transaction(msg.fee_satoshis, skip_remote_output)?.0;
+					let sighash = closing_tx
+						.trust()
+						.get_sighash_all(&funding_redeemscript, self.funding.get_value_satoshis());
+					let res = self.context.secp_ctx.verify_ecdsa(
+						&sighash,
+						&msg.signature,
+						self.funding.counterparty_funding_pubkey(),
+					);
+					secp_check!(res, "Invalid closing tx signature from peer".to_owned());
+				},
+			};
+			None
 		};
+		// Suppress unused warnings on the ECDSA-only locals for the taproot path.
+		let _ = &funding_redeemscript;
 
 		for outp in closing_tx.trust().built_transaction().output.iter() {
 			if !outp.script_pubkey.is_witness_program()
@@ -10658,8 +11565,11 @@ where
 		if let Some((last_fee, _, _, Some(sig))) = self.context.last_sent_closing_fee {
 			if last_fee == msg.fee_satoshis {
 				let shutdown_result = self.shutdown_result_coop_close();
-				let tx =
-					self.build_signed_closing_transaction(&mut closing_tx, &msg.signature, &sig);
+				let tx = if let Some(agg_sig) = taproot_closing_sig.as_ref() {
+					self.build_signed_taproot_closing_transaction(&closing_tx, agg_sig)
+				} else {
+					self.build_signed_closing_transaction(&mut closing_tx, &msg.signature, &sig)
+				};
 				self.context.channel_state = ChannelState::ShutdownComplete;
 				self.context.update_time_counter += 1;
 				return Ok((None, Some((tx, shutdown_result))));
@@ -10691,11 +11601,21 @@ where
 					if let Some(ClosingSigned { signature, .. }) = &closing_signed {
 						let shutdown_result = self.shutdown_result_coop_close();
 						self.context.channel_state = ChannelState::ShutdownComplete;
-						let tx = self.build_signed_closing_transaction(
-							&closing_tx,
-							&msg.signature,
-							signature,
-						);
+						let tx = if let Some(agg_sig) = taproot_closing_sig.as_ref() {
+							// Spec §9f-0: `taproot_closing_sig` was produced by
+							// `verify_taproot_closing_partial` above at the SAME round whose
+							// nonce we advertised (and which the peer's partial in this
+							// message is bound to), so it is exactly the witness sig the peer
+							// will also derive — both parties broadcast the identical tx.
+							self.build_signed_taproot_closing_transaction(&closing_tx, agg_sig)
+						} else {
+							self.build_signed_closing_transaction(
+								&closing_tx,
+								&msg.signature,
+								signature,
+							)
+						};
+						self.context.update_time_counter += 1;
 						Some((tx, shutdown_result))
 					} else {
 						None
@@ -10728,6 +11648,26 @@ where
 					self.funding.get_value_satoshis()
 						- (self.funding.value_to_self_msat + 999) / 1000
 				);
+				// Spec §9f-0: for a SIMPLE-TAPROOT channel, converge in a SINGLE round
+				// by ACCEPTING the proposer's fee whenever it is within our acceptable
+				// range, instead of counter-proposing the maximum. LDK's symmetric
+				// `closing_signed` binds each MuSig2 closing partial to the nonce in
+				// hand when it is signed; a counter-proposal would make us (or the peer)
+				// sign a SECOND, distinct close tx — and the only fresh-nonce schemes
+				// that keep the converged 2-of-2 key-path signature aggregatable across
+				// both parties cannot also rebind the peer's already-sent partial to a
+				// new nonce. Converging on the first in-range fee means each party signs
+				// exactly ONE close tx, so the fixed per-close nonce can never be reused
+				// over two different messages (the funding-key-leak condition). The
+				// counterparty already advertises a fresh nonce per `closing_signed`, so
+				// a genuine RBF (new fee) still gets a fresh nonce; we simply avoid
+				// gratuitously forcing a second tx here.
+				if self.funding.get_channel_type().supports_simple_taproot()
+					&& msg.fee_satoshis >= our_min_fee
+					&& msg.fee_satoshis <= our_max_fee
+				{
+					propose_fee!(msg.fee_satoshis);
+				}
 				propose_fee!(cmp::min(max_fee_satoshis, our_max_fee));
 			} else {
 				if msg.fee_satoshis < our_min_fee || msg.fee_satoshis > our_max_fee {
@@ -11099,10 +12039,16 @@ where
 	) -> Option<msgs::ChannelReady> where L::Target: Logger {
 		if self.holder_commitment_point.can_advance() {
 			self.context.signer_pending_channel_ready = false;
+			// Simple taproot: advertise a fresh verification nonce for the next holder
+			// commitment the counterparty will sign post-funding (spec §4).
+			let next_local_nonce = self.context.generate_holder_next_local_nonce(
+				&self.funding, self.holder_commitment_point.next_transaction_number(),
+			);
 			Some(msgs::ChannelReady {
 				channel_id: self.context.channel_id(),
 				next_per_commitment_point: self.holder_commitment_point.next_point(),
 				short_channel_id_alias: Some(self.context.outbound_scid_alias),
+				next_local_nonce,
 			})
 		} else {
 			log_debug!(logger, "Not producing channel_ready: the holder commitment point is not available.");
@@ -11273,6 +12219,8 @@ where
 				}
 			}
 
+			let holder_next_commitment_number =
+				self.holder_commitment_point.next_transaction_number();
 			if let Some(pending_splice) = &mut self.pending_splice {
 				let mut confirmed_funding_index = None;
 				let mut funding_already_confirmed = false;
@@ -11297,6 +12245,7 @@ where
 						&self.context,
 						confirmed_funding_index,
 						height,
+						holder_next_commitment_number,
 					) {
 
 						log_info!(
@@ -11423,6 +12372,8 @@ where
 			return Err(ClosureReason::FundingTimedOut);
 		}
 
+		let holder_next_commitment_number =
+			self.holder_commitment_point.next_transaction_number();
 		if let Some(pending_splice) = &mut self.pending_splice {
 			let mut confirmed_funding_index = None;
 
@@ -11460,6 +12411,7 @@ where
 					&self.context,
 					confirmed_funding_index,
 					height,
+					holder_next_commitment_number,
 				) {
 					log_info!(
 						logger, "Sending splice_locked txid {} to our peer for channel {}",
@@ -11665,9 +12617,14 @@ where
 					bitcoin_signature: our_bitcoin_sig,
 				})
 			},
-			// TODO (taproot|arik)
-			#[cfg(taproot)]
-			_ => todo!()
+			// simple-taproot channels are never announced — QU!D's hop is a private
+			// unannounced leaf (it force-closes inbound channel opens), so the taproot
+			// funding-key channel_announcement path is never driven. See
+			// TAPROOT-CHANNELS-BUILD-SPEC §M9-final. Reached only if a taproot channel
+			// were ever announced, which the protocol forbids.
+			ChannelSignerType::Taproot(_) => unreachable!(
+				"simple-taproot channels are never announced — QU!D hop is a private unannounced leaf; see TAPROOT-CHANNELS-BUILD-SPEC §M9-final"
+			),
 		}
 	}
 
@@ -11698,9 +12655,13 @@ where
 						contents: announcement,
 					})
 				},
-				// TODO (taproot|arik)
-				#[cfg(taproot)]
-				_ => todo!()
+				// simple-taproot channels are never announced — QU!D's hop is a private
+				// unannounced leaf (it force-closes inbound channel opens), so the taproot
+				// funding-key channel_announcement path is never driven. See
+				// TAPROOT-CHANNELS-BUILD-SPEC §M9-final.
+				ChannelSignerType::Taproot(_) => unreachable!(
+					"simple-taproot channels are never announced — QU!D hop is a private unannounced leaf; see TAPROOT-CHANNELS-BUILD-SPEC §M9-final"
+				),
 			}
 		} else {
 			Err(ChannelError::Ignore("Attempted to sign channel announcement before we'd received announcement_signatures".to_string()))
@@ -11839,6 +12800,40 @@ where
 			log_info!(logger, "Sending a data_loss_protect with no previous remote per_commitment_secret for channel {}", &self.context.channel_id());
 			[0;32]
 		};
+		// Simple-taproot reconnect nonce resync (spec §9d): MuSig2 verification nonces
+		// are ephemeral (spec §1) — forgotten on a dropped connection — so on every
+		// reconnect we re-advertise our FRESH holder verification nonce for the next
+		// holder commitment the counterparty will partial-sign. It is derived
+		// deterministically at `holder_commitment_point.next_transaction_number()` —
+		// the SAME height we advertise in `channel_ready`/`revoke_and_ack`, and the
+		// SAME the counterparty consumes when it signs our next commitment — so the
+		// advertised nonce equals the one we will actually sign with (no advertise!=sign
+		// regression). For a SPLICED channel there are two funding scopes (BOLT #995),
+		// so we send the per-funding-txid `next_local_nonces` map instead of the single
+		// nonce. Each side re-derives its OWN secret nonce (deterministic); re-sending
+		// the pubnonce here is the transport that was missing.
+		let next_commitment_number = self.holder_commitment_point.next_transaction_number();
+		let pending_funding = self.pending_funding();
+		let (next_local_nonce, next_local_nonces) = if pending_funding.is_empty() {
+			let single = self
+				.context
+				.generate_holder_next_local_nonce(&self.funding, next_commitment_number);
+			(single, Vec::new())
+		} else {
+			// Spliced: one fresh verification nonce per active funding scope, keyed by
+			// its funding TXID, so the post-reconnect `commitment_signed` for either
+			// scope has an exchanged pubnonce.
+			let mut nonces = Vec::new();
+			for funding in core::iter::once(&self.funding).chain(pending_funding.iter()) {
+				if let (Some(txid), Some(nonce)) = (
+					funding.get_funding_txid(),
+					self.context.generate_holder_next_local_nonce(funding, next_commitment_number),
+				) {
+					nonces.push((txid, nonce));
+				}
+			}
+			(None, nonces)
+		};
 		msgs::ChannelReestablish {
 			channel_id: self.context.channel_id(),
 			// The protocol has two different commitment number concepts - the "commitment
@@ -11863,6 +12858,8 @@ where
 			my_current_per_commitment_point: dummy_pubkey,
 			next_funding: self.maybe_get_next_funding(),
 			my_current_funding_locked: self.maybe_get_my_current_funding_locked(),
+			next_local_nonce,
+			next_local_nonces,
 		}
 	}
 
@@ -11908,22 +12905,53 @@ where
 		}
 
 		let our_funding_contribution = contribution.value();
-		if our_funding_contribution == SignedAmount::ZERO {
-			return Err(APIError::APIMisuseError {
-				err: format!(
-					"Channel {} cannot be spliced; contribution cannot be zero",
-					self.context.channel_id(),
-				),
-			});
-		}
+		// QU!D PATCH (§ACCEPTOR-CONTRIBUTION): a ZERO initiator contribution is now MEANINGFUL, so
+		// this guard is scoped to the case it was actually written for.
+		//
+		// Upstream rejected it unconditionally, and correctly: with the acceptor pinned to a zero
+		// contribution (`internal_splice_init`), a zero-zero splice moved no value and existed only
+		// to rotate the funding outpoint — which is pure cost, and for QU!D would void every
+		// pre-signed exit rung under BIP-341 `Prevouts::All` for nothing.
+		//
+		// With `register_acceptor_splice_contribution` that premise no longer holds: **the whole
+		// point of a hop-initiated delivery is that the initiator contributes NOTHING and the
+		// acceptor splices its own sats out.** Keeping the guard would forbid exactly the shape the
+		// patch exists to enable.
+		// ⚠️ WHAT IS STILL REFUSED IS THE ONE THAT IS ACTUALLY EMPTY: the initiator may pass zero,
+		// but it must then be offering the counterparty a chance to contribute — a splice where
+		// NEITHER side contributes is a no-op rotation, and it is refused where that becomes
+		// knowable, in `splice_init` once the acceptor's own contribution has been resolved.
+		// 📌 Same correction shape as the EVM's `SpliceUnchanged`, which was widened from "the size
+		// did not change" to "NOTHING changed" for the same reason.
+		// ⚠️ NOT A FLAG PARAMETER, DELIBERATELY: the initiator CANNOT know the acceptor's
+		// contribution at this point, so any flag here would be the caller ASSERTING something it
+		// cannot check. The both-zero case is refused in `splice_init`, which is the first place it
+		// is actually knowable.
 
 		// Fees for splice-out are paid from the channel balance whereas fees for splice-in
 		// are paid by the funding inputs. Therefore, in the case of splice-out, we add the
 		// fees on top of the user-specified contribution. We leave the user-specified
 		// contribution as-is for splice-ins.
+		// QU!D PATCH (§ACCEPTOR-CONTRIBUTION-FEES): **THE FEE FOLLOWS THE CONTRIBUTION, NOT THE
+		// INITIATION.** `is_initiator` in the estimator gates exactly the COMMON costs — the tx
+		// common fields, the shared funding output, and the input spending the previous funding
+		// output. Upstream charges them to whoever sent `splice_init`, which was the same party as
+		// the contributor because the acceptor could not contribute at all.
+		//
+		// This patch separates those two for the first time, and a hop-initiated delivery is the
+		// case where they come apart: the sats leaving are the LP's, the hop holds ~no balance in
+		// that channel, and charging the hop the common weight makes delivery impossible for
+		// exactly the fleet that is supposed to perform it.
+		//
+		// ⚠️ THE RULE IS DETERMINISTIC FROM DATA BOTH SIDES SEE, WHICH IS WHAT MAKES IT SAFE:
+		// *the common costs fall on the acceptor iff the initiator contributes ZERO.* The acceptor
+		// reads that from `splice_init.funding_contribution_satoshis`, so both compute the same
+		// split — if they disagreed, the interactive-tx fee checks would fail mid-negotiation with
+		// no way to attribute the mismatch.
+		let bears_common_costs = contribution.value() != SignedAmount::ZERO;
 		let adjusted_funding_contribution = check_splice_contribution_sufficient(
 			&contribution,
-			true,
+			bears_common_costs,
 			FeeRate::from_sat_per_kwu(u64::from(funding_feerate_per_kw)),
 		)
 		.map_err(|e| APIError::APIMisuseError {
@@ -12003,18 +13031,25 @@ where
 			change_script,
 		};
 
-		// Rotate the funding pubkey using the prev_funding_txid as a tweak
+		// Rotate the funding pubkey using the prev_funding_txid as a tweak.
+		// `new_funding_pubkey` is a base `ChannelSigner` method (scheme-agnostic):
+		// it tweaks OUR INDIVIDUAL funding key by `SHA256(prev_funding_txid || sk)`
+		// (BOLT #995). For ECDSA the rotated individual key IS the channel funding
+		// key; for taproot (MuSig2) it's our rotated individual key which both sides
+		// later re-`KeyAgg`+unspendable-tweak into the new aggregate `Q'` (the new
+		// `0x5120||Q'` funding output). The rotation itself is identical, so we drive
+		// it through `as_ref()` for BOTH signer variants (spec §9c).
 		let prev_funding_txid = self.funding.get_funding_txid();
-		let funding_pubkey = match (prev_funding_txid, &self.context.holder_signer) {
-			(None, _) => {
+		let funding_pubkey = match prev_funding_txid {
+			None => {
 				debug_assert!(false);
 				self.funding.get_holder_pubkeys().funding_pubkey
 			},
-			(Some(prev_funding_txid), ChannelSignerType::Ecdsa(ecdsa)) => {
-				ecdsa.new_funding_pubkey(prev_funding_txid, &self.context.secp_ctx)
-			},
-			#[cfg(taproot)]
-			_ => todo!(),
+			Some(prev_funding_txid) => self
+				.context
+				.holder_signer
+				.as_ref()
+				.new_funding_pubkey(prev_funding_txid, &self.context.secp_ctx),
 		};
 
 		let funding_negotiation =
@@ -12026,6 +13061,11 @@ where
 			received_funding_txid: None,
 		});
 
+		// Simple-taproot: advertise our MuSig2 splice nonce for the key-path sign of
+		// the shared (old-funding) input, derived per the OLD funding txid (spec §9c).
+		let splice_nonce = prev_funding_txid
+			.and_then(|txid| self.context.generate_holder_splice_nonce(&self.funding, &txid));
+
 		msgs::SpliceInit {
 			channel_id: self.context.channel_id,
 			funding_contribution_satoshis: adjusted_funding_contribution.to_sat(),
@@ -12033,6 +13073,7 @@ where
 			locktime,
 			funding_pubkey,
 			require_confirmed_inputs: None,
+			splice_nonce,
 		}
 	}
 
@@ -12094,14 +13135,34 @@ where
 			));
 		}
 
-		// TODO(splicing): Once splice acceptor can contribute, check that inputs are sufficient,
-		// similarly to the check in `splice_channel`.
-		debug_assert_eq!(our_funding_contribution, SignedAmount::ZERO);
+		// QU!D PATCH (§ACCEPTOR-CONTRIBUTION): upstream asserted the acceptor contributes NOTHING —
+		// `debug_assert_eq!(our_funding_contribution, SignedAmount::ZERO)` — which is the same
+		// assumption as the hardcoded zero in `internal_splice_init`, restated as an invariant.
+		// ⚠️ A NEGATIVE contribution is now legitimate (an acceptor-side splice-OUT, funded from its
+		// own channel balance). A POSITIVE one is not yet: it would need funding INPUTS whose
+		// sufficiency nothing on this path checks — upstream's remaining TODO, quoted below — so
+		// `internal_splice_init` refuses any non-`SpliceOut` registration before reaching here, and
+		// this assert is the backstop for that.
+		// TODO(splicing): Once a splice acceptor can contribute POSITIVELY, check that inputs are
+		// sufficient, similarly to the check in `splice_channel`.
+		debug_assert!(
+			our_funding_contribution <= SignedAmount::ZERO,
+			"acceptor may splice OUT (negative) but not IN: inputs are unchecked on this path",
+		);
 
 		let their_funding_contribution = SignedAmount::from_sat(msg.funding_contribution_satoshis);
-		if their_funding_contribution == SignedAmount::ZERO {
+		// QU!D PATCH: this refused a ZERO INITIATOR contribution outright. That is now the shape a
+		// hop-initiated delivery takes — the hop contributes nothing and offers the LP the chance to
+		// splice its own sats out — so the refusal is narrowed to the case that is actually empty:
+		// **neither side contributes**, which moves no value and rotates the funding outpoint for
+		// nothing, voiding every pre-signed exit rung under BIP-341 `Prevouts::All`.
+		// 📌 THIS IS THE ONE PLACE THE BOTH-ZERO CASE IS CHECKED (rule 17 — an earlier draft of this
+		// patch also added it to `splice_init`, which was a second guard for one condition).
+		if their_funding_contribution == SignedAmount::ZERO
+			&& our_funding_contribution == SignedAmount::ZERO
+		{
 			return Err(ChannelError::WarnAndDisconnect(format!(
-				"Channel {} cannot be spliced; they are the initiator, and their contribution is zero",
+				"Channel {} cannot be spliced; neither side contributes",
 				self.context.channel_id(),
 			)));
 		}
@@ -12109,18 +13170,22 @@ where
 		self.validate_splice_contributions(our_funding_contribution, their_funding_contribution)
 			.map_err(|e| ChannelError::WarnAndDisconnect(e))?;
 
-		// Rotate the pubkeys using the prev_funding_txid as a tweak
+		// Rotate the pubkeys using the prev_funding_txid as a tweak. As in
+		// `send_splice_init` above, `new_funding_pubkey` is the scheme-agnostic base
+		// `ChannelSigner` rotation (taproot rotates the same INDIVIDUAL key that is
+		// then re-aggregated into `Q'`), so we drive it via `as_ref()` for ECDSA and
+		// taproot alike (spec §9c).
 		let prev_funding_txid = self.funding.get_funding_txid();
-		let funding_pubkey = match (prev_funding_txid, &self.context.holder_signer) {
-			(None, _) => {
+		let funding_pubkey = match prev_funding_txid {
+			None => {
 				debug_assert!(false);
 				self.funding.get_holder_pubkeys().funding_pubkey
 			},
-			(Some(prev_funding_txid), ChannelSignerType::Ecdsa(ecdsa)) => {
-				ecdsa.new_funding_pubkey(prev_funding_txid, &self.context.secp_ctx)
-			},
-			#[cfg(taproot)]
-			_ => todo!(),
+			Some(prev_funding_txid) => self
+				.context
+				.holder_signer
+				.as_ref()
+				.new_funding_pubkey(prev_funding_txid, &self.context.secp_ctx),
 		};
 		let mut new_keys = self.funding.get_holder_pubkeys().clone();
 		new_keys.funding_pubkey = funding_pubkey;
@@ -12226,13 +13291,43 @@ where
 
 	pub(crate) fn splice_init<ES: Deref, L: Deref>(
 		&mut self, msg: &msgs::SpliceInit, our_funding_contribution_satoshis: i64,
+		// QU!D PATCH: outputs funded by a NEGATIVE `our_funding_contribution_satoshis` (an
+		// acceptor-side splice-out). Empty on the upstream path.
+		our_funding_outputs: Vec<TxOut>,
 		signer_provider: &SP, entropy_source: &ES, holder_node_id: &PublicKey, logger: &L,
 	) -> Result<msgs::SpliceAck, ChannelError>
 	where
 		ES::Target: EntropySource,
 		L::Target: Logger,
 	{
+		// QU!D PATCH (§ACCEPTOR-CONTRIBUTION-FEES): the acceptor's contribution must ABSORB its share
+		// of the funding-transaction fee, exactly as the initiator's does in `splice_channel`.
+		// Without this the outputs are funded but the FEE is not, so the transaction underpays and
+		// the mismatch surfaces later in the interactive-tx checks — far from its cause.
+		//
+		// 🔑 AND IT PICKS UP THE COMMON COSTS WHEN THE INITIATOR CONTRIBUTED NOTHING, which is the
+		// other half of the rule stated in `splice_channel`: the fee follows the CONTRIBUTION, not
+		// the initiation. `msg.funding_contribution_satoshis` is how the acceptor learns which case
+		// it is in, and it is the same input the initiator used — so both sides compute one split.
+		let our_funding_contribution_satoshis = if our_funding_contribution_satoshis != 0 {
+			let bears_common_costs = msg.funding_contribution_satoshis == 0;
+			let fee = estimate_v2_funding_transaction_fee(
+				&[],
+				&our_funding_outputs,
+				bears_common_costs,
+				true, // is_splice
+				msg.funding_feerate_per_kw,
+			);
+			// A splice-OUT is funded from channel balance, so the fee DEEPENS the negative
+			// contribution. (A positive acceptor contribution is refused in `internal_splice_init`,
+			// so the negative branch is the only one reachable — see that comment for why.)
+			our_funding_contribution_satoshis.saturating_sub(fee as i64)
+		} else {
+			our_funding_contribution_satoshis
+		};
 		let our_funding_contribution = SignedAmount::from_sat(our_funding_contribution_satoshis);
+		// (§ACCEPTOR-CONTRIBUTION) The both-zero refusal lives in `validate_splice_init`, which this
+		// calls — one guard, one place. An earlier draft duplicated it here.
 		let splice_funding = self.validate_splice_init(msg, our_funding_contribution)?;
 
 		log_info!(
@@ -12251,7 +13346,12 @@ where
 			funding_feerate_sat_per_1000_weight: msg.funding_feerate_per_kw,
 			shared_funding_input: Some(prev_funding_input),
 			our_funding_inputs: Vec::new(),
-			our_funding_outputs: Vec::new(),
+			// QU!D PATCH: the acceptor's own splice-out outputs. Upstream leaves this empty because
+			// `internal_splice_init` hardcoded a zero contribution, so there was never anything to
+			// put here. It is the OTHER half of that patch — a negative contribution with no
+			// outputs would remove value from our balance and pay it nowhere.
+			// ⚠️ Stays EMPTY for a zero contribution, so the upstream path is byte-identical.
+			our_funding_outputs: our_funding_outputs,
 			change_script: None,
 		};
 
@@ -12277,6 +13377,30 @@ where
 		// go into splicing from both sides.
 
 		let new_funding_pubkey = splice_funding.get_holder_pubkeys().funding_pubkey;
+
+		// Simple-taproot: store the initiator's splice nonce and advertise ours, both
+		// for the key-path sign of the shared (old-funding) input over the OLD funding
+		// txid (spec §9c). The KeyAggContext is the CURRENT funding scope (`self.funding`),
+		// since the splice spends the OLD funding output.
+		let prev_funding_txid = self.funding.get_funding_txid();
+		if self.funding.get_channel_type().supports_simple_taproot() {
+			if let Some(nonce) = msg.splice_nonce.clone() {
+				self.context.cur_counterparty_splice_nonce = Some(nonce);
+			}
+		}
+		let splice_nonce = prev_funding_txid
+			.and_then(|txid| self.context.generate_holder_splice_nonce(&self.funding, &txid));
+
+		// Simple-taproot: also advertise our fresh Q'-BOUND verification nonce for the
+		// splice's NEW-funding initial commitment (the acceptor can compute Q' — it has
+		// both rotated funding pubkeys via `splice_funding`). The initiator signs our
+		// new commitment against this nonce. Bound to Q' (NOT the old Q), at the next
+		// holder commitment height (spec §9c).
+		let splice_commitment_nonce = self.context.generate_holder_next_local_nonce(
+			&splice_funding,
+			self.holder_commitment_point.current_transaction_number(),
+		);
+
 		self.pending_splice = Some(PendingFunding {
 			funding_negotiation: Some(FundingNegotiation::ConstructingTransaction {
 				funding: splice_funding,
@@ -12292,6 +13416,8 @@ where
 			funding_contribution_satoshis: our_funding_contribution.to_sat(),
 			funding_pubkey: new_funding_pubkey,
 			require_confirmed_inputs: None,
+			splice_nonce,
+			splice_commitment_nonce,
 		})
 	}
 
@@ -12312,6 +13438,22 @@ where
 			splice_funding.get_value_satoshis(),
 			self.funding.get_value_satoshis(),
 		);
+
+		// Simple-taproot: store the acceptor's splice nonce so we can produce our
+		// key-path partial over the shared (old-funding) input at `funding_tx_signed`
+		// (spec §9c). We advertised ours in `splice_init`. Also store the acceptor's
+		// Q'-BOUND commitment nonce as our current verification nonce, so our splice
+		// initial `commitment_signed` partial-signs the acceptor's new commitment
+		// against the right (Q'-bound) nonce — reusing the old-Q nonce would make the
+		// MuSig2 aggregation fail (bad partial).
+		if self.funding.get_channel_type().supports_simple_taproot() {
+			if let Some(nonce) = msg.splice_nonce.clone() {
+				self.context.cur_counterparty_splice_nonce = Some(nonce);
+			}
+			if let Some(nonce) = msg.splice_commitment_nonce.clone() {
+				self.context.cur_counterparty_taproot_nonce = Some(nonce);
+			}
+		}
 
 		let pending_splice =
 			self.pending_splice.as_mut().expect("We should have returned an error earlier!");
@@ -12480,6 +13622,17 @@ where
 			return Err(ChannelError::close(err.to_string()));
 		}
 		pending_splice.received_funding_txid = Some(msg.splice_txid);
+
+		// Simple-taproot (§10 audit, HTLC↔splice): store the peer's Q'-bound
+		// verification nonce for the FIRST post-splice commitment, so our next
+		// `commitment_signed` partial-signs the peer's next commitment against the
+		// right nonce. The splice-initial exchange had no `revoke_and_ack`, so this is
+		// where the post-splice next nonce is (re)established (the channel_ready analog).
+		if self.funding.get_channel_type().supports_simple_taproot() {
+			if let Some(nonce) = msg.next_local_nonce.clone() {
+				self.context.cur_counterparty_taproot_nonce = Some(nonce);
+			}
+		}
 
 		if pending_splice.sent_funding_txid.is_none() {
 			log_info!(
@@ -12854,7 +14007,7 @@ where
 					debug_assert_eq!(htlc_signatures.len(), trusted_tx.nondust_htlcs().len());
 					for (ref htlc_sig, ref htlc) in htlc_signatures.iter().zip(trusted_tx.nondust_htlcs()) {
 						log_trace!(logger, "Signed remote HTLC tx {} with redeemscript {} with pubkey {} -> {} in channel {}",
-							encode::serialize_hex(&chan_utils::build_htlc_transaction(&trusted_tx.txid(), trusted_tx.negotiated_feerate_per_kw(), funding.get_holder_selected_contest_delay(), htlc, funding.get_channel_type(), &counterparty_keys.broadcaster_delayed_payment_key, &counterparty_keys.revocation_key)),
+							encode::serialize_hex(&chan_utils::build_htlc_transaction(&trusted_tx.txid(), trusted_tx.negotiated_feerate_per_kw(), funding.get_holder_selected_contest_delay(), htlc, funding.get_channel_type(), &counterparty_keys.broadcaster_delayed_payment_key, &counterparty_keys.revocation_key, &self.context.secp_ctx)),
 							encode::serialize_hex(&chan_utils::get_htlc_redeemscript(&htlc, funding.get_channel_type(), &counterparty_keys)),
 							log_bytes!(counterparty_keys.broadcaster_htlc_key.to_public_key().serialize()),
 							log_bytes!(htlc_sig.serialize_compact()[..]), &self.context.channel_id());
@@ -12865,14 +14018,39 @@ where
 					channel_id: self.context.channel_id,
 					signature,
 					htlc_signatures,
+					htlc_partial_signatures: Vec::new(),
 					funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
-					#[cfg(taproot)]
 					partial_signature_with_nonce: None,
+					next_local_nonce: None,
 				})
 			},
-			// TODO (taproot|arik)
-			#[cfg(taproot)]
-			_ => todo!()
+			// Simple taproot channels: produce a MuSig2 key-path partial over the
+			// counterparty commitment, signed against their current verification
+			// nonce (`cur_counterparty_taproot_nonce`), in
+			// `partial_signature_with_nonce` (spec §1), plus one BIP340 Schnorr sig
+			// per non-dust HTLC over the second-level HTLC tx (spec §3, M9b) carried
+			// in `htlc_partial_signatures`.
+			ChannelSignerType::Taproot(taproot) => {
+				self.context.provide_taproot_context_to_signer(funding);
+				let cp_nonce = self.context.cur_counterparty_taproot_nonce.clone()
+					.ok_or_else(|| ChannelError::Ignore(
+						"No counterparty taproot nonce for commitment_signed".to_owned()))?;
+				let (psn, htlc_sigs) = taproot.partially_sign_counterparty_commitment(
+					cp_nonce, &counterparty_commitment_tx, commitment_data.inbound_htlc_preimages,
+					commitment_data.outbound_htlc_preimages, &self.context.secp_ctx,
+				).map_err(|_| ChannelError::Ignore(
+					"Failed to get taproot partial for new commitment_signed".to_owned()))?;
+				debug_assert_eq!(htlc_sigs.len(), counterparty_commitment_tx.trust().nondust_htlcs().len());
+				Ok(msgs::CommitmentSigned {
+					channel_id: self.context.channel_id,
+					signature: taproot_unused_ecdsa_sig(),
+					htlc_signatures: Vec::new(),
+					htlc_partial_signatures: htlc_sigs,
+					funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
+					partial_signature_with_nonce: Some(psn),
+					next_local_nonce: None,
+				})
+			},
 		}
 	}
 
@@ -13032,6 +14210,7 @@ where
 		let shutdown = msgs::Shutdown {
 			channel_id: self.context.channel_id,
 			scriptpubkey: self.get_closing_scriptpubkey(),
+			shutdown_nonce: self.context.generate_holder_shutdown_nonce(&self.funding),
 		};
 
 		// Go ahead and drop holding cell updates as we'd rather fail payments than wait to send
@@ -13422,16 +14601,38 @@ where
 			self.context.counterparty_next_commitment_transaction_number,
 			&self.context.counterparty_next_commitment_point.unwrap(), false, false, logger);
 		let counterparty_initial_commitment_tx = commitment_data.tx;
-		let signature = match &self.context.holder_signer {
-			// TODO (taproot|arik): move match into calling method for Taproot
-			ChannelSignerType::Ecdsa(ecdsa) => {
-				let channel_parameters = &self.funding.channel_transaction_parameters;
-				ecdsa.sign_counterparty_commitment(channel_parameters, &counterparty_initial_commitment_tx, Vec::new(), Vec::new(), &self.context.secp_ctx)
-					.map(|(sig, _)| sig).ok()
-			},
-			// TODO (taproot|arik)
-			#[cfg(taproot)]
-			_ => todo!()
+		let is_taproot = self.funding.get_channel_type().supports_simple_taproot();
+		// For simple-taproot channels: a MuSig2 key-path partial over the
+		// counterparty commitment (signed against their `next_local_nonce` from
+		// `accept_channel`), plus our own fresh `next_local_nonce` for the acceptor
+		// to use when partial-signing the funding output (spec §1).
+		let (signature, partial_signature_with_nonce, next_local_nonce) = if is_taproot {
+			self.context.provide_taproot_context_to_signer(&self.funding);
+			let cp_nonce = self.context.cur_counterparty_taproot_nonce.clone();
+			let partial = cp_nonce.and_then(|cpn| self.context.holder_signer.as_taproot().and_then(|s|
+				s.partially_sign_counterparty_commitment(
+					cpn, &counterparty_initial_commitment_tx, Vec::new(), Vec::new(), &self.context.secp_ctx
+				).ok()
+			));
+			let holder_next_num = self.unfunded_context.holder_commitment_point
+				.map(|p| p.next_transaction_number()).unwrap_or(INITIAL_COMMITMENT_NUMBER);
+			let our_next_nonce = self.context.generate_holder_next_local_nonce(
+				&self.funding, holder_next_num,
+			);
+			match partial {
+				Some((psn, _htlc_sigs)) => (Some(taproot_unused_ecdsa_sig()), Some(psn), our_next_nonce),
+				None => (None, None, None),
+			}
+		} else {
+			let sig = match &self.context.holder_signer {
+				ChannelSignerType::Ecdsa(ecdsa) => {
+					let channel_parameters = &self.funding.channel_transaction_parameters;
+					ecdsa.sign_counterparty_commitment(channel_parameters, &counterparty_initial_commitment_tx, Vec::new(), Vec::new(), &self.context.secp_ctx)
+						.map(|(sig, _)| sig).ok()
+				},
+				_ => unreachable!("non-taproot channel always has an Ecdsa signer"),
+			};
+			(sig, None, None)
 		};
 
 		if signature.is_some() && self.context.signer_pending_funding {
@@ -13447,10 +14648,8 @@ where
 			funding_txid: self.funding.channel_transaction_parameters.funding_outpoint.as_ref().unwrap().txid,
 			funding_output_index: self.funding.channel_transaction_parameters.funding_outpoint.as_ref().unwrap().index,
 			signature,
-			#[cfg(taproot)]
-			partial_signature_with_nonce: None,
-			#[cfg(taproot)]
-			next_local_nonce: None,
+			partial_signature_with_nonce,
+			next_local_nonce,
 		})
 	}
 
@@ -13573,6 +14772,11 @@ where
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
+				// Simple-taproot `next_local_nonce` (TLV 4). Generated by the
+				// nonce-exchange handler once the counterparty funding pubkey is
+				// known (the M5 signer's `generate_local_nonce_pair` requires the
+				// per-channel KeyAggContext, which needs the peer funding key).
+				next_local_nonce: None,
 			},
 			push_msat: self.funding.get_value_satoshis() * 1000 - self.funding.value_to_self_msat,
 			channel_reserve_satoshis: self.funding.holder_selected_channel_reserve_satoshis,
@@ -13590,7 +14794,16 @@ where
 			their_features,
 			&msg.common_fields,
 			msg.channel_reserve_satoshis,
-		)
+		)?;
+		// Simple taproot: store the fundee's verification nonce (`next_local_nonce`)
+		// so our `funding_created` can partial-sign the fundee's commitment against it
+		// (spec §1/§5). The counterparty funding pubkey is now set by the checks above.
+		if self.funding.get_channel_type().supports_simple_taproot() {
+			if let Some(nonce) = msg.next_local_nonce.clone() {
+				self.context.cur_counterparty_taproot_nonce = Some(nonce);
+			}
+		}
+		Ok(())
 	}
 
 	/// Handles a funding_signed message from the remote end.
@@ -13615,7 +14828,7 @@ where
 		self.context.assert_no_commitment_advancement(holder_commitment_point.next_transaction_number(), "funding_signed");
 
 		let (channel_monitor, _) = match self.initial_commitment_signed(
-			self.context.channel_id(), msg.signature,
+			self.context.channel_id(), msg.signature, msg.partial_signature_with_nonce.clone(),
 			&mut holder_commitment_point, best_block, signer_provider, logger
 		) {
 			Ok(channel_monitor) => channel_monitor,
@@ -13848,8 +15061,15 @@ where
 				channel_type: Some(self.funding.get_channel_type().clone()),
 			},
 			channel_reserve_satoshis: self.funding.holder_selected_channel_reserve_satoshis,
-			#[cfg(taproot)]
-			next_local_nonce: None,
+			// Simple-taproot `next_local_nonce` (TLV 4): the fundee's verification
+			// nonce for its first holder commitment. The counterparty funding pubkey is
+			// known by now (from `open_channel`), so the per-channel KeyAggContext is
+			// available and the nonce is derivable (spec §5).
+			next_local_nonce: {
+				let holder_next_num = self.unfunded_context.holder_commitment_point
+					.map(|p| p.next_transaction_number()).unwrap_or(INITIAL_COMMITMENT_NUMBER);
+				self.context.generate_holder_next_local_nonce(&self.funding, holder_next_num)
+			},
 		})
 	}
 
@@ -13895,8 +15115,17 @@ where
 		let funding_txo = OutPoint { txid: msg.funding_txid, index: msg.funding_output_index };
 		self.funding.channel_transaction_parameters.funding_outpoint = Some(funding_txo);
 
+		// Simple taproot: store the funder's fresh verification nonce
+		// (`next_local_nonce`) so our `funding_signed` can partial-sign the funder's
+		// commitment against it (spec §1).
+		if self.funding.get_channel_type().supports_simple_taproot() {
+			if let Some(nonce) = msg.next_local_nonce.clone() {
+				self.context.cur_counterparty_taproot_nonce = Some(nonce);
+			}
+		}
+
 		let (channel_monitor, counterparty_initial_commitment_tx) = match self.initial_commitment_signed(
-			ChannelId::v1_from_funding_outpoint(funding_txo), msg.signature,
+			ChannelId::v1_from_funding_outpoint(funding_txo), msg.signature, msg.partial_signature_with_nonce.clone(),
 			&mut holder_commitment_point, best_block, signer_provider, logger
 		) {
 			Ok(channel_monitor) => channel_monitor,
@@ -14102,6 +15331,8 @@ where
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
+				// Simple-taproot `next_local_nonce` (TLV 4); see open_channel.
+				next_local_nonce: None,
 			},
 			funding_feerate_sat_per_1000_weight: self.context.feerate_per_kw,
 			second_per_commitment_point,
@@ -14182,7 +15413,7 @@ where
 		};
 		let shared_funding_output = TxOut {
 			value: Amount::from_sat(funding.get_value_satoshis()),
-			script_pubkey: funding.get_funding_redeemscript().to_p2wsh(),
+			script_pubkey: funding.get_funding_spk(),
 		};
 
 		let interactive_tx_constructor = Some(InteractiveTxConstructor::new(
@@ -14304,6 +15535,44 @@ pub(super) fn get_initial_channel_type(
 	// available. If it's private, we first try `scid_privacy` as it provides better privacy
 	// with no other changes, and fall back to `only_static_remotekey`.
 	let mut ret = ChannelTypeFeatures::only_static_remote_key();
+
+	// `option_simple_taproot` (BOLT bits 80/81) is an explicit opt-in, NOT the default: we only
+	// select the taproot channel type when the user has enabled `negotiate_simple_taproot` AND the
+	// counterparty advertises the feature. Otherwise we leave `ret` on the existing (non-taproot)
+	// channel type so default channel opening is unchanged. When selected, taproot supersedes the
+	// rest of the channel-type negotiation below (key-path MuSig2 funding has its own format), so
+	// we return early.
+	if config.channel_handshake_config.negotiate_simple_taproot
+		&& their_features.supports_simple_taproot()
+	{
+		// `option_simple_taproot` implies (and the acceptor's channel-type check
+		// requires) `static_remote_key`; start from `only_static_remote_key()` so the
+		// bit is set, then layer the taproot bit on top.
+		let mut taproot = ChannelTypeFeatures::only_static_remote_key();
+		taproot.set_simple_taproot_required();
+		// M9g: simple-taproot channels ARE anchor channels (BOLT #995). When the user
+		// has opted into `negotiate_anchors_zero_fee_htlc_tx` (QU!D always does — see
+		// `build_user_config`) and the counterparty supports it, layer
+		// `option_anchors_zero_fee_htlc_tx` on top so the commitment carries the two
+		// taproot anchor outputs and a force-close can be CPFP-fee-bumped. The
+		// fee/balance model (`tx_builder::subtract_addl_outputs` / `commit_tx_fee_sat`)
+		// reserves the 2×330-sat anchor value off the funder once this bit is set.
+		// Resolves the prior config↔type contradiction (config advertised anchors but
+		// the negotiated taproot type silently dropped them → no anchor outputs).
+		if config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx
+			&& their_features.supports_anchors_zero_fee_htlc_tx()
+		{
+			taproot.set_anchors_zero_fee_htlc_tx_required();
+		}
+		if !config.channel_handshake_config.announce_for_forwarding
+			&& config.channel_handshake_config.negotiate_scid_privacy
+			&& their_features.supports_scid_privacy()
+		{
+			taproot.set_scid_privacy_required();
+		}
+		return taproot;
+	}
+
 	if !config.channel_handshake_config.announce_for_forwarding
 		&& config.channel_handshake_config.negotiate_scid_privacy
 		&& their_features.supports_scid_privacy()
@@ -14781,6 +16050,11 @@ where
 			monitor_pending_update_adds = Some(&self.context.monitor_pending_update_adds);
 		}
 		let is_manual_broadcast = Some(self.context.is_manual_broadcast);
+		// Taproot coop-close nonce-reuse guard (spec §9f-0): persist the monotonic
+		// `closing_round` and whether its nonce was consumed, so a restart mid-close
+		// cannot re-sign a round whose nonce already signed a different-fee close tx.
+		let closing_round = Some(self.context.closing_round);
+		let closing_partial_sent_at_round = Some(self.context.closing_partial_sent_at_round);
 
 		let holder_commitment_point_current = self.holder_commitment_point.current_point();
 		let holder_commitment_point_next = self.holder_commitment_point.next_point();
@@ -14843,6 +16117,8 @@ where
 			(65, self.quiescent_action, option), // Added in 0.2
 			(67, pending_outbound_held_htlc_flags, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags, optional_vec), // Added in 0.2
+			(71, closing_round, option), // Added: taproot coop-close round (restart nonce-reuse guard)
+			(73, closing_partial_sent_at_round, option), // Added: taproot coop-close round consumed flag
 		});
 
 		Ok(())
@@ -15198,6 +16474,8 @@ where
 		let mut holder_commitment_point_next_opt: Option<PublicKey> = None;
 		let mut holder_commitment_point_pending_next_opt: Option<PublicKey> = None;
 		let mut is_manual_broadcast = None;
+		let mut closing_round: Option<u64> = None;
+		let mut closing_partial_sent_at_round: Option<bool> = None;
 
 		let mut historical_scids = Some(Vec::new());
 
@@ -15257,9 +16535,27 @@ where
 			(65, quiescent_action, upgradable_option), // Added in 0.2
 			(67, pending_outbound_held_htlc_flags_opt, optional_vec), // Added in 0.2
 			(69, holding_cell_held_htlc_flags_opt, optional_vec), // Added in 0.2
+			(71, closing_round, option), // Added: taproot coop-close round (restart nonce-reuse guard)
+			(73, closing_partial_sent_at_round, option), // Added: taproot coop-close round consumed flag
 		});
 
-		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
+		// Restart nonce-reuse guard (taproot coop-close). The reconnect bump in
+		// `remove_uncommitted_htlcs_and_mark_paused` fires only on a LIVE
+		// `peer_disconnected`; a RELOADED node never traverses it (it is read back
+		// already paused and reconnects via `channel_reestablish`). So if a closing
+		// partial was sent at the persisted `closing_round` before the crash — i.e.
+		// that round's MuSig2 nonce is already consumed and was put on the wire —
+		// advance the round HERE, before any nonce is regenerated (the reconnect
+		// `shutdown_nonce` retransmit / the next closing partial). Otherwise the
+		// restarted node re-signs round N over a different-fee close tx with the same
+		// nonce and leaks the funding key (`x = (s1 - s2)/(e1 - e2)`).
+		// `closing_partial_sent_at_round` is only ever set for taproot channels, so no
+		// channel-type gate is needed; the flag is cleared (the new round is unused).
+		let closing_round = closing_round
+			.unwrap_or(0)
+			.saturating_add(if closing_partial_sent_at_round.unwrap_or(false) { 1 } else { 0 });
+
+		let holder_ecdsa_signer = signer_provider.derive_channel_signer(channel_keys_id);
 
 		let mut iter = preimages.into_iter();
 		let mut fulfill_attribution_data_iter = fulfill_attribution_data.map(Vec::into_iter);
@@ -15303,6 +16599,16 @@ where
 		if chan_features != channel_parameters.channel_type_features {
 			return Err(DecodeError::InvalidValue);
 		}
+
+		// Reconstruct the right signer variant (M6): a reloaded simple-taproot
+		// channel holds a `ChannelSignerType::Taproot(_)`, everything else `Ecdsa(_)`.
+		let holder_signer = if chan_features.supports_simple_taproot() {
+			ChannelSignerType::Taproot(
+				signer_provider.derive_taproot_channel_signer(channel_keys_id),
+			)
+		} else {
+			ChannelSignerType::Ecdsa(holder_ecdsa_signer)
+		};
 
 		let mut secp_ctx = Secp256k1::new();
 		secp_ctx.seeded_randomize(&entropy_source.get_secure_random_bytes());
@@ -15464,6 +16770,7 @@ where
 					// If the current point is not available then splicing can't be initiated
 					// until the next point is advanced and becomes the current point.
 					holder_signer
+						.as_ref()
 						.get_per_commitment_point(
 							holder_commitment_next_transaction_number + 1,
 							&secp_ctx,
@@ -15481,11 +16788,13 @@ where
 				},
 				(_, _) => {
 					let next_point = holder_signer
+						.as_ref()
 						.get_per_commitment_point(holder_commitment_next_transaction_number, &secp_ctx)
 						.expect(
 							"Must be able to derive the next commitment point upon channel restoration",
 						);
 					let pending_next_point = holder_signer
+						.as_ref()
 						.get_per_commitment_point(
 							holder_commitment_next_transaction_number - 1,
 							&secp_ctx,
@@ -15555,9 +16864,14 @@ where
 
 				latest_monitor_update_id,
 
-				holder_signer: ChannelSignerType::Ecdsa(holder_signer),
+				holder_signer,
 				shutdown_scriptpubkey,
 				destination_script,
+				cur_counterparty_taproot_nonce: None,
+				cur_counterparty_closing_nonce: None,
+				closing_round, // restart nonce-reuse guard applied above
+				closing_partial_sent_at_round: false, // consumed by the reload bump above
+				cur_counterparty_splice_nonce: None,
 
 				counterparty_next_commitment_transaction_number,
 
@@ -15769,7 +17083,6 @@ mod tests {
 	#[cfg(ldk_test_vectors)]
 	impl SignerProvider for Keys {
 		type EcdsaSigner = InMemorySigner;
-		#[cfg(taproot)]
 		type TaprootSigner = InMemorySigner;
 
 		fn generate_channel_keys_id(&self, _inbound: bool, _user_channel_id: u128) -> [u8; 32] {
@@ -15777,6 +17090,10 @@ mod tests {
 		}
 
 		fn derive_channel_signer(&self, _channel_keys_id: [u8; 32]) -> Self::EcdsaSigner {
+			self.signer.clone()
+		}
+
+		fn derive_taproot_channel_signer(&self, _channel_keys_id: [u8; 32]) -> Self::TaprootSigner {
 			self.signer.clone()
 		}
 

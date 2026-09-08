@@ -2845,6 +2845,31 @@ pub struct ChannelManager<
 	/// are handled by the user before they're persisted durably to disk). In that case, the second
 	/// element in the tuple is set to `Some` with further details of the action.
 	///
+	/// QU!D PATCH (see lib/rust-lightning/QUID_PATCHES.md): the contribution THIS node will make to
+	/// the next splice the COUNTERPARTY initiates on a given channel.
+	///
+	/// Upstream hardcodes the acceptor's contribution to zero (`internal_splice_init`) under
+	/// *"TODO(splicing): Currently not possible to contribute on the splicing-acceptor side"*, while
+	/// `Channel::splice_init` and `FundingNegotiationContext` already accept and use one. This map
+	/// is the missing input, nothing more.
+	///
+	/// 🔑 WHY QU!D NEEDS IT: a swap-out delivery removes the **LP's** sats, and
+	/// `SpliceContribution::SpliceOut` debits the INITIATOR — so upstream forces the LP to initiate.
+	/// The LP is an often-offline phone wallet, and driving an interactive-tx splice is a far larger
+	/// ask of a wallet than co-signing one. With this, the HOP initiates and the LP contributes its
+	/// own splice-out as ACCEPTOR. Upstream's own TODO in `splice_init` names this case: *"for
+	/// often-offline nodes it may be [useful], as we may connect and immediately go into splicing
+	/// from both sides."*
+	///
+	/// ⚠️ ONE-SHOT AND PER-CHANNEL, BOTH DELIBERATE. It is REMOVED when consumed, so a registration
+	/// cannot attach the same outputs to a later, unrelated splice — which would pay a swapper twice
+	/// out of a channel that never agreed to it. Keyed by `ChannelId` so a registration for one
+	/// channel can never be applied to another.
+	/// ⚠️ NOT PERSISTED. An intent that survived a restart would be applied to whatever splice
+	/// arrived next, possibly after the delivery it belonged to had already been resolved. It is
+	/// re-registered per delivery attempt by design.
+	pending_acceptor_contributions: Mutex<HashMap<ChannelId, SpliceContribution>>,
+
 	/// Note that events MUST NOT be removed from pending_events after deserialization, as they
 	/// could be in the middle of being processed without the direct mutex held.
 	///
@@ -4004,6 +4029,7 @@ where
 			#[cfg(not(any(test, feature = "_externalize_tests")))]
 			monitor_update_type: AtomicUsize::new(0),
 
+			pending_acceptor_contributions: Mutex::new(new_hash_map()),
 			pending_events: Mutex::new(VecDeque::new()),
 			pending_events_processor: AtomicBool::new(false),
 			pending_htlc_forwards_processor: AtomicBool::new(false),
@@ -4706,6 +4732,43 @@ where
 			);
 		}
 	}
+	/// QU!D PATCH (see lib/rust-lightning/QUID_PATCHES.md): declare what THIS node will contribute to
+	/// the next splice the COUNTERPARTY initiates on `channel_id`.
+	///
+	/// Upstream can only contribute as the splice INITIATOR, because
+	/// [`ChannelManager::internal_splice_init`] hardcodes the acceptor's contribution to zero. Every
+	/// layer below already supports one, so this and that line are the whole patch.
+	///
+	/// 🔑 WHY IT EXISTS: [`SpliceContribution::SpliceOut`] debits the INITIATOR, so removing an LP's
+	/// sats upstream-style requires the LP to drive the whole interactive-tx negotiation. QU!D's LP
+	/// is an often-offline phone wallet, and **co-signing a splice is a far smaller ask than driving
+	/// one**. With this, the hop initiates and the LP contributes its own splice-out as acceptor.
+	///
+	/// ⚠️ **ONE-SHOT.** The registration is CONSUMED by the next `splice_init` on this channel. It is
+	/// not a standing policy, and it is deliberately not persisted — an intent that survived a
+	/// restart would attach to whatever splice arrived next, which for a delivery means paying a
+	/// swapper out of a channel that never agreed to it.
+	/// ⚠️ **`SpliceOut` ONLY.** A positive contribution needs inputs whose sufficiency the acceptor
+	/// path does not yet check (upstream's remaining TODO in `validate_splice_init`); a splice-out is
+	/// funded from channel balance and needs none. A non-`SpliceOut` registration is refused when the
+	/// splice arrives rather than here, so the caller learns of it on the path that uses it.
+	///
+	/// Returns the contribution previously registered for this channel, if any — a `Some` means an
+	/// earlier intent was replaced without ever being used, which is worth logging at the call site.
+	pub fn register_acceptor_splice_contribution(
+		&self, channel_id: ChannelId, contribution: SpliceContribution,
+	) -> Option<SpliceContribution> {
+		self.pending_acceptor_contributions.lock().unwrap().insert(channel_id, contribution)
+	}
+
+	/// QU!D PATCH: drop a registration made by [`Self::register_acceptor_splice_contribution`]
+	/// without waiting for a splice to consume it — for a delivery attempt that was abandoned.
+	pub fn clear_acceptor_splice_contribution(
+		&self, channel_id: &ChannelId,
+	) -> Option<SpliceContribution> {
+		self.pending_acceptor_contributions.lock().unwrap().remove(channel_id)
+	}
+
 
 	/// Initiate a splice in order to add value to (splice-in) or remove value from (splice-out)
 	/// the channel. This will spend the channel's funding transaction output, effectively replacing
@@ -6366,7 +6429,9 @@ where
 				is_batch_funding,
 				|chan| {
 					let mut output_index = None;
-					let expected_spk = chan.funding.get_funding_redeemscript().to_p2wsh();
+					// Simple-taproot channels fund a P2TR (`0x5120||Q`) output; everything
+					// else the P2WSH 2-of-2. `get_funding_spk()` returns the right one.
+					let expected_spk = chan.funding.get_funding_spk();
 					let outpoint = match &funding {
 						FundingType::Checked(tx) | FundingType::CheckedManualBroadcast(tx) => {
 							for (idx, outp) in tx.output.iter().enumerate() {
@@ -10274,7 +10339,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 								&peer_state.latest_features,
 							);
 							try_channel_entry!(self, peer_state, res, chan);
-							(unfunded_chan.funding.get_value_satoshis(), unfunded_chan.funding.get_funding_redeemscript().to_p2wsh(), unfunded_chan.context.get_user_id())
+							(unfunded_chan.funding.get_value_satoshis(), unfunded_chan.funding.get_funding_spk(), unfunded_chan.context.get_user_id())
 						},
 						None => {
 							return Err(MsgHandleErrInternal::send_err_msg_no_close(format!("Got an unexpected accept_channel message from peer with counterparty_node_id {}", counterparty_node_id), msg.common_fields.temporary_channel_id));
@@ -11223,9 +11288,28 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				let chan = chan_entry.get_mut();
 				let logger = WithChannelContext::from(&self.logger, &chan.context(), None);
 				let funding_txo = chan.funding().get_funding_txo();
-				let (monitor_opt, monitor_update_opt) = try_channel_entry!(
+				let (monitor_opt, monitor_update_opt, deferred_commitment_signed) = try_channel_entry!(
 					self, peer_state, chan.commitment_signed(msg, best_block, &self.signer_provider, &self.fee_estimator, &&logger),
 					chan_entry);
+
+				// SIMPLE-TAPROOT SPLICE (spec §9c): the splice acceptor deferred its
+				// `commitment_signed` until it received the initiator's `Q'`-bound nonce in
+				// this message; send it now (the corresponding holder-commitment safety is
+				// captured by the `RenegotiatedFunding` monitor update queued above).
+				if let Some(deferred_commitment_signed) = deferred_commitment_signed {
+					peer_state.pending_msg_events.push(MessageSendEvent::UpdateHTLCs {
+						node_id: *counterparty_node_id,
+						channel_id: msg.channel_id,
+						updates: CommitmentUpdate {
+							commitment_signed: vec![deferred_commitment_signed],
+							update_add_htlcs: vec![],
+							update_fulfill_htlcs: vec![],
+							update_fail_htlcs: vec![],
+							update_fail_malformed_htlcs: vec![],
+							update_fee: None,
+						},
+					});
+				}
 
 				if let Some(chan) = chan.as_funded_mut() {
 					if let Some(monitor) = monitor_opt {
@@ -11815,6 +11899,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							my_current_per_commitment_point: PublicKey::from_slice(&[2u8; 33]).unwrap(),
 							next_funding: None,
 							my_current_funding_locked: None,
+							next_local_nonce: None,
+							next_local_nonces: Vec::new(),
 						},
 					});
 					return Err(MsgHandleErrInternal::send_err_msg_no_close(
@@ -11848,8 +11934,42 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 		let mut peer_state_lock = peer_state_mutex.lock().unwrap();
 		let peer_state = &mut *peer_state_lock;
 
-		// TODO(splicing): Currently not possible to contribute on the splicing-acceptor side
-		let our_funding_contribution = 0i64;
+		// QU!D PATCH: outputs the acceptor funds, filled in beside the contribution below.
+		let mut acceptor_outputs: Vec<bitcoin::TxOut> = Vec::new();
+		// QU!D PATCH: the acceptor's contribution, if this node registered one for THIS channel.
+		// Upstream reads `0i64` here under *"TODO(splicing): Currently not possible to contribute on
+		// the splicing-acceptor side"* — every layer BELOW this already supports it
+		// (`Channel::splice_init` takes it, `FundingNegotiationContext` carries our contribution AND
+		// our outputs, and `validate_splice_init` does not reject a non-zero one), so this line was
+		// the whole of the limitation.
+		//
+		// ⚠️ REMOVED, NOT READ: consuming the registration is what keeps it one-shot. A left-behind
+		// intent would attach the same outputs to the NEXT splice on this channel — paying a swapper
+		// a second time out of a channel that never agreed to it.
+		// ⚠️ SPLICE-OUT ONLY, AND THAT IS NOT AN ARBITRARY RESTRICTION. A negative contribution is
+		// funded from this node's CHANNEL BALANCE and needs no inputs; a positive one needs inputs
+		// whose sufficiency `validate_splice_init` still does not check (its own remaining TODO).
+		// Accepting a splice-IN here would walk straight into that gap.
+		let our_funding_contribution = {
+			let mut pending = self.pending_acceptor_contributions.lock().unwrap();
+			match pending.remove(&msg.channel_id) {
+				Some(SpliceContribution::SpliceOut { outputs }) => {
+					let out_value: u64 = outputs.iter().map(|o| o.value.to_sat()).sum();
+					acceptor_outputs = outputs;
+					-(out_value as i64)
+				},
+				Some(other) => {
+					// Put it back untouched: refusing is not the same as discarding, and silently
+					// dropping a registered intent is how a delivery goes missing with no error.
+					pending.insert(msg.channel_id, other);
+					let err = ChannelError::WarnAndDisconnect(
+						"acceptor contribution must be SpliceOut".to_owned()
+					);
+					return Err(MsgHandleErrInternal::from_chan_no_close(err, msg.channel_id));
+				},
+				None => 0i64,
+			}
+		};
 
 		// Look for the channel
 		match peer_state.channel_by_id.entry(msg.channel_id) {
@@ -11867,8 +11987,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 
 				if let Some(ref mut funded_channel) = chan_entry.get_mut().as_funded_mut() {
 					let init_res = funded_channel.splice_init(
-						msg, our_funding_contribution, &self.signer_provider, &self.entropy_source,
-						&self.get_our_node_id(), &self.logger
+						msg, our_funding_contribution, acceptor_outputs, &self.signer_provider,
+						&self.entropy_source, &self.get_our_node_id(), &self.logger
 					);
 					let splice_ack_msg = try_channel_entry!(self, peer_state, init_res, chan_entry);
 					peer_state.pending_msg_events.push(MessageSendEvent::SendSpliceAck {
@@ -15770,6 +15890,12 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 		features.set_anchor_zero_fee_commitments_optional();
 	}
 
+	// `option_simple_taproot` (BOLT bits 80/81). Opt-in only: advertised when the user
+	// explicitly enables it so default channel opening stays on the existing channel type.
+	if config.channel_handshake_config.negotiate_simple_taproot {
+		features.set_simple_taproot_optional();
+	}
+
 	if config.enable_htlc_hold {
 		features.set_htlc_hold_optional();
 	}
@@ -18087,6 +18213,10 @@ where
 		.with_async_payments_offers_cache(async_receive_offer_cache);
 
 		let channel_manager = ChannelManager {
+			// QU!D PATCH: deliberately EMPTY on reload. A registered acceptor contribution is an
+			// in-flight intent for ONE delivery; restoring one would apply it to whatever splice
+			// arrived next, possibly long after the delivery it belonged to was resolved.
+			pending_acceptor_contributions: Mutex::new(new_hash_map()),
 			chain_hash,
 			fee_estimator: bounded_fee_estimator,
 			chain_monitor: args.chain_monitor,

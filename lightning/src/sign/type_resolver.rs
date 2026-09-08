@@ -7,7 +7,6 @@ where
 {
 	// in practice, this will only ever be an EcdsaChannelSigner (specifically, Writeable)
 	Ecdsa(<SP::Target as SignerProvider>::EcdsaSigner),
-	#[cfg(taproot)]
 	#[allow(unused)]
 	Taproot(<SP::Target as SignerProvider>::TaprootSigner),
 }
@@ -19,7 +18,6 @@ where
 	pub(crate) fn as_ref(&self) -> &dyn ChannelSigner {
 		match self {
 			ChannelSignerType::Ecdsa(ecs) => ecs,
-			#[cfg(taproot)]
 			#[allow(unused)]
 			ChannelSignerType::Taproot(tcs) => tcs,
 		}
@@ -39,6 +37,17 @@ where
 	) -> Option<&mut <SP::Target as SignerProvider>::EcdsaSigner> {
 		match self {
 			ChannelSignerType::Ecdsa(ecs) => Some(ecs),
+			_ => None,
+		}
+	}
+
+	/// Borrow the inner taproot (MuSig2) signer, if this is a taproot channel.
+	/// Used by the simple-taproot-channel (M6) nonce-exchange handler to generate
+	/// the local `next_local_nonce` and drive key-path partial signing.
+	#[allow(unused)]
+	pub(crate) fn as_taproot(&self) -> Option<&<SP::Target as SignerProvider>::TaprootSigner> {
+		match self {
+			ChannelSignerType::Taproot(tcs) => Some(tcs),
 			_ => None,
 		}
 	}

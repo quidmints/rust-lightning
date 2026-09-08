@@ -18,7 +18,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::script::{Script, ScriptBuf};
 use bitcoin::secp256k1;
-use bitcoin::secp256k1::{ecdsa::Signature, Secp256k1};
+use bitcoin::secp256k1::{ecdsa::Signature, PublicKey, Secp256k1};
 use bitcoin::transaction::OutPoint as BitcoinOutPoint;
 use bitcoin::transaction::Transaction;
 
@@ -185,6 +185,10 @@ pub(crate) enum ClaimEvent {
 		pending_nondust_htlcs: Vec<HTLCOutputInCommitment>,
 		anchor_output_idx: u32,
 		channel_parameters: ChannelTransactionParameters,
+		/// M9g: the broadcast holder commitment's per-commitment point — needed to
+		/// re-derive the simple-taproot anchor's internal key (the holder's
+		/// `local_delayedpubkey`) for the CPFP key-path spend. `None` for non-taproot.
+		holder_per_commitment_point: Option<PublicKey>,
 	},
 	/// Event yielded to signal that the commitment transaction has confirmed and its HTLCs must be
 	/// resolved by broadcasting a transaction with sufficient fee to claim them.
@@ -677,7 +681,16 @@ impl<ChannelSigner: EcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 					let channel_parameters = output.channel_parameters.as_ref()
 						.unwrap_or(self.channel_parameters());
 					let funding_pubkey = &channel_parameters.holder_pubkeys.funding_pubkey;
-					let script_pubkey = if channel_parameters.channel_type_features.supports_anchors_zero_fee_htlc_tx() {
+					let script_pubkey = if channel_parameters.channel_type_features.supports_simple_taproot() {
+						// M9g: simple-taproot anchor. The HOLDER's (broadcaster's) anchor SPK is a
+						// P2TR with internal key = the holder's per-commitment `local_delayedpubkey`
+						// (spec §3 / `get_taproot_anchor_spk`). We derive that key from this holder
+						// commitment's per-commitment point so the located output matches what the
+						// commitment builder emitted; the CPFP child then key-path-spends it.
+						let delayed_key = holder_commitment.trust().keys()
+							.broadcaster_delayed_payment_key.to_public_key();
+						crate::ln::chan_utils::get_taproot_anchor_spk(&self.secp_ctx, &delayed_key)
+					} else if channel_parameters.channel_type_features.supports_anchors_zero_fee_htlc_tx() {
 						get_keyed_anchor_redeemscript(funding_pubkey).to_p2wsh()
 					} else {
 						debug_assert!(channel_parameters.channel_type_features.supports_anchor_zero_fee_commitments());
@@ -701,6 +714,13 @@ impl<ChannelSigner: EcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 									commitment_tx_fee_satoshis: fee_sat,
 									anchor_output_idx: idx,
 									channel_parameters: channel_parameters.clone(),
+									// M9g: carry the per-commitment point for taproot anchor CPFP.
+									holder_per_commitment_point:
+										if channel_parameters.channel_type_features.supports_simple_taproot() {
+											Some(holder_commitment.trust().per_commitment_point())
+										} else {
+											None
+										},
 								}),
 							))
 						},
@@ -1407,6 +1427,7 @@ mod tests {
 						htlc: htlc.clone(),
 						preimage: None,
 						counterparty_sig: *counterparty_sig,
+						counterparty_sig_taproot: None,
 					},
 					0
 				)),

@@ -41,7 +41,8 @@ use crate::chain::transaction::OutPoint;
 use crate::crypto::utils::{hkdf_extract_expand_twice, sign, sign_with_aux_rand};
 use crate::ln::chan_utils;
 use crate::ln::chan_utils::{
-	get_countersigner_payment_script, get_revokeable_redeemscript, make_funding_redeemscript,
+	get_countersigner_payment_script, get_revokeable_redeemscript, get_taproot_to_remote_spk,
+	make_funding_redeemscript,
 	ChannelPublicKeys, ChannelTransactionParameters, ClosingTransaction, CommitmentTransaction,
 	HTLCOutputInCommitment, HolderCommitmentTransaction,
 };
@@ -51,7 +52,6 @@ use crate::ln::channel_keys::{
 	RevocationBasepoint, RevocationKey,
 };
 use crate::ln::inbound_payment::ExpandedKey;
-#[cfg(taproot)]
 use crate::ln::msgs::PartialSignatureWithNonce;
 use crate::ln::msgs::{UnsignedChannelAnnouncement, UnsignedGossipMessage};
 use crate::ln::script::ShutdownScript;
@@ -65,20 +65,19 @@ use crate::util::transaction_utils;
 use crate::crypto::chacha20::ChaCha20;
 use crate::prelude::*;
 use crate::sign::ecdsa::EcdsaChannelSigner;
-#[cfg(taproot)]
 use crate::sign::taproot::TaprootChannelSigner;
+use crate::sync::{Arc, Mutex};
 use crate::util::atomic_counter::AtomicCounter;
 use core::convert::TryInto;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(taproot)]
-use musig2::types::{PartialSignature, PublicNonce};
+use musig2::{PartialSignature, PubNonce as PublicNonce};
 
 pub(crate) mod type_resolver;
 
 pub mod ecdsa;
-#[cfg(taproot)]
 pub mod taproot;
+pub mod taproot_signer;
 pub mod tx_builder;
 
 pub(crate) const COMPRESSED_PUBLIC_KEY_SIZE: usize = bitcoin::secp256k1::constants::PUBLIC_KEY_SIZE;
@@ -126,6 +125,87 @@ impl DelayedPaymentOutputDescriptor {
 		+ 1 /* empty vec push */
 		+ 1 /* redeemscript push */
 		+ chan_utils::REVOKEABLE_REDEEMSCRIPT_MAX_LENGTH) as u64;
+
+	/// Whether this descriptor's `to_local` output is a simple-taproot (BOLT #995)
+	/// P2TR output (swept via a BIP341 script-path spend) rather than a legacy P2WSH
+	/// output (swept via an ECDSA witness).
+	pub fn is_taproot(&self) -> bool {
+		self.channel_transaction_parameters
+			.as_ref()
+			.map(|p| p.channel_type_features.supports_simple_taproot())
+			.unwrap_or(false)
+	}
+
+	/// The maximum length a well-formed witness spending this output should have.
+	///
+	/// For legacy (P2WSH ECDSA) channels this is the static [`Self::MAX_WITNESS_LENGTH`].
+	/// For simple-taproot (BOLT #995, M9e) channels the `to_local` is swept via a
+	/// BIP341 SCRIPT-path spend of the `to_delay` tapleaf — a HEAVIER witness — and
+	/// the exact weight is computed **dynamically** (build-and-measure) by
+	/// [`Self::taproot_max_witness_weight`], which needs a `secp` context. Callers that
+	/// have a `secp` (e.g. the spendable-output PSBT builder) MUST use
+	/// [`Self::taproot_max_witness_weight`] for taproot outputs; this `secp`-less
+	/// method falls back to the legacy bound and is only correct for non-taproot
+	/// descriptors.
+	pub fn max_witness_length(&self) -> u64 {
+		Self::MAX_WITNESS_LENGTH
+	}
+
+	/// The worst-case serialized weight (witness units) of the witness spending this
+	/// `to_local` output.
+	///
+	/// For legacy channels this returns the static [`Self::MAX_WITNESS_LENGTH`]. For
+	/// simple-taproot (BOLT #995, M9e) channels the `to_local` sweep is a BIP341
+	/// script-path spend of the `to_delay` tapleaf — `[<64B schnorr sig>, <to_delay
+	/// tapleaf>, <control block>]` — whose weight is computed **dynamically** by
+	/// BUILDING the real witness (the actual tapleaf script + control block from this
+	/// output's `to_local` spend info, with a max-size dummy Schnorr sig) and measuring
+	/// it, rather than from a hardcoded constant. Every element is fixed-length (x-only
+	/// pubkeys are 32 bytes, the Schnorr sig 64 bytes, the 2-leaf control block 65
+	/// bytes) and the `to_self_delay` push uses this descriptor's real delay value, so
+	/// the result is an exact, never-underestimating upper bound that stays correct if
+	/// the tapleaf script or tree shape ever changes.
+	///
+	/// The tapleaf/control-block depend only on the output's keys and `to_self_delay`,
+	/// not on the (private) delayed-payment key, so the descriptor's `revocation_pubkey`
+	/// doubles as the placeholder delayed-payment key for the weight measurement — the
+	/// serialized witness length is invariant to which 32-byte x-only key is used.
+	pub fn taproot_max_witness_weight<C: secp256k1::Signing + secp256k1::Verification>(
+		&self, secp: &Secp256k1<C>,
+	) -> Result<u64, ()> {
+		if !self.is_taproot() {
+			return Ok(Self::MAX_WITNESS_LENGTH);
+		}
+		// A 64-byte all-zero BIP340 Schnorr signature is a valid-length placeholder;
+		// only its serialized length matters for the weight measurement.
+		let dummy_sig = schnorr::Signature::from_slice(&[0u8; 64]).map_err(|_| ())?;
+		// The delayed-payment key value does not affect the witness length (all x-only
+		// pubkeys serialize to 32 bytes); reuse the descriptor's revocation pubkey as a
+		// length-equivalent placeholder so this is computable from the descriptor alone.
+		let dummy_delayed_key = DelayedPaymentKey(self.revocation_pubkey.to_public_key());
+		let leaf = chan_utils::get_taproot_to_local_delay_script(
+			self.to_self_delay,
+			&dummy_delayed_key,
+		);
+		let spend_info = chan_utils::taproot_to_local_spend_info(
+			secp,
+			&self.revocation_pubkey,
+			self.to_self_delay,
+			&dummy_delayed_key,
+		);
+		let elem = chan_utils::taproot_schnorr_witness_element(
+			&dummy_sig,
+			bitcoin::sighash::TapSighashType::Default,
+		);
+		let witness = chan_utils::build_taproot_script_path_witness(elem, &leaf, &spend_info)
+			.map_err(|_| ())?;
+		// `witness.size()` is the exact serialized witness for this input. The per-input
+		// satisfaction-weight model omits the per-tx BIP141 segwit marker+flag (2 WU),
+		// which the conservative P2WSH constants happen to absorb but this exact taproot
+		// measurement does not; attribute it here so the estimate stays a safe upper
+		// bound.
+		Ok(witness.size() as u64 + chan_utils::SEGWIT_MARKER_FLAG_WEIGHT)
+	}
 }
 
 impl_writeable_tlv_based!(DelayedPaymentOutputDescriptor, {
@@ -202,6 +282,13 @@ impl StaticPaymentOutputDescriptor {
 	///
 	/// Note: If you have the `grind_signatures` feature enabled, this will be at least 1 byte
 	/// shorter.
+	///
+	/// This is the legacy P2WSH/P2WPKH estimate; for simple-taproot (BOLT #995) channels the
+	/// `to_remote` is a BIP341 script-path spend of a 1-CSV tapleaf — a HEAVIER witness — whose
+	/// exact weight is computed **dynamically** by [`Self::taproot_max_witness_weight`] (which
+	/// needs a `secp` context). Callers that have a `secp` (e.g. the spendable-output PSBT
+	/// builder) MUST use [`Self::taproot_max_witness_weight`]; this `secp`-less method
+	/// under-counts the taproot case and is only correct for non-taproot descriptors.
 	pub fn max_witness_length(&self) -> u64 {
 		if self.needs_csv_1_for_spend() {
 			let witness_script_weight = 1 /* pubkey push */
@@ -217,6 +304,58 @@ impl StaticPaymentOutputDescriptor {
 		} else {
 			P2WPKH_WITNESS_WEIGHT
 		}
+	}
+
+	/// Whether this descriptor's `to_remote` output is a simple-taproot (BOLT #995) P2TR
+	/// output (swept via a BIP341 script-path spend of the 1-CSV tapleaf) rather than a
+	/// legacy P2WSH/P2WPKH output.
+	pub fn is_taproot(&self) -> bool {
+		self.channel_transaction_parameters
+			.as_ref()
+			.map(|p| p.channel_type_features.supports_simple_taproot())
+			.unwrap_or(false)
+	}
+
+	/// The worst-case serialized weight (witness units) of the witness spending this
+	/// `to_remote` output.
+	///
+	/// For legacy channels this returns [`Self::max_witness_length`]. For simple-taproot
+	/// (BOLT #995, M9e) channels the `to_remote` sweep is a BIP341 script-path spend of the
+	/// 1-CSV tapleaf (`<remote> OP_CHECKSIGVERIFY 1 OP_CSV`) — `[<64B schnorr sig>, <tapleaf>,
+	/// <control block>]` — which is HEAVIER than the legacy P2WSH/P2WPKH estimate (the legacy
+	/// estimate UNDER-counts it). The taproot weight is computed **dynamically** by BUILDING
+	/// the real witness (the actual tapleaf script + single-leaf control block from this
+	/// output's `to_remote` spend info, with a max-size dummy Schnorr sig) and measuring it,
+	/// rather than from a hardcoded constant. Every element is fixed-length, so the result is
+	/// an exact, never-underestimating upper bound that stays correct if the tapleaf script or
+	/// tree shape ever changes.
+	///
+	/// The tapleaf/control-block witness length is invariant to the (32-byte x-only) remote
+	/// pubkey value, so the channel's `holder_pubkeys.payment_point` is used as the placeholder.
+	pub fn taproot_max_witness_weight<C: secp256k1::Signing + secp256k1::Verification>(
+		&self, secp: &Secp256k1<C>,
+	) -> Result<u64, ()> {
+		if !self.is_taproot() {
+			return Ok(self.max_witness_length());
+		}
+		let params = self.channel_transaction_parameters.as_ref().ok_or(())?;
+		let remote_pubkey = params.holder_pubkeys.payment_point;
+		// A 64-byte all-zero BIP340 Schnorr signature is a valid-length placeholder; only its
+		// serialized length matters for the weight measurement.
+		let dummy_sig = schnorr::Signature::from_slice(&[0u8; 64]).map_err(|_| ())?;
+		let leaf = chan_utils::get_taproot_to_remote_script(&remote_pubkey);
+		let spend_info = chan_utils::taproot_to_remote_spend_info(secp, &remote_pubkey);
+		let elem = chan_utils::taproot_schnorr_witness_element(
+			&dummy_sig,
+			bitcoin::sighash::TapSighashType::Default,
+		);
+		let witness = chan_utils::build_taproot_script_path_witness(elem, &leaf, &spend_info)
+			.map_err(|_| ())?;
+		// `witness.size()` is the exact serialized witness for this input. The per-input
+		// satisfaction-weight model omits the per-tx BIP141 segwit marker+flag (2 WU), which
+		// the conservative P2WSH constants happen to absorb but this exact taproot measurement
+		// does not; attribute it here so the estimate stays a safe upper bound.
+		Ok(witness.size() as u64 + chan_utils::SEGWIT_MARKER_FLAG_WEIGHT)
 	}
 
 	/// Returns true if spending this output requires a transaction with a CheckSequenceVerify
@@ -467,7 +606,7 @@ impl SpendableOutputDescriptor {
 	/// does not match the one we can spend.
 	///
 	/// We do not enforce that outputs meet the dust limit or that any output scripts are standard.
-	pub fn create_spendable_outputs_psbt<T: secp256k1::Signing>(
+	pub fn create_spendable_outputs_psbt<T: secp256k1::Signing + secp256k1::Verification>(
 		secp_ctx: &Secp256k1<T>, descriptors: &[&SpendableOutputDescriptor], outputs: Vec<TxOut>,
 		change_destination_script: ScriptBuf, feerate_sat_per_1000_weight: u32,
 		locktime: Option<LockTime>,
@@ -482,7 +621,10 @@ impl SpendableOutputDescriptor {
 					if !output_set.insert(descriptor.outpoint) {
 						return Err(());
 					}
-					let sequence = if descriptor.needs_csv_1_for_spend() {
+					// The taproot `to_remote` 1-CSV tapleaf (and the anchor-channel P2WSH
+					// `to_countersigner` script) both require sequence >= 1.
+					let sequence = if descriptor.needs_csv_1_for_spend() || descriptor.is_taproot()
+					{
 						Sequence::from_consensus(1)
 					} else {
 						Sequence::ZERO
@@ -493,11 +635,17 @@ impl SpendableOutputDescriptor {
 						sequence,
 						witness: Witness::new(),
 					});
-					witness_weight += descriptor.max_witness_length();
+					// Taproot `to_remote` is a BIP341 script-path spend whose exact weight is
+					// measured dynamically (secp is available here); legacy is the static bound.
+					witness_weight +=
+						descriptor.taproot_max_witness_weight(&secp_ctx).map_err(|_| ())?;
 					#[cfg(feature = "grind_signatures")]
 					{
-						// Guarantees a low R signature
-						witness_weight -= 1;
+						// Guarantees a low R signature. Only the legacy P2WSH/P2WPKH ECDSA
+						// spend can be grinded; the taproot BIP340 Schnorr sig is fixed 64 bytes.
+						if !descriptor.is_taproot() {
+							witness_weight -= 1;
+						}
 					}
 					input_value += descriptor.output.value;
 				},
@@ -511,11 +659,17 @@ impl SpendableOutputDescriptor {
 						sequence: Sequence(descriptor.to_self_delay as u32),
 						witness: Witness::new(),
 					});
-					witness_weight += DelayedPaymentOutputDescriptor::MAX_WITNESS_LENGTH;
+					// Taproot `to_local` is a BIP341 script-path spend whose exact weight is
+					// measured dynamically (secp is available here); legacy is the static bound.
+					witness_weight +=
+						descriptor.taproot_max_witness_weight(&secp_ctx).map_err(|_| ())?;
 					#[cfg(feature = "grind_signatures")]
 					{
-						// Guarantees a low R signature
-						witness_weight -= 1;
+						// Guarantees a low R signature. Only the legacy P2WSH ECDSA spend can
+						// be grinded; the taproot BIP340 Schnorr sig is fixed 64 bytes.
+						if !descriptor.is_taproot() {
+							witness_weight -= 1;
+						}
 					}
 					input_value += descriptor.output.value;
 				},
@@ -623,6 +777,15 @@ pub struct HTLCDescriptor {
 	pub preimage: Option<PaymentPreimage>,
 	/// The counterparty's signature required to spend the HTLC output.
 	pub counterparty_sig: Signature,
+	/// M9e-4: for `simple_taproot` channels the counterparty's per-HTLC signature is a
+	/// BIP340 Schnorr sig over the 2-of-2 HTLC tapleaf (the ECDSA `counterparty_sig`
+	/// above is an unused placeholder). The external-funding CPFP bump handler
+	/// (`events::bump_transaction`) signs the holder-HTLC 2nd-level tx for anchor
+	/// channels; for taproot it must build the script-path witness
+	/// `[remote_schnorr, our_schnorr, (preimage), tapleaf, control_block]`, so the
+	/// counterparty's Schnorr sig has to travel with the descriptor. `None` for legacy
+	/// (P2WSH) channels.
+	pub counterparty_sig_taproot: Option<schnorr::Signature>,
 }
 
 impl_writeable_tlv_based!(HTLCDescriptor, {
@@ -634,6 +797,7 @@ impl_writeable_tlv_based!(HTLCDescriptor, {
 	(8, htlc, required),
 	(10, preimage, option),
 	(12, counterparty_sig, required),
+	(13, counterparty_sig_taproot, option),
 });
 
 impl HTLCDescriptor {
@@ -651,10 +815,42 @@ impl HTLCDescriptor {
 	pub fn previous_utxo<C: secp256k1::Signing + secp256k1::Verification>(
 		&self, secp: &Secp256k1<C>,
 	) -> TxOut {
-		TxOut {
-			script_pubkey: self.witness_script(secp).to_p2wsh(),
-			value: self.htlc.to_bitcoin_amount(),
-		}
+		let script_pubkey = if self
+			.channel_derivation_parameters
+			.transaction_parameters
+			.channel_type_features
+			.supports_simple_taproot()
+		{
+			// M9e-4: the HTLC output on a taproot commitment is a P2TR output (NUMS-tree
+			// of offered/received tapleaves), not P2WSH.
+			self.taproot_htlc_spk(secp)
+		} else {
+			self.witness_script(secp).to_p2wsh()
+		};
+		TxOut { script_pubkey, value: self.htlc.to_bitcoin_amount() }
+	}
+
+	/// M9e-4: the taproot HTLC output's scriptPubKey (`0x5120 || output_key`) for the
+	/// simple-taproot HTLC tapscript tree, used as the prevout the 2nd-level
+	/// HTLC-Success/Timeout tx spends.
+	fn taproot_htlc_spk<C: secp256k1::Signing + secp256k1::Verification>(
+		&self, secp: &Secp256k1<C>,
+	) -> ScriptBuf {
+		let channel_params =
+			self.channel_derivation_parameters.transaction_parameters.as_holder_broadcastable();
+		let keys = chan_utils::TxCreationKeys::from_channel_static_keys(
+			&self.per_commitment_point,
+			channel_params.broadcaster_pubkeys(),
+			channel_params.countersignatory_pubkeys(),
+			secp,
+		);
+		chan_utils::get_taproot_htlc_spk(
+			secp,
+			&self.htlc,
+			&keys.broadcaster_htlc_key,
+			&keys.countersignatory_htlc_key,
+			&keys.revocation_key,
+		)
 	}
 
 	/// Returns the unsigned transaction input spending the HTLC output in the commitment
@@ -693,6 +889,7 @@ impl HTLCDescriptor {
 			channel_params.channel_type_features(),
 			&broadcaster_delayed_key,
 			&counterparty_revocation_key,
+			secp,
 		)
 	}
 
@@ -738,6 +935,103 @@ impl HTLCDescriptor {
 			witness_script,
 			&self.channel_derivation_parameters.transaction_parameters.channel_type_features,
 		)
+	}
+
+	/// M9e-4: returns the fully signed BIP341 script-path witness for spending a
+	/// **taproot** HTLC output (the 2nd-level HTLC-Success/Timeout tx). Mirrors the
+	/// malleable-path witness built at `chain::package::get_maybe_signed_htlc_tx`:
+	/// `[remote_schnorr, our_schnorr, (preimage), htlc_tapleaf, control_block]` over
+	/// the 2-of-2 HTLC tapleaf. `our_sig` is produced by
+	/// `sign_holder_htlc_transaction_taproot`; the counterparty's pre-signed Schnorr
+	/// sig is carried in `self.counterparty_sig_taproot`. Used by the external-funding
+	/// CPFP bump handler for anchor (zero-fee) taproot channels.
+	pub fn taproot_tx_input_witness<C: secp256k1::Signing + secp256k1::Verification>(
+		&self, our_sig: &schnorr::Signature, secp: &Secp256k1<C>,
+	) -> Result<Witness, ()> {
+		let remote_sig = self.counterparty_sig_taproot.as_ref().ok_or(())?;
+		let channel_params =
+			self.channel_derivation_parameters.transaction_parameters.as_holder_broadcastable();
+		let keys = chan_utils::TxCreationKeys::from_channel_static_keys(
+			&self.per_commitment_point,
+			channel_params.broadcaster_pubkeys(),
+			channel_params.countersignatory_pubkeys(),
+			secp,
+		);
+		let leaf = chan_utils::taproot_htlc_remote_sig_leaf(
+			&self.htlc,
+			&keys.broadcaster_htlc_key,
+			&keys.countersignatory_htlc_key,
+		);
+		let spend_info = chan_utils::taproot_htlc_spend_info(
+			secp,
+			&self.htlc,
+			&keys.broadcaster_htlc_key,
+			&keys.countersignatory_htlc_key,
+			&keys.revocation_key,
+		);
+		chan_utils::build_taproot_htlc_input_witness(
+			our_sig,
+			remote_sig,
+			&self.preimage,
+			&leaf,
+			&spend_info,
+		)
+		.map_err(|_| ())
+	}
+
+	/// M9e-4: the worst-case serialized weight (witness units) of the BIP341 script-path
+	/// witness this descriptor's taproot HTLC input is spent with — computed
+	/// **dynamically** by BUILDING the real witness (the actual tapleaf script + control
+	/// block from this HTLC's spend info, with max-size dummy Schnorr sigs) and measuring
+	/// it, rather than a hardcoded constant. This adapts automatically to the tapleaf
+	/// script length, control-block depth, and sig encoding, so it stays exact if the
+	/// taproot HTLC script ever changes. Used by the external-funding CPFP bump handler to
+	/// size each taproot HTLC input's `satisfaction_weight`.
+	///
+	/// The signer's real Schnorr sigs are 64-byte BIP340 sigs; `build_taproot_htlc_input_witness`
+	/// appends the sighash-type byte, so the on-chain witness element is 65 bytes — exactly
+	/// what a 64-byte dummy sig measures here. This is the worst case (sigs are fixed-length),
+	/// so the result is a tight, never-underestimating upper bound.
+	pub fn taproot_max_witness_weight<C: secp256k1::Signing + secp256k1::Verification>(
+		&self, secp: &Secp256k1<C>,
+	) -> Result<u64, ()> {
+		// A 64-byte all-zero BIP340 Schnorr signature is a valid-length placeholder; only its
+		// serialized length matters for the weight measurement (not its validity).
+		let dummy_sig = schnorr::Signature::from_slice(&[0u8; 64]).map_err(|_| ())?;
+		let channel_params =
+			self.channel_derivation_parameters.transaction_parameters.as_holder_broadcastable();
+		let keys = chan_utils::TxCreationKeys::from_channel_static_keys(
+			&self.per_commitment_point,
+			channel_params.broadcaster_pubkeys(),
+			channel_params.countersignatory_pubkeys(),
+			secp,
+		);
+		let leaf = chan_utils::taproot_htlc_remote_sig_leaf(
+			&self.htlc,
+			&keys.broadcaster_htlc_key,
+			&keys.countersignatory_htlc_key,
+		);
+		let spend_info = chan_utils::taproot_htlc_spend_info(
+			secp,
+			&self.htlc,
+			&keys.broadcaster_htlc_key,
+			&keys.countersignatory_htlc_key,
+			&keys.revocation_key,
+		);
+		let witness = chan_utils::build_taproot_htlc_input_witness(
+			&dummy_sig,
+			&dummy_sig,
+			&self.preimage,
+			&leaf,
+			&spend_info,
+		)
+		.map_err(|_| ())?;
+		// `witness.size()` is the exact serialized witness for this input. The per-input
+		// satisfaction-weight model omits the per-tx BIP141 segwit marker+flag (2 WU),
+		// which the conservative P2WSH constants happen to absorb but this exact taproot
+		// measurement does not; attribute it here so the bump estimate stays a safe upper
+		// bound (well within the 2% tightness check, even with multiple HTLC inputs).
+		Ok(witness.size() as u64 + chan_utils::SEGWIT_MARKER_FLAG_WEIGHT)
 	}
 }
 
@@ -1016,25 +1310,14 @@ pub trait OutputSpender {
 /// A dynamic [`SignerProvider`] temporarily needed for doc tests.
 ///
 /// This is not exported to bindings users as it is not intended for public consumption.
-#[cfg(taproot)]
 #[doc(hidden)]
-#[deprecated(note = "Remove once taproot cfg is removed")]
 pub type DynSignerProvider =
 	dyn SignerProvider<EcdsaSigner = InMemorySigner, TaprootSigner = InMemorySigner>;
-
-/// A dynamic [`SignerProvider`] temporarily needed for doc tests.
-///
-/// This is not exported to bindings users as it is not intended for public consumption.
-#[cfg(not(taproot))]
-#[doc(hidden)]
-#[deprecated(note = "Remove once taproot cfg is removed")]
-pub type DynSignerProvider = dyn SignerProvider<EcdsaSigner = InMemorySigner>;
 
 /// A trait that can return signer instances for individual channels.
 pub trait SignerProvider {
 	/// A type which implements [`EcdsaChannelSigner`] which will be returned by [`Self::derive_channel_signer`].
 	type EcdsaSigner: EcdsaChannelSigner;
-	#[cfg(taproot)]
 	/// A type which implements [`TaprootChannelSigner`]
 	type TaprootSigner: TaprootChannelSigner;
 
@@ -1053,6 +1336,16 @@ pub trait SignerProvider {
 	/// re-derived from its `channel_keys_id`, which can be obtained through its trait method
 	/// [`ChannelSigner::channel_keys_id`].
 	fn derive_channel_signer(&self, channel_keys_id: [u8; 32]) -> Self::EcdsaSigner;
+
+	/// Derives the [`Self::TaprootSigner`] for a **simple taproot channel**
+	/// (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md`). This is the taproot analogue of
+	/// [`Self::derive_channel_signer`]: it is called instead of that method when
+	/// the negotiated `channel_type` has `option_simple_taproot`, so the channel
+	/// can hold a `ChannelSignerType::Taproot(_)` and drive the MuSig2 key-path
+	/// nonce-exchange flow. It re-derives from the same `channel_keys_id` key
+	/// material — for providers where `TaprootSigner == EcdsaSigner` (e.g.
+	/// [`KeysManager`], the test harness) it is the same signer.
+	fn derive_taproot_channel_signer(&self, channel_keys_id: [u8; 32]) -> Self::TaprootSigner;
 
 	/// Get a script pubkey which we send funds to when claiming on-chain contestable outputs.
 	///
@@ -1213,6 +1506,59 @@ pub struct InMemorySigner {
 	channel_keys_id: [u8; 32],
 	/// A source of random bytes.
 	entropy_source: RandomBytes,
+	/// Late-bound per-channel MuSig2 (simple-taproot) signing context.
+	///
+	/// The `TaprootChannelSigner` trait surface of this fork passes neither the
+	/// counterparty funding pubkey nor the funding prevout into the MuSig2
+	/// methods, so a funding key-path partial cannot be produced from the trait
+	/// arguments alone: it needs the counterparty funding pubkey (to build the
+	/// per-channel `KeyAggContext` → the `0x5120||Q` funding scriptPubKey) and the
+	/// funding amount (committed in the BIP341 key-path sighash). The
+	/// nonce-exchange handler supplies it via [`InMemorySigner::provide_taproot_context`].
+	///
+	/// This is **ephemeral**, never persisted (this fork does not serialize the
+	/// signer; the monitor re-derives it via `derive_channel_signer` and the
+	/// handler re-supplies the context from the reloaded `FundingScope`), and is
+	/// excluded from `PartialEq`/`Clone`-of-state — a clone starts with no context.
+	taproot_ctx: Arc<Mutex<Option<TaprootSignerContext>>>,
+}
+
+/// The late-bound per-channel data the MuSig2 (`TaprootChannelSigner`) bodies of
+/// [`InMemorySigner`] need but the trait surface does not hand them. Supplied by
+/// the `channel.rs` nonce-exchange handler via
+/// [`InMemorySigner::provide_taproot_context`]. Mirrors
+/// `quid_ln::validating_signer::TaprootSignerContext`.
+#[derive(Clone)]
+pub struct TaprootSignerContext {
+	/// The counterparty's 33-byte compressed funding pubkey.
+	pub counterparty_funding_pubkey: PublicKey,
+	/// The channel funding amount in satoshis (committed in the key-path sighash).
+	pub funding_value_sat: u64,
+	/// The counterparty's current cooperative-close nonce (their `shutdown_nonce`,
+	/// or the nonce from their previous `closing_sig` on an RBF round). Required by
+	/// [`TaprootChannelSigner::partially_sign_closing_transaction`], which the
+	/// trait surface passes no nonce to. `None` until `shutdown` is exchanged.
+	pub counterparty_closing_nonce: Option<PublicNonce>,
+	/// The **cooperative-close round index** (`0` for the `shutdown`/first
+	/// `closing_signed`, incremented for every subsequent fee-negotiation /RBF
+	/// round). The closing MuSig2 secret nonce is derived at the per-round height
+	/// [`closing_nonce_height`]`(closing_round)` so no two distinct close
+	/// transactions (different fees ⇒ different sighash messages) are ever signed
+	/// with the same nonce — which would otherwise leak the funding private key
+	/// (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9f-0). The handler bumps this each
+	/// round before supplying the context; signing and the advertised
+	/// `shutdown_nonce`/`next_closee_nonce` MUST use the same round so the
+	/// advertised nonce equals the nonce the partial is computed with.
+	pub closing_round: u64,
+	/// For a **spliced** funding scope: the `prev_funding_txid` the new funding key
+	/// was rotated from (BOLT #995 / spec §9c). When set, the signer derives BOTH its
+	/// individual funding key AND the KeyAggContext from the ROTATED key
+	/// (`funding_key(Some(txid))`), so the aggregate matches the new `0x5120||Q'` the
+	/// splice funding output commits to. `None` for the original (un-spliced) funding,
+	/// where the base funding key is used. (The shared-input splice SPEND uses the OLD
+	/// `Q` and is handled separately via `partially_sign_splice_shared_input`, which
+	/// always uses the base key; this field is for the NEW commitment scope.)
+	pub splice_parent_funding_txid: Option<bitcoin::Txid>,
 }
 
 impl PartialEq for InMemorySigner {
@@ -1242,6 +1588,11 @@ impl Clone for InMemorySigner {
 			commitment_seed: self.commitment_seed.clone(),
 			channel_keys_id: self.channel_keys_id,
 			entropy_source: RandomBytes::new(self.get_secure_random_bytes()),
+			// Share the late-bound taproot context across clones: LDK clones the
+			// signer freely (e.g. into the monitor), and the nonce-exchange handler
+			// may have already supplied the context to one clone. An `Arc<Mutex<_>>`
+			// keeps every clone pointed at the same (ephemeral) context cell.
+			taproot_ctx: Arc::clone(&self.taproot_ctx),
 		}
 	}
 }
@@ -1265,6 +1616,7 @@ impl InMemorySigner {
 			commitment_seed,
 			channel_keys_id,
 			entropy_source: RandomBytes::new(rand_bytes_unique_start),
+			taproot_ctx: Arc::new(Mutex::new(None)),
 		}
 	}
 
@@ -1286,6 +1638,7 @@ impl InMemorySigner {
 			commitment_seed,
 			channel_keys_id,
 			entropy_source: RandomBytes::new(rand_bytes_unique_start),
+			taproot_ctx: Arc::new(Mutex::new(None)),
 		}
 	}
 
@@ -1295,6 +1648,63 @@ impl InMemorySigner {
 		let tweak = splice_parent_funding_txid
 			.map(|txid| compute_funding_key_tweak(&self.funding_key.with_tweak(None), &txid));
 		self.funding_key.with_tweak(tweak)
+	}
+
+	/// Supply the late-bound per-channel taproot (MuSig2) signing context.
+	///
+	/// Called by the `channel.rs` nonce-exchange handler as soon as the
+	/// counterparty funding pubkey + funding amount are known (the channel's
+	/// `channel_transaction_parameters` carry the counterparty parameters and
+	/// funding outpoint). Idempotent for the same context; re-supplying a
+	/// different one replaces it (a splice rebinds `Q`, and each close round
+	/// re-supplies the peer's current closing nonce). This is the data the MuSig2
+	/// funding key-path bodies need but the `TaprootChannelSigner` trait surface
+	/// does not pass. See [`TaprootSignerContext`].
+	pub fn provide_taproot_context(&self, ctx: TaprootSignerContext) {
+		if let Ok(mut slot) = self.taproot_ctx.lock() {
+			*slot = Some(ctx);
+		}
+	}
+
+	/// Build the cached per-channel KeySorted + taproot-tweaked `KeyAggContext`,
+	/// our signer index, the counterparty index, the funding amount, and the
+	/// `0x5120||Q` funding scriptPubKey that the BIP341 key-path sighash commits
+	/// to, from the handler-supplied [`TaprootSignerContext`]. `Err(())` if no
+	/// context has been supplied yet.
+	/// The (rotated, for a splice) holder funding SECRET key the current taproot
+	/// context's funding scope signs with — `funding_key(ctx.splice_parent_funding_txid)`.
+	/// Used by the funding key-path partial bodies so a spliced commitment signs with
+	/// the SAME rotated key the new `Q'` aggregate is built from (spec §9c).
+	fn taproot_holder_funding_key(&self) -> SecretKey {
+		let parent =
+			self.taproot_ctx.lock().ok().and_then(|s| s.as_ref().and_then(|c| c.splice_parent_funding_txid));
+		self.funding_key(parent)
+	}
+
+	fn taproot_key_agg(
+		&self, secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<(musig2::KeyAggContext, usize, usize, u64, ScriptBuf), ()> {
+		let ctx = {
+			let slot = self.taproot_ctx.lock().map_err(|_| ())?;
+			slot.clone().ok_or(())?
+		};
+		// Use the ROTATED holder funding key for a spliced scope (so the aggregate is
+		// the new `Q'`); the base key otherwise. The counterparty key in `ctx` is
+		// already the (rotated, for a splice) one the handler supplied.
+		let holder = self
+			.funding_key(ctx.splice_parent_funding_txid)
+			.public_key(secp_ctx)
+			.serialize();
+		let cp = ctx.counterparty_funding_pubkey.serialize();
+		let (key_agg, our_index) =
+			crate::sign::taproot_signer::channel_key_agg_ctx(&holder, &cp, &holder)
+				.map_err(|_| ())?;
+		let counterparty_index = 1 - our_index;
+		let q = crate::sign::taproot_signer::aggregated_xonly(&key_agg);
+		let spk = ScriptBuf::new_p2tr_tweaked(
+			bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(q),
+		);
+		Ok((key_agg, our_index, counterparty_index, ctx.funding_value_sat, spk))
 	}
 
 	/// Sign the single input of `spend_tx` at index `input_idx`, which spends the output described
@@ -1307,7 +1717,8 @@ impl InMemorySigner {
 	/// [`descriptor.outpoint`]: StaticPaymentOutputDescriptor::outpoint
 	pub fn sign_counterparty_payment_input<C: Signing>(
 		&self, spend_tx: &Transaction, input_idx: usize,
-		descriptor: &StaticPaymentOutputDescriptor, secp_ctx: &Secp256k1<C>,
+		descriptor: &StaticPaymentOutputDescriptor, all_prevouts: &[bitcoin::TxOut],
+		secp_ctx: &Secp256k1<C>,
 	) -> Result<Witness, ()> {
 		// TODO: We really should be taking the SigHashCache as a parameter here instead of
 		// spend_tx, but ideally the SigHashCache would expose the transaction's inputs read-only
@@ -1333,6 +1744,39 @@ impl InMemorySigner {
 
 		let payment_point_v1 = PublicKey::from_secret_key(secp_ctx, &self.payment_key_v1);
 		let payment_point_v2 = PublicKey::from_secret_key(secp_ctx, &self.payment_key_v2);
+
+		// Simple-taproot (M9e-2): on a counterparty-broadcast commitment OUR balance is
+		// the taproot `to_remote` 1-CSV tapleaf output (`<remote> OP_CHECKSIGVERIFY 1
+		// OP_CSV`, spec §3), NOT a P2WSH/P2WPKH. Sweep it via the script path with a
+		// BIP340 Schnorr sig over the BIP341 (Prevouts::All) script-path sighash. This is
+		// the LP-side mirror of the M9e to_local/HTLC sweeps.
+		if channel_type_features.supports_simple_taproot() {
+			let verify_ctx = Secp256k1::verification_only();
+			let spk_v1 = get_taproot_to_remote_spk(&verify_ctx, &payment_point_v1);
+			let spk_v2 = get_taproot_to_remote_spk(&verify_ctx, &payment_point_v2);
+			let (remote_pubkey, payment_key) = if spk_v1 == descriptor.output.script_pubkey {
+				(payment_point_v1, &self.payment_key_v1)
+			} else if spk_v2 == descriptor.output.script_pubkey {
+				(payment_point_v2, &self.payment_key_v2)
+			} else {
+				return Err(());
+			};
+			let leaf = chan_utils::get_taproot_to_remote_script(&remote_pubkey);
+			let spend_info = chan_utils::taproot_to_remote_spend_info(&verify_ctx, &remote_pubkey);
+			let sighash =
+				chan_utils::taproot_sweep_leaf_sighash(spend_tx, input_idx, &leaf, all_prevouts)
+					.map_err(|_| ())?;
+			let keypair = bitcoin::secp256k1::Keypair::from_secret_key(secp_ctx, payment_key);
+			let msg = bitcoin::secp256k1::Message::from_digest(*sighash.as_ref());
+			let sig = secp_ctx.sign_schnorr_no_aux_rand(&msg, &keypair);
+			let elem = chan_utils::taproot_schnorr_witness_element(
+				&sig,
+				bitcoin::sighash::TapSighashType::Default,
+			);
+			return chan_utils::build_taproot_script_path_witness(elem, &leaf, &spend_info)
+				.map_err(|_| ());
+		}
+
 		let spk_v1 = get_countersigner_payment_script(channel_type_features, &payment_point_v1);
 		let spk_v2 = get_countersigner_payment_script(channel_type_features, &payment_point_v2);
 
@@ -1394,7 +1838,8 @@ impl InMemorySigner {
 	/// [`descriptor.to_self_delay`]: DelayedPaymentOutputDescriptor::to_self_delay
 	pub fn sign_dynamic_p2wsh_input<C: Signing>(
 		&self, spend_tx: &Transaction, input_idx: usize,
-		descriptor: &DelayedPaymentOutputDescriptor, secp_ctx: &Secp256k1<C>,
+		descriptor: &DelayedPaymentOutputDescriptor, all_prevouts: &[bitcoin::TxOut],
+		secp_ctx: &Secp256k1<C>,
 	) -> Result<Witness, ()> {
 		// TODO: We really should be taking the SigHashCache as a parameter here instead of
 		// spend_tx, but ideally the SigHashCache would expose the transaction's inputs read-only
@@ -1421,6 +1866,47 @@ impl InMemorySigner {
 		);
 		let delayed_payment_pubkey =
 			DelayedPaymentKey::from_secret_key(&secp_ctx, &delayed_payment_key);
+
+		// Simple-taproot (M9e) broadcaster `to_local` sweep after the CSV: spend the
+		// to_delay tapleaf (`<delayed> OP_CHECKSIGVERIFY <to_self_delay> OP_CSV`) with
+		// our delayed key. BIP341 script-path, SIGHASH_DEFAULT (Prevouts::All).
+		let is_taproot = descriptor
+			.channel_transaction_parameters
+			.as_ref()
+			.map(|p| p.channel_type_features.supports_simple_taproot())
+			.unwrap_or(false);
+		if is_taproot {
+			let verify_ctx = Secp256k1::verification_only();
+			let leaf = chan_utils::get_taproot_to_local_delay_script(
+				descriptor.to_self_delay,
+				&delayed_payment_pubkey,
+			);
+			let spend_info = chan_utils::taproot_to_local_spend_info(
+				&verify_ctx,
+				&descriptor.revocation_pubkey,
+				descriptor.to_self_delay,
+				&delayed_payment_pubkey,
+			);
+			let payment_script =
+				bitcoin::ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
+			if descriptor.output.script_pubkey != payment_script {
+				return Err(());
+			}
+			let sighash =
+				chan_utils::taproot_sweep_leaf_sighash(spend_tx, input_idx, &leaf, all_prevouts)
+					.map_err(|_| ())?;
+			let keypair =
+				bitcoin::secp256k1::Keypair::from_secret_key(secp_ctx, &delayed_payment_key);
+			let msg = bitcoin::secp256k1::Message::from_digest(*sighash.as_ref());
+			let sig = secp_ctx.sign_schnorr_no_aux_rand(&msg, &keypair);
+			let elem = chan_utils::taproot_schnorr_witness_element(
+				&sig,
+				bitcoin::sighash::TapSighashType::Default,
+			);
+			return chan_utils::build_taproot_script_path_witness(elem, &leaf, &spend_info)
+				.map_err(|_| ());
+		}
+
 		let witness_script = chan_utils::get_revokeable_redeemscript(
 			&descriptor.revocation_pubkey,
 			descriptor.to_self_delay,
@@ -1558,6 +2044,7 @@ impl EcdsaChannelSigner for InMemorySigner {
 				chan_type,
 				&keys.broadcaster_delayed_payment_key,
 				&keys.revocation_key,
+				secp_ctx,
 			);
 			let htlc_redeemscript = chan_utils::get_htlc_redeemscript(&htlc, chan_type, &keys);
 			let htlc_sighashtype = if chan_type.supports_anchors_zero_fee_htlc_tx()
@@ -1804,6 +2291,152 @@ impl EcdsaChannelSigner for InMemorySigner {
 		Ok(sign_with_aux_rand(secp_ctx, &sighash, &htlc_key, &self))
 	}
 
+	fn sign_justice_revoked_output_taproot(
+		&self, channel_parameters: &ChannelTransactionParameters, justice_tx: &Transaction,
+		input: usize, _amount: u64, per_commitment_key: &SecretKey, all_prevouts: &[bitcoin::TxOut],
+		secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<schnorr::Signature, ()> {
+		assert!(channel_parameters.is_populated(), "Channel parameters must be fully populated");
+		// Breach sweep of a revoked taproot `to_local` output via the `revoke`
+		// tapleaf (`<delayed> OP_DROP <revocation> OP_CHECKSIG`) — signed by the
+		// derived revocation secret. Script-path TapSighash, SIGHASH_DEFAULT.
+		let revocation_key = chan_utils::derive_private_revocation_key(
+			secp_ctx,
+			per_commitment_key,
+			&self.revocation_base_key,
+		);
+		let per_commitment_point = PublicKey::from_secret_key(secp_ctx, per_commitment_key);
+		let revocation_pubkey = RevocationKey::from_basepoint(
+			secp_ctx,
+			&channel_parameters.holder_pubkeys.revocation_basepoint,
+			&per_commitment_point,
+		);
+		let counterparty_keys = channel_parameters.counterparty_pubkeys().ok_or(())?;
+		let counterparty_delayedpubkey = DelayedPaymentKey::from_basepoint(
+			secp_ctx,
+			&counterparty_keys.delayed_payment_basepoint,
+			&per_commitment_point,
+		);
+		let leaf = chan_utils::get_taproot_to_local_revoke_script(
+			&revocation_pubkey,
+			&counterparty_delayedpubkey,
+		);
+		let sighash =
+			chan_utils::taproot_sweep_leaf_sighash(justice_tx, input, &leaf, all_prevouts)
+				.map_err(|_| ())?;
+		let keypair = Keypair::from_secret_key(secp_ctx, &revocation_key);
+		let msg = secp256k1::Message::from_digest(*sighash.as_ref());
+		Ok(secp_ctx.sign_schnorr_no_aux_rand(&msg, &keypair))
+	}
+
+	fn sign_justice_revoked_htlc_taproot(
+		&self, channel_parameters: &ChannelTransactionParameters, justice_tx: &Transaction,
+		input: usize, _amount: u64, per_commitment_key: &SecretKey, htlc: &HTLCOutputInCommitment,
+		all_prevouts: &[bitcoin::TxOut], secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<schnorr::Signature, ()> {
+		assert!(channel_parameters.is_populated(), "Channel parameters must be fully populated");
+		// Breach sweep of a revoked taproot HTLC output. The HTLC tree's INTERNAL
+		// key is the revocation key, so the breach path is a BIP341 KEY-PATH spend:
+		// sign with `revocation_secret + tap_tweak(revocation_pubkey, merkle_root)`.
+		let revocation_key = chan_utils::derive_private_revocation_key(
+			secp_ctx,
+			per_commitment_key,
+			&self.revocation_base_key,
+		);
+		let per_commitment_point = PublicKey::from_secret_key(secp_ctx, per_commitment_key);
+		let revocation_pubkey = RevocationKey::from_basepoint(
+			secp_ctx,
+			&channel_parameters.holder_pubkeys.revocation_basepoint,
+			&per_commitment_point,
+		);
+		let counterparty_keys = channel_parameters.counterparty_pubkeys().ok_or(())?;
+		// On the counterparty's broadcast commitment the broadcaster is the
+		// counterparty; their htlc key is the broadcaster_htlc_key, ours the
+		// countersignatory_htlc_key.
+		let broadcaster_htlc_key = HtlcKey::from_basepoint(
+			secp_ctx,
+			&counterparty_keys.htlc_basepoint,
+			&per_commitment_point,
+		);
+		let countersignatory_htlc_key = HtlcKey::from_basepoint(
+			secp_ctx,
+			&channel_parameters.holder_pubkeys.htlc_basepoint,
+			&per_commitment_point,
+		);
+		let spend_info = chan_utils::taproot_htlc_spend_info(
+			secp_ctx,
+			htlc,
+			&broadcaster_htlc_key,
+			&countersignatory_htlc_key,
+			&revocation_pubkey,
+		);
+		let sighash =
+			chan_utils::taproot_sweep_keyspend_sighash(justice_tx, input, all_prevouts)
+				.map_err(|_| ())?;
+		let keypair = Keypair::from_secret_key(secp_ctx, &revocation_key);
+		let tweak = spend_info.tap_tweak().to_scalar();
+		let tweaked = keypair.add_xonly_tweak(secp_ctx, &tweak).map_err(|_| ())?;
+		let msg = secp256k1::Message::from_digest(*sighash.as_ref());
+		Ok(secp_ctx.sign_schnorr_no_aux_rand(&msg, &tweaked))
+	}
+
+	fn sign_holder_htlc_transaction_taproot(
+		&self, htlc_tx: &Transaction, input: usize, htlc_descriptor: &HTLCDescriptor,
+		secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<schnorr::Signature, ()> {
+		// Reuse the already-implemented TaprootChannelSigner body (BIP342 script-path
+		// over the 2-of-2 leaf, SIGHASH_SINGLE|ANYONECANPAY, with our htlc key).
+		TaprootChannelSigner::sign_holder_htlc_transaction(
+			self, htlc_tx, input, htlc_descriptor, secp_ctx,
+		)
+	}
+
+	fn sign_counterparty_htlc_transaction_taproot(
+		&self, channel_parameters: &ChannelTransactionParameters, htlc_tx: &Transaction,
+		input: usize, _amount: u64, per_commitment_point: &PublicKey, htlc: &HTLCOutputInCommitment,
+		all_prevouts: &[bitcoin::TxOut], secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<schnorr::Signature, ()> {
+		assert!(channel_parameters.is_populated(), "Channel parameters must be fully populated");
+		// Direct claim of an HTLC output on the COUNTERPARTY's broadcast taproot
+		// commitment. We sign with OUR (countersignatory) htlc key over the leaf we
+		// satisfy:
+		//   offered-by-them  → success leaf (we reveal the preimage),
+		//   received-by-them → timeout leaf (we reclaim after CLTV).
+		// These leaves are single-sig (just our key) so the claim is a direct sweep
+		// into our wallet — script-path TapSighash, SIGHASH_DEFAULT (commits all
+		// prevouts + outputs, matching the legacy `EcdsaSighashType::All` claim).
+		let our_htlc_secret =
+			chan_utils::derive_private_key(secp_ctx, per_commitment_point, &self.htlc_base_key);
+		let counterparty_keys = channel_parameters.counterparty_pubkeys().ok_or(())?;
+		let _broadcaster_htlc_key = HtlcKey::from_basepoint(
+			secp_ctx,
+			&counterparty_keys.htlc_basepoint,
+			per_commitment_point,
+		);
+		let countersignatory_htlc_key = HtlcKey::from_basepoint(
+			secp_ctx,
+			&channel_parameters.holder_pubkeys.htlc_basepoint,
+			per_commitment_point,
+		);
+		let leaf = if htlc.offered {
+			chan_utils::get_taproot_offered_htlc_success_script(
+				&countersignatory_htlc_key,
+				&htlc.payment_hash,
+			)
+		} else {
+			chan_utils::get_taproot_received_htlc_timeout_script(
+				&countersignatory_htlc_key,
+				htlc.cltv_expiry,
+			)
+		};
+		let sighash =
+			chan_utils::taproot_sweep_leaf_sighash(htlc_tx, input, &leaf, all_prevouts)
+				.map_err(|_| ())?;
+		let keypair = Keypair::from_secret_key(secp_ctx, &our_htlc_secret);
+		let msg = secp256k1::Message::from_digest(*sighash.as_ref());
+		Ok(secp_ctx.sign_schnorr_no_aux_rand(&msg, &keypair))
+	}
+
 	fn sign_closing_transaction(
 		&self, channel_parameters: &ChannelTransactionParameters, closing_tx: &ClosingTransaction,
 		secp_ctx: &Secp256k1<secp256k1::All>,
@@ -1882,62 +2515,350 @@ impl EcdsaChannelSigner for InMemorySigner {
 	}
 }
 
-#[cfg(taproot)]
-#[allow(unused)]
+/// The base "height" domain fed to the deterministic shachain nonce derivation
+/// for cooperative-close partial signatures. A close has no commitment height, so
+/// we pin a sentinel range that cannot collide with any real commitment number
+/// (which count *down* from `(1<<48)-1`); `u64::MAX` and the few values below it
+/// are strictly above that range. Each closing **round** subtracts its index, so
+/// every distinct close transaction gets a distinct nonce (spec §9f-0).
+/// Mirrors `quid_ln::validating_signer::CLOSING_NONCE_BASE`.
+pub const CLOSING_NONCE_BASE: u64 = u64::MAX;
+
+/// The per-round deterministic nonce height for cooperative-close round `round`
+/// (`0` = `shutdown`/first `closing_signed`). MuSig2 exchanges the nonce in round
+/// 1 *before* the close fee/message is known in round 2, so the nonce CANNOT be
+/// message-bound; instead we derive a FRESH nonce per round via a monotonic
+/// per-round index, advertised through `shutdown_nonce` (round 0) /
+/// `next_closee_nonce` (subsequent rounds). Two distinct close txs (different
+/// fees) therefore never share a nonce — closing nonce reuse would otherwise
+/// leak the funding private key (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9f-0).
+/// Saturates so a pathological round count cannot wrap into the commitment range.
+pub const fn closing_nonce_height(round: u64) -> u64 {
+	CLOSING_NONCE_BASE.saturating_sub(round)
+}
+
+/// The deterministic shachain nonce **height** for the MuSig2 partial that signs a
+/// splice transaction's shared (old-funding) input, derived from the
+/// `prev_funding_txid` it spends (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9c/§9f-0).
+///
+/// ## Why per-`prev_funding_txid` — and the RBF caveat (the §9f-0 lesson)
+/// A channel can splice MANY times over its life; each splice signs a DIFFERENT
+/// splice tx (different sighash message `m`). If two splice partials reused the same
+/// nonce `k` over `m1 ≠ m2`, the counterparty could solve `x = (s1−s2)/(e1−e2)` for
+/// our funding private key — the exact closing-nonce-reuse leak fixed in §9f-0. Each
+/// DISTINCT splice spends a distinct prior funding output (`prev_funding_txid` is
+/// unique per splice and re-derivable from chain state, so this is crash-safe), so
+/// keying on it separates the nonces of two *distinct* splices. The advertised splice
+/// nonce (`splice_init`/`splice_ack` `splice_nonce`) is derived at this same height,
+/// so the advertised nonce equals the one we sign with.
+///
+/// ⚠️ CAVEAT — this does NOT cover RBF of a splice: an RBF replacement spends the
+/// SAME `prev_funding_txid` with a DIFFERENT message, so it would re-derive the SAME
+/// nonce height over a different `m` — a direct reuse leak. Today that is unreachable
+/// because (a) `tx_init_rbf`/`tx_ack_rbf` are rejected (dual-funding disabled), (b) a
+/// reconnect retransmit REPLAYS the cached partial rather than re-signing, and (c) the
+/// `bind_nonce` reuse guard refuses re-signing this nonce against a different `m`
+/// within a process. BEFORE enabling splice RBF, this height MUST gain a per-attempt
+/// monotonic component (like `closing_round`), persisted, or the secret nonce must be
+/// message-bound — otherwise (c) alone is defeated by a host-restart (SGX) that resets
+/// the guard between the two RBF signings.
+///
+/// ## Disjoint height domain (no collision with commitment / closing nonces)
+/// Commitment numbers count DOWN from `(1<<48)−1`, so they live in `[0, 2^48)`.
+/// Closing nonces live near the top (`u64::MAX − round`). We map the txid into the
+/// strictly disjoint window `[2^48, 2^56)`, so a splice nonce can never collide with
+/// a commitment-height or closing-round nonce on the same shachain root.
+pub fn splice_nonce_height(prev_funding_txid: &Txid) -> u64 {
+	let mut eng = Sha256::engine();
+	eng.input(b"quid-taproot-splice-nonce");
+	eng.input(prev_funding_txid.as_byte_array());
+	let h = Sha256::from_engine(eng).to_byte_array();
+	let mut x = [0u8; 8];
+	x.copy_from_slice(&h[..8]);
+	let raw = u64::from_be_bytes(x);
+	// Fold into the 56-bit window then shift it above the commitment range:
+	// result ∈ [2^48, 2^48 + 2^56) ⊂ [2^48, 2^56 + 2^48), strictly below the
+	// closing range (top of u64) and strictly above the commitment range (<2^48).
+	(1u64 << 48).wrapping_add(raw & ((1u64 << 56) - 1))
+}
+
+// MuSig2 key-path signer for simple taproot channels (spec §1/§2/§5). The funding
+// key-path partial needs (a) the counterparty funding pubkey to build the
+// per-channel `KeyAggContext` (→ the `0x5120||Q` funding scriptPubKey + funding
+// amount the BIP341 key-path sighash commits to), supplied by the nonce-exchange
+// handler as a late-bound `TaprootSignerContext`, and (b) the counterparty
+// nonce / partial driving the 2-party round. The deterministic per-height JIT
+// signing nonce + partial-sign + aggregate run through `crate::sign::taproot_signer`.
+// HTLC justice/sign methods stay `todo!("M6-HTLC")` (a no-HTLC channel is valid).
 impl TaprootChannelSigner for InMemorySigner {
+	fn provide_taproot_context(&self, ctx: TaprootSignerContext) {
+		// Same body as the inherent `InMemorySigner::provide_taproot_context`;
+		// exposed through the trait so the generic nonce-exchange handler can
+		// supply the context via `ChannelSignerType::as_taproot()`.
+		if let Ok(mut slot) = self.taproot_ctx.lock() {
+			*slot = Some(ctx);
+		}
+	}
+
 	fn generate_local_nonce_pair(
 		&self, commitment_number: u64, secp_ctx: &Secp256k1<All>,
 	) -> PublicNonce {
-		todo!()
+		let (key_agg, our_index, _cp_index, _value, _spk) = self
+			.taproot_key_agg(secp_ctx)
+			.expect("taproot context must be supplied before advertising a nonce");
+		crate::sign::taproot_signer::local_pubnonce(
+			key_agg,
+			our_index,
+			&self.commitment_seed,
+			commitment_number,
+		)
+		.expect("local nonce derivation")
 	}
 
 	fn partially_sign_counterparty_commitment(
 		&self, counterparty_nonce: PublicNonce, commitment_tx: &CommitmentTransaction,
-		inbound_htlc_preimages: Vec<PaymentPreimage>,
-		outbound_htlc_preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<All>,
+		_inbound_htlc_preimages: Vec<PaymentPreimage>,
+		_outbound_htlc_preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<All>,
 	) -> Result<(PartialSignatureWithNonce, Vec<schnorr::Signature>), ()> {
-		todo!()
+		let idx = commitment_tx.commitment_number();
+		let (key_agg, our_index, counterparty_index, funding_value_sat, funding_spk) =
+			self.taproot_key_agg(secp_ctx)?;
+
+		let built = commitment_tx.trust();
+		let tx = &built.built_transaction().transaction;
+		let sighash = chan_utils::taproot_funding_keyspend_sighash(
+			tx,
+			0,
+			Amount::from_sat(funding_value_sat),
+			&funding_spk,
+		)
+		.map_err(|_| ())?;
+		let message: [u8; 32] = *sighash.as_ref();
+
+		// Counterparty commitment: domain-separated nonce so it can never equal the
+		// holder-commitment nonce at this same `idx` (both numbers count down from
+		// INITIAL_COMMITMENT_NUMBER in lockstep) — reusing it across the two
+		// different commitment sighashes would leak the funding key.
+		let (partial, our_pubnonce) =
+			crate::sign::taproot_signer::our_key_path_partial_counterparty(
+				key_agg,
+				our_index,
+				counterparty_index,
+				self.taproot_holder_funding_key(),
+				&self.commitment_seed,
+				idx,
+				counterparty_nonce,
+				message,
+			)
+			.map_err(|_| ())?;
+
+		// HTLC sigs (spec §3, M9b): one BIP340 Schnorr sig per non-dust HTLC over
+		// the second-level HTLC tx, signed with OUR htlc base key. The broadcaster
+		// of the counterparty commitment is the counterparty, so the delay is
+		// `to_broadcaster_delay`.
+		let contest_delay = built.to_broadcaster_delay().unwrap_or(0);
+		let htlc_sigs = chan_utils::taproot_counterparty_commitment_htlc_sigs(
+			commitment_tx,
+			&self.htlc_base_key,
+			contest_delay,
+			secp_ctx,
+		)
+		.map_err(|_| ())?;
+
+		Ok((PartialSignatureWithNonce(partial, our_pubnonce), htlc_sigs))
 	}
 
 	fn finalize_holder_commitment(
 		&self, commitment_tx: &HolderCommitmentTransaction,
 		counterparty_partial_signature: PartialSignatureWithNonce, secp_ctx: &Secp256k1<All>,
 	) -> Result<PartialSignature, ()> {
-		todo!()
+		let idx = commitment_tx.commitment_number();
+		let (key_agg, our_index, counterparty_index, funding_value_sat, funding_spk) =
+			self.taproot_key_agg(secp_ctx)?;
+
+		let built = commitment_tx.trust();
+		let tx = &built.built_transaction().transaction;
+		let sighash = chan_utils::taproot_funding_keyspend_sighash(
+			tx,
+			0,
+			Amount::from_sat(funding_value_sat),
+			&funding_spk,
+		)
+		.map_err(|_| ())?;
+		let message: [u8; 32] = *sighash.as_ref();
+
+		let PartialSignatureWithNonce(_cp_partial, cp_nonce) = counterparty_partial_signature;
+		let (partial, _our_pubnonce) = crate::sign::taproot_signer::our_key_path_partial(
+			key_agg,
+			our_index,
+			counterparty_index,
+			self.taproot_holder_funding_key(),
+			&self.commitment_seed,
+			idx,
+			cp_nonce,
+			message,
+		)
+		.map_err(|_| ())?;
+		Ok(partial)
 	}
 
 	fn sign_justice_revoked_output(
-		&self, justice_tx: &Transaction, input: usize, amount: u64, per_commitment_key: &SecretKey,
-		secp_ctx: &Secp256k1<All>,
+		&self, _justice_tx: &Transaction, _input: usize, _amount: u64,
+		_per_commitment_key: &SecretKey, _secp_ctx: &Secp256k1<All>,
 	) -> Result<schnorr::Signature, ()> {
-		todo!()
+		// Breach sweep of a revoked counterparty `to_local` output (script-path
+		// `revoke` leaf). The exact tapleaf hash needs the counterparty's delayed
+		// key, which this trait method does not pass (no `channel_parameters`); the
+		// production breach-sweep path supplies it through the `ChannelMonitor`
+		// descriptor (M9 force-close-sweep slice), not through `InMemorySigner`.
+		// This happy-swap-path signer therefore declines the breach sweep rather
+		// than emit a sig over an incomplete message.
+		Err(())
 	}
 
 	fn sign_justice_revoked_htlc(
-		&self, justice_tx: &Transaction, input: usize, amount: u64, per_commitment_key: &SecretKey,
-		htlc: &HTLCOutputInCommitment, secp_ctx: &Secp256k1<All>,
+		&self, _justice_tx: &Transaction, _input: usize, _amount: u64,
+		_per_commitment_key: &SecretKey, _htlc: &HTLCOutputInCommitment, _secp_ctx: &Secp256k1<All>,
 	) -> Result<schnorr::Signature, ()> {
-		todo!()
+		// Breach sweep of a revoked HTLC output (internal key = revocation_pubkey →
+		// key-path spend). The key-path TapSighash commits to the exact prevout
+		// scriptPubKey (`0x5120 || revocation_output_key`), which needs the HTLC's
+		// htlc keys to reconstruct — not passed by this trait method. The monitor
+		// descriptor path supplies it (M9 force-close-sweep slice).
+		Err(())
 	}
 
 	fn sign_holder_htlc_transaction(
 		&self, htlc_tx: &Transaction, input: usize, htlc_descriptor: &HTLCDescriptor,
 		secp_ctx: &Secp256k1<All>,
 	) -> Result<schnorr::Signature, ()> {
-		todo!()
+		// Our second-level HTLC-Success/Timeout tx spends the holder commitment's
+		// HTLC output via the 2-of-2 leaf. Sign a BIP342 script-path TapSighash
+		// (SIGHASH_SINGLE|ANYONECANPAY) with our per-commitment HTLC key (spec §3).
+		let channel_parameters =
+			&htlc_descriptor.channel_derivation_parameters.transaction_parameters;
+		let directed = channel_parameters.as_holder_broadcastable();
+		let keys = chan_utils::TxCreationKeys::from_channel_static_keys(
+			&htlc_descriptor.per_commitment_point,
+			directed.broadcaster_pubkeys(),
+			directed.countersignatory_pubkeys(),
+			secp_ctx,
+		);
+		let sighash = chan_utils::taproot_resolution_htlc_sighash(
+			secp_ctx,
+			htlc_tx,
+			input,
+			htlc_descriptor.htlc.to_bitcoin_amount(),
+			&htlc_descriptor.htlc,
+			&keys.broadcaster_htlc_key,
+			&keys.countersignatory_htlc_key,
+			&keys.revocation_key,
+		)
+		.map_err(|_| ())?;
+		let our_htlc_secret = chan_utils::derive_private_key(
+			secp_ctx,
+			&htlc_descriptor.per_commitment_point,
+			&self.htlc_base_key,
+		);
+		let keypair = bitcoin::secp256k1::Keypair::from_secret_key(secp_ctx, &our_htlc_secret);
+		let msg = secp256k1::Message::from_digest(*sighash.as_ref());
+		Ok(secp_ctx.sign_schnorr_no_aux_rand(&msg, &keypair))
 	}
 
 	fn sign_counterparty_htlc_transaction(
-		&self, htlc_tx: &Transaction, input: usize, amount: u64, per_commitment_point: &PublicKey,
-		htlc: &HTLCOutputInCommitment, secp_ctx: &Secp256k1<All>,
+		&self, _htlc_tx: &Transaction, _input: usize, _amount: u64,
+		_per_commitment_point: &PublicKey, _htlc: &HTLCOutputInCommitment, _secp_ctx: &Secp256k1<All>,
 	) -> Result<schnorr::Signature, ()> {
-		todo!()
+		// Claim an HTLC output on the counterparty's broadcast commitment via the
+		// 2-of-2 leaf. The leaf hash needs BOTH htlc keys (counterparty broadcaster
+		// + our countersignatory) and the revocation pubkey; this trait method does
+		// not pass `channel_parameters`, so the counterparty's htlc basepoint is not
+		// available here. The production on-chain-claim path supplies the full key
+		// set via the monitor descriptor (M9 force-close-sweep slice); this signer
+		// declines rather than sign over an incomplete leaf.
+		Err(())
 	}
 
 	fn partially_sign_closing_transaction(
 		&self, closing_tx: &ClosingTransaction, secp_ctx: &Secp256k1<All>,
 	) -> Result<PartialSignature, ()> {
-		todo!()
+		let (key_agg, our_index, counterparty_index, funding_value_sat, funding_spk) =
+			self.taproot_key_agg(secp_ctx)?;
+		// Per-round closing nonce: the secret nonce is derived at
+		// `closing_nonce_height(closing_round)`, NOT a fixed sentinel, so two
+		// distinct close txs (different fees) never share a nonce (spec §9f-0).
+		let (cp_nonce, closing_round) = {
+			let slot = self.taproot_ctx.lock().map_err(|_| ())?;
+			let ctx = slot.as_ref().ok_or(())?;
+			(ctx.counterparty_closing_nonce.clone().ok_or(())?, ctx.closing_round)
+		};
+
+		let built = closing_tx.trust();
+		let tx = built.built_transaction();
+		let sighash = chan_utils::taproot_funding_keyspend_sighash(
+			tx,
+			0,
+			Amount::from_sat(funding_value_sat),
+			&funding_spk,
+		)
+		.map_err(|_| ())?;
+		let message: [u8; 32] = *sighash.as_ref();
+
+		let (partial, _our_pubnonce) = crate::sign::taproot_signer::our_key_path_partial(
+			key_agg,
+			our_index,
+			counterparty_index,
+			self.taproot_holder_funding_key(),
+			&self.commitment_seed,
+			closing_nonce_height(closing_round),
+			cp_nonce,
+			message,
+		)
+		.map_err(|_| ())?;
+		Ok(partial)
+	}
+
+	fn generate_splice_nonce(
+		&self, prev_funding_txid: &bitcoin::Txid, secp_ctx: &Secp256k1<All>,
+	) -> Option<PublicNonce> {
+		// The splice signs the OLD (current) funding output, so the KeyAggContext is
+		// built from the CURRENT funding keys (the OLD `Q`), exactly as the closing /
+		// commitment partials do — `funding_key(None)` / `pubkeys().funding_pubkey`.
+		let (key_agg, our_index, _cp, _value, _spk) = self.taproot_key_agg(secp_ctx).ok()?;
+		crate::sign::taproot_signer::local_pubnonce(
+			key_agg,
+			our_index,
+			&self.commitment_seed,
+			crate::sign::splice_nonce_height(prev_funding_txid),
+		)
+		.ok()
+	}
+
+	fn partially_sign_splice_shared_input(
+		&self, tx: &Transaction, input_index: usize, all_prevouts: &[bitcoin::TxOut],
+		counterparty_nonce: PublicNonce, prev_funding_txid: &bitcoin::Txid,
+		secp_ctx: &Secp256k1<All>,
+	) -> Result<(PartialSignature, PublicNonce), ()> {
+		// The splice tx spends the OLD funding output (the current `0x5120||Q`); the
+		// KeyAggContext is the CURRENT funding-key aggregate (spec §9c). A splice tx
+		// has MULTIPLE inputs, so the BIP341 key-path sighash must commit to ALL
+		// prevouts (`Prevouts::All`), unlike the single-input commitment/close paths.
+		let (key_agg, our_index, counterparty_index, _value, _spk) =
+			self.taproot_key_agg(secp_ctx)?;
+		let sighash = chan_utils::taproot_splice_keyspend_sighash(tx, input_index, all_prevouts)
+			.map_err(|_| ())?;
+		let message: [u8; 32] = *sighash.as_ref();
+		crate::sign::taproot_signer::our_key_path_partial(
+			key_agg,
+			our_index,
+			counterparty_index,
+			self.taproot_holder_funding_key(),
+			&self.commitment_seed,
+			crate::sign::splice_nonce_height(prev_funding_txid),
+			counterparty_nonce,
+			message,
+		)
+		.map_err(|_| ())
 	}
 }
 
@@ -2229,6 +3150,18 @@ impl KeysManager {
 		&self, descriptors: &[&SpendableOutputDescriptor], mut psbt: Psbt, secp_ctx: &Secp256k1<C>,
 	) -> Result<Psbt, ()> {
 		let mut keys_cache: Option<(InMemorySigner, [u8; 32])> = None;
+		// BIP341 script-path TapSighash for a taproot `to_local` delayed-output sweep
+		// (M9e) and the `to_remote` static-payment sweep (M9e-2) both commit to ALL
+		// prevouts (`Prevouts::All`); gather them in tx-input order from the PSBT's
+		// witness_utxos (set by `to_psbt_input` for every descriptor).
+		let all_prevouts: Vec<TxOut> = psbt
+			.inputs
+			.iter()
+			.map(|i| i.witness_utxo.clone().unwrap_or(TxOut {
+				value: Amount::ZERO,
+				script_pubkey: ScriptBuf::new(),
+			}))
+			.collect();
 		for outp in descriptors {
 			let get_input_idx = |outpoint: &OutPoint| {
 				psbt.unsigned_tx
@@ -2259,6 +3192,7 @@ impl KeysManager {
 						&psbt.unsigned_tx,
 						input_idx,
 						&descriptor,
+						&all_prevouts,
 						&secp_ctx,
 					)?;
 					psbt.inputs[input_idx].final_script_witness = Some(witness);
@@ -2277,6 +3211,7 @@ impl KeysManager {
 						&psbt.unsigned_tx,
 						input_idx,
 						&descriptor,
+						&all_prevouts,
 						&secp_ctx,
 					)?;
 					psbt.inputs[input_idx].final_script_witness = Some(witness);
@@ -2447,7 +3382,6 @@ impl OutputSpender for KeysManager {
 
 impl SignerProvider for KeysManager {
 	type EcdsaSigner = InMemorySigner;
-	#[cfg(taproot)]
 	type TaprootSigner = InMemorySigner;
 
 	fn generate_channel_keys_id(&self, _inbound: bool, user_channel_id: u128) -> [u8; 32] {
@@ -2467,6 +3401,12 @@ impl SignerProvider for KeysManager {
 	}
 
 	fn derive_channel_signer(&self, channel_keys_id: [u8; 32]) -> Self::EcdsaSigner {
+		self.derive_channel_keys(&channel_keys_id)
+	}
+
+	fn derive_taproot_channel_signer(&self, channel_keys_id: [u8; 32]) -> Self::TaprootSigner {
+		// EcdsaSigner == TaprootSigner == InMemorySigner here; the same key
+		// material backs both signing schemes.
 		self.derive_channel_keys(&channel_keys_id)
 	}
 
@@ -2596,7 +3536,6 @@ impl OutputSpender for PhantomKeysManager {
 
 impl SignerProvider for PhantomKeysManager {
 	type EcdsaSigner = InMemorySigner;
-	#[cfg(taproot)]
 	type TaprootSigner = InMemorySigner;
 
 	fn generate_channel_keys_id(&self, inbound: bool, user_channel_id: u128) -> [u8; 32] {
@@ -2605,6 +3544,10 @@ impl SignerProvider for PhantomKeysManager {
 
 	fn derive_channel_signer(&self, channel_keys_id: [u8; 32]) -> Self::EcdsaSigner {
 		self.inner.derive_channel_signer(channel_keys_id)
+	}
+
+	fn derive_taproot_channel_signer(&self, channel_keys_id: [u8; 32]) -> Self::TaprootSigner {
+		self.inner.derive_taproot_channel_signer(channel_keys_id)
 	}
 
 	fn get_destination_script(&self, channel_keys_id: [u8; 32]) -> Result<ScriptBuf, ()> {
@@ -2698,6 +3641,46 @@ impl EntropySource for RandomBytes {
 #[test]
 pub fn dyn_sign() {
 	let _signer: Box<dyn EcdsaChannelSigner>;
+}
+
+// §10 audit area 3/11 (coop-close RBF nonce + no nonce reuse): the per-round closing
+// nonce height MUST be distinct for every distinct close round (so two distinct close
+// txs never share a MuSig2 nonce → no funding-key leak, spec §9f-0), AND the closing /
+// splice nonce-height domains must be disjoint from the commitment-height range
+// ([0, 2^48)) and from each other, so a closing-round nonce can never collide with a
+// commitment or splice nonce on the same shachain root.
+#[test]
+fn taproot_closing_and_splice_nonce_heights_disjoint_and_distinct() {
+	use bitcoin::hashes::Hash;
+	use bitcoin::Txid;
+
+	// Per-round closing heights are strictly decreasing from the sentinel and unique.
+	let h0 = closing_nonce_height(0);
+	let h1 = closing_nonce_height(1);
+	let h2 = closing_nonce_height(2);
+	assert_eq!(h0, CLOSING_NONCE_BASE);
+	assert!(h0 > h1 && h1 > h2, "each closing round gets a strictly distinct height");
+
+	// Closing heights live at the very top (near u64::MAX), strictly ABOVE the
+	// commitment range [0, 2^48) and the splice window [2^48, 2^56 + 2^48).
+	const COMMITMENT_TOP: u64 = 1u64 << 48;
+	const SPLICE_TOP: u64 = (1u64 << 56) + (1u64 << 48);
+	for r in 0..1000u64 {
+		let h = closing_nonce_height(r);
+		assert!(h >= SPLICE_TOP, "closing nonce height must be above the splice window");
+	}
+
+	// Distinct splice txids → distinct splice nonce heights, all inside the disjoint
+	// [2^48, 2^56 + 2^48) window (above commitments, below the closing range).
+	let txid_a = Txid::from_slice(&[0x11; 32]).unwrap();
+	let txid_b = Txid::from_slice(&[0x22; 32]).unwrap();
+	let sa = splice_nonce_height(&txid_a);
+	let sb = splice_nonce_height(&txid_b);
+	assert_ne!(sa, sb, "distinct splices get distinct nonce heights (§9f-0 reuse guard)");
+	for s in [sa, sb] {
+		assert!(s >= COMMITMENT_TOP, "splice nonce height is above the commitment range");
+		assert!(s < SPLICE_TOP, "splice nonce height is below the closing range");
+	}
 }
 
 #[cfg(ldk_bench)]

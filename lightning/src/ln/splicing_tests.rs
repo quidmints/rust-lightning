@@ -178,11 +178,31 @@ pub fn complete_splice_handshake<'a, 'b, 'c, 'd>(
 	let splice_ack = get_event_msg!(acceptor, MessageSendEvent::SendSpliceAck, node_id_initiator);
 	initiator.node.handle_splice_ack(node_id_acceptor, &splice_ack);
 
-	let new_funding_script = chan_utils::make_funding_redeemscript(
-		&splice_init.funding_pubkey,
-		&splice_ack.funding_pubkey,
-	)
-	.to_p2wsh();
+	// The new funding output script depends on the channel type. For a
+	// **simple-taproot** channel it is the rotated key-path `0x5120||Q'`
+	// (`channel_taproot_script_pubkey` of the two ROTATED `splice_*` funding pubkeys —
+	// each carries the per-splice key rotation, spec §9c); for a legacy P2WSH channel
+	// it is the 2-of-2 redeemscript's P2WSH.
+	let is_taproot = initiator
+		.node
+		.list_channels()
+		.iter()
+		.find(|c| c.channel_id == channel_id)
+		.map(|c| c.channel_type.as_ref().map(|t| t.supports_simple_taproot()).unwrap_or(false))
+		.unwrap_or(false);
+	let new_funding_script = if is_taproot {
+		chan_utils::channel_taproot_script_pubkey(
+			&splice_init.funding_pubkey,
+			&splice_ack.funding_pubkey,
+		)
+		.expect("rotated splice funding pubkeys are valid points")
+	} else {
+		chan_utils::make_funding_redeemscript(
+			&splice_init.funding_pubkey,
+			&splice_ack.funding_pubkey,
+		)
+		.to_p2wsh()
+	};
 
 	new_funding_script
 }
@@ -265,12 +285,42 @@ pub fn complete_interactive_funding_negotiation<'a, 'b, 'c, 'd>(
 			}
 		}
 
+		// QU!D PATCH: the acceptor may now CONTRIBUTE (see QUID_PATCHES.md,
+		// `register_acceptor_splice_contribution`), so its turn is no longer always a bare
+		// `tx_complete` — it may first add the outputs it funds from its own channel balance.
+		// ⚠️ WRITTEN AS A LOOP RATHER THAN A NEW PARAMETER SO EXISTING TESTS ARE UNTOUCHED: with no
+		// registration the acceptor still emits exactly one `tx_complete` on its first turn and this
+		// behaves identically to the code it replaces.
 		let mut msg_events = acceptor.node.get_and_clear_pending_msg_events();
-		assert_eq!(msg_events.len(), 1, "{msg_events:?}");
-		if let MessageSendEvent::SendTxComplete { ref msg, .. } = msg_events.remove(0) {
-			initiator.node.handle_tx_complete(node_id_acceptor, msg);
-		} else {
-			panic!();
+		loop {
+			assert_eq!(msg_events.len(), 1, "{msg_events:?}");
+			match msg_events.remove(0) {
+				MessageSendEvent::SendTxAddOutput { ref msg, .. } => {
+					initiator.node.handle_tx_add_output(node_id_acceptor, msg);
+					// The initiator answers each acceptor output with its own `tx_complete`; feed it
+					// back so the acceptor can take another turn.
+					let mut init_events = initiator.node.get_and_clear_pending_msg_events();
+					assert_eq!(init_events.len(), 1, "{init_events:?}");
+					match init_events.remove(0) {
+						MessageSendEvent::SendTxComplete { ref msg, .. } => {
+							acceptor.node.handle_tx_complete(node_id_initiator, msg);
+						},
+						// The initiator may still owe the SHARED input (the previous funding output),
+						// which it adds on its own turn — an acceptor output does not necessarily
+						// arrive after the initiator has finished contributing.
+						MessageSendEvent::SendTxAddInput { ref msg, .. } => {
+							acceptor.node.handle_tx_add_input(node_id_initiator, msg);
+						},
+						ev => panic!("unexpected initiator reply to an acceptor output: {ev:?}"),
+					}
+					msg_events = acceptor.node.get_and_clear_pending_msg_events();
+				},
+				MessageSendEvent::SendTxComplete { ref msg, .. } => {
+					initiator.node.handle_tx_complete(node_id_acceptor, msg);
+					break;
+				},
+				ev => panic!("unexpected acceptor message: {ev:?}"),
+			}
 		}
 		acceptor_sent_tx_complete = true;
 	}
@@ -833,6 +883,69 @@ fn test_splice_in() {
 	let htlc_limit_msat = nodes[0].node.list_channels()[0].next_outbound_htlc_limit_msat;
 	assert!(htlc_limit_msat > initial_channel_value_sat);
 	let _ = send_payment(&nodes[0], &[&nodes[1]], htlc_limit_msat);
+}
+
+#[test]
+/// QU!D PATCH TEST (§ACCEPTOR-CONTRIBUTION): the ACCEPTOR funds a splice-out, so the party whose
+/// sats leave does NOT have to drive the negotiation.
+///
+/// 🔑 WHY THIS EXISTS. `SpliceContribution::SpliceOut` debits the INITIATOR, and
+/// `internal_splice_init` used to hardcode the acceptor's contribution to zero. Together they force
+/// the LP — an often-offline phone wallet — to initiate every swap-out delivery, when co-signing one
+/// is a far smaller ask than driving an interactive-tx negotiation. This asserts the inverted shape
+/// actually completes: node 0 (the hop) initiates contributing NOTHING, node 1 (the LP) contributes
+/// the splice-out, and the resulting transaction pays the destination.
+fn test_acceptor_contributed_splice_out() {
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let mut config = test_default_channel_config();
+	config.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let initial_channel_value_sat = 100_000;
+	let (_, _, channel_id, _) =
+		create_announced_chan_between_nodes_with_value(&nodes, 0, 1, initial_channel_value_sat, 0);
+
+	// Give node 1 (the LP) a balance to splice OUT of. Without this it has nothing to contribute
+	// and the test would pass for the wrong reason.
+	let _ = send_payment(&nodes[0], &[&nodes[1]], 50_000_000);
+
+	// The destination the acceptor's sats leave to — a swapper's script, in production.
+	let payout_script = nodes[1].wallet_source.get_change_script().unwrap();
+	let payout_sat = initial_channel_value_sat / 10;
+	let prev = nodes[1].node.register_acceptor_splice_contribution(
+		channel_id,
+		SpliceContribution::SpliceOut {
+			outputs: vec![TxOut {
+				value: Amount::from_sat(payout_sat),
+				script_pubkey: payout_script.clone(),
+			}],
+		},
+	);
+	assert!(prev.is_none(), "no earlier registration should exist");
+
+	// The HOP initiates and contributes NOTHING — the inversion this patch exists for.
+	let initiator_contribution = SpliceContribution::SpliceOut { outputs: vec![] };
+	let splice_tx = splice_channel(&nodes[0], &nodes[1], channel_id, initiator_contribution);
+
+	assert!(
+		splice_tx.output.iter().any(|o| o.script_pubkey == payout_script
+			&& o.value == Amount::from_sat(payout_sat)),
+		"the acceptor's splice-out must appear in the negotiated transaction: {:?}",
+		splice_tx.output
+	);
+
+	// ⚠️ ONE-SHOT: the registration must be CONSUMED, or a later splice on this channel would pay
+	// the same destination again out of a channel that never agreed to it.
+	assert!(
+		nodes[1].node.clear_acceptor_splice_contribution(&channel_id).is_none(),
+		"the registration must be consumed by the splice, not left pending"
+	);
+
+	mine_transaction(&nodes[0], &splice_tx);
+	mine_transaction(&nodes[1], &splice_tx);
+	lock_splice_after_blocks(&nodes[0], &nodes[1], ANTI_REORG_DELAY - 1);
 }
 
 #[test]
@@ -2118,4 +2231,486 @@ fn do_test_splice_with_inflight_htlc_forward_and_resolution(expire_scid_pre_forw
 fn test_splice_with_inflight_htlc_forward_and_resolution() {
 	do_test_splice_with_inflight_htlc_forward_and_resolution(true);
 	do_test_splice_with_inflight_htlc_forward_and_resolution(false);
+}
+
+// ===========================================================================
+// Simple-taproot SPLICE signing (BOLT #995, M9c — spec §9c/§9f-0)
+// ===========================================================================
+
+#[cfg(test)]
+fn taproot_splice_config() -> crate::util::config::UserConfig {
+	let mut cfg = test_default_channel_config();
+	cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	// Splice-in/out moves balance around; allow the full channel value in flight so
+	// the post-splice payment assertions are not capped by the default 10% policy.
+	cfg.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+	cfg
+}
+
+/// Lock a splice on a PRIVATE (unannounced) simple-taproot channel: mine the splice
+/// to its confirmation depth and drive the `splice_locked` exchange WITHOUT the
+/// announcement-signatures dance (a private QU!D hop/LP channel never announces, so
+/// `splice_locked` emits only `SendSpliceLocked`, no `SendAnnouncementSignatures` —
+/// the same event shape as the `is_0conf` branch of `lock_splice`). After this the
+/// channel's funding outpoint has rotated to the new `Q'`.
+#[cfg(test)]
+fn lock_taproot_splice_after_blocks<'a, 'b, 'c, 'd>(
+	node_a: &'a Node<'b, 'c, 'd>, node_b: &'a Node<'b, 'c, 'd>, num_blocks: u32,
+) {
+	connect_blocks(node_a, num_blocks);
+	connect_blocks(node_b, num_blocks);
+	let node_id_b = node_b.node.get_our_node_id();
+	let splice_locked_for_node_b =
+		get_event_msg!(node_a, MessageSendEvent::SendSpliceLocked, node_id_b);
+	// `is_0conf = true` selects the no-announcement event shape, which is exactly what
+	// a private channel produces (only `SendSpliceLocked`, no announcement sigs).
+	lock_splice(node_a, node_b, &splice_locked_for_node_b, true);
+}
+
+/// Drive ONE simple-taproot splice (handshake → interactive tx → commitment_signed
+/// → tx_signatures) WITHOUT locking it (locking needs announcement, which a private
+/// taproot channel never does), returning the finalized splice tx plus the splice
+/// nonces both sides advertised. Mirrors `splice_channel` but stops before
+/// `splice_locked` and surfaces the nonces for the §9f-0 reuse check.
+#[cfg(test)]
+fn drive_taproot_splice<'a, 'b, 'c, 'd>(
+	initiator: &'a Node<'b, 'c, 'd>, acceptor: &'a Node<'b, 'c, 'd>, channel_id: ChannelId,
+	contribution: SpliceContribution,
+) -> (Transaction, ScriptBuf, musig2::PubNonce, musig2::PubNonce) {
+	let node_id_initiator = initiator.node.get_our_node_id();
+	let node_id_acceptor = acceptor.node.get_our_node_id();
+
+	// Run the handshake manually so we can capture the advertised splice nonces.
+	initiator
+		.node
+		.splice_channel(&channel_id, &node_id_acceptor, contribution.clone(), FEERATE_FLOOR_SATS_PER_KW, None)
+		.unwrap();
+	let stfu_init = get_event_msg!(initiator, MessageSendEvent::SendStfu, node_id_acceptor);
+	acceptor.node.handle_stfu(node_id_initiator, &stfu_init);
+	let stfu_ack = get_event_msg!(acceptor, MessageSendEvent::SendStfu, node_id_initiator);
+	initiator.node.handle_stfu(node_id_acceptor, &stfu_ack);
+
+	let splice_init = get_event_msg!(initiator, MessageSendEvent::SendSpliceInit, node_id_acceptor);
+	let init_nonce = splice_init.splice_nonce.clone().expect("taproot splice_init carries a splice nonce");
+	acceptor.node.handle_splice_init(node_id_initiator, &splice_init);
+	let splice_ack = get_event_msg!(acceptor, MessageSendEvent::SendSpliceAck, node_id_initiator);
+	let ack_nonce = splice_ack.splice_nonce.clone().expect("taproot splice_ack carries a splice nonce");
+	initiator.node.handle_splice_ack(node_id_acceptor, &splice_ack);
+
+	// The NEW funding output is the rotated key-path `0x5120||Q'`.
+	let new_funding_script = chan_utils::channel_taproot_script_pubkey(
+		&splice_init.funding_pubkey,
+		&splice_ack.funding_pubkey,
+	)
+	.expect("rotated splice funding pubkeys are valid points");
+
+	let initial_commit_sig_for_acceptor = complete_interactive_funding_negotiation(
+		initiator,
+		acceptor,
+		channel_id,
+		contribution,
+		new_funding_script.clone(),
+	);
+	let (splice_tx, splice_locked) =
+		sign_interactive_funding_tx(initiator, acceptor, initial_commit_sig_for_acceptor, false);
+	assert!(splice_locked.is_none());
+
+	expect_splice_pending_event(initiator, &node_id_acceptor);
+	expect_splice_pending_event(acceptor, &node_id_initiator);
+
+	(splice_tx, new_funding_script, init_nonce, ack_nonce)
+}
+
+/// Assert the splice tx's shared (old-funding) input is a SINGLE 64-byte BIP340
+/// key-path Schnorr witness over the OLD `0x5120||Q` funding output, AND that the
+/// splice tx pays a new funding output that is `0x5120||Q'` (the rotated aggregate,
+/// `expected_new_funding_spk`, spec §9c). The CRYPTOGRAPHIC spend-validity (that the
+/// aggregate MuSig2 sig actually verifies vs the old `Q` under BIP341 consensus
+/// rules) is proven by the caller's `check_spends!`, which runs `Transaction::verify`
+/// = libbitcoinconsensus over every input including this key-path spend.
+#[cfg(test)]
+fn assert_taproot_splice_tx(
+	splice_tx: &Transaction, old_funding_tx: &Transaction, expected_new_funding_spk: &ScriptBuf,
+) {
+	// Find the shared input (the one spending the old funding output).
+	let old_funding_txid = old_funding_tx.compute_txid();
+	let shared_in = splice_tx
+		.input
+		.iter()
+		.find(|txin| txin.previous_output.txid == old_funding_txid)
+		.expect("splice spends the old funding output");
+	let old_funding_spk =
+		&old_funding_tx.output[shared_in.previous_output.vout as usize].script_pubkey;
+
+	// The OLD funding output is a P2TR `0x5120||Q` key-path output.
+	assert!(old_funding_spk.is_p2tr(), "old funding output is P2TR (0x5120||Q)");
+
+	// KEY-PATH SPEND: exactly one 64-byte BIP340 Schnorr witness element (NOT a
+	// 2-of-2 script witness). This is the aggregated MuSig2 sig.
+	let witness = shared_in.witness.to_vec();
+	assert_eq!(witness.len(), 1, "taproot key-path spend = one witness element");
+	assert_eq!(witness[0].len(), 64, "BIP340 key-path Schnorr sig is 64 bytes");
+
+	// The NEW funding output is the rotated `0x5120||Q'`.
+	assert!(
+		splice_tx.output.iter().any(|o| &o.script_pubkey == expected_new_funding_spk),
+		"splice tx must pay the rotated 0x5120||Q' funding output"
+	);
+	assert!(expected_new_funding_spk.is_p2tr(), "new funding output is P2TR (0x5120||Q')");
+	assert_ne!(
+		old_funding_spk, expected_new_funding_spk,
+		"funding key rotated: Q' must differ from the old Q"
+	);
+}
+
+#[test]
+fn test_simple_taproot_channel_splice_with_inflight_htlc() {
+	// §10 audit area 7 (HTLC ↔ splice INTERACTION): a simple-taproot channel must be
+	// able to splice while an HTLC is COMMITTED + in flight. Quiescence (STFU) freezes
+	// the HTLC set but does NOT clear it, so the post-splice commitment over the rotated
+	// `Q'` must still carry the existing HTLC output(s) AND a valid taproot HTLC sig
+	// (the HTLC outputs are built from the channel's HTLC set + the taproot channel-type
+	// SPK builders; the funding scope only governs the funding output/value). The other
+	// taproot splice tests splice an HTLC-free channel, so this is the unexercised
+	// composition cell. We drive: route (commit) an HTLC → splice-in → and prove the
+	// spliced channel is still fully functional by CLAIMING the in-flight HTLC over the
+	// post-splice commitment (off-chain settle exchanges a fresh commitment_signed over
+	// `Q'` whose HTLC output + sig must verify, else the claim would fail).
+	let taproot_cfg = taproot_splice_config();
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let initial_value_sat = 200_000;
+	let (channel_ready, funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, initial_value_sat, 100_000_000);
+	let channel_id = channel_ready.channel_id;
+
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], channel_id);
+	assert!(chan_type.supports_simple_taproot(), "channel must be simple-taproot, got {chan_type:?}");
+
+	// Route a payment WITHOUT claiming it: this leaves a non-dust HTLC committed + in
+	// flight on the latest commitment (the receiver holds the preimage; the HTLC output
+	// remains in the commitment). Use a value well above the dust limit so the HTLC is a
+	// real on-commitment output, not trimmed.
+	let payment_amount_msat = 5_000_000;
+	let (preimage, payment_hash, ..) = route_payment(&nodes[0], &[&nodes[1]], payment_amount_msat);
+
+	// --- SPLICE-IN (grow) WITH the HTLC still in flight ---
+	let coinbase_tx1 = provide_anchor_reserves(&nodes);
+	let coinbase_tx2 = provide_anchor_reserves(&nodes);
+	let splice_in = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(initial_value_sat),
+		inputs: vec![
+			FundingTxInput::new_p2wpkh(coinbase_tx1.clone(), 0).unwrap(),
+			FundingTxInput::new_p2wpkh(coinbase_tx2.clone(), 0).unwrap(),
+		],
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	// drive_taproot_splice runs the full handshake → interactive tx → commitment_signed
+	// → tx_signatures. The commitment_signed it processes is the post-splice commitment
+	// over `Q'`; with the HTLC in flight it MUST include the HTLC output + taproot HTLC
+	// sig, or commitment_signed verification (and thus this helper) would fail.
+	let (splice_in_tx, new_funding_spk_in, _n0, _n1) =
+		drive_taproot_splice(&nodes[0], &nodes[1], channel_id, splice_in);
+	check_spends!(splice_in_tx, funding_tx, coinbase_tx1, coinbase_tx2);
+	assert_taproot_splice_tx(&splice_in_tx, &funding_tx, &new_funding_spk_in);
+
+	// Lock the splice so the funding outpoint rotates to the new `Q'`.
+	mine_transaction(&nodes[0], &splice_in_tx);
+	mine_transaction(&nodes[1], &splice_in_tx);
+	lock_taproot_splice_after_blocks(&nodes[0], &nodes[1], ANTI_REORG_DELAY - 1);
+
+	// The HTLC that was committed BEFORE the splice must still be claimable over the
+	// post-splice channel. `claim_payment` drives the full preimage-release + settle
+	// (a fresh commitment_signed round over `Q'`, dropping the HTLC output) and asserts
+	// the PaymentSent event; a green claim proves the spliced channel correctly composed
+	// the in-flight HTLC with the rotated funding scope.
+	claim_payment(&nodes[0], &[&nodes[1]], preimage);
+	let _ = payment_hash;
+}
+
+#[test]
+fn test_simple_taproot_channel_splice_in_and_out() {
+	// M9c (spec §9c): a simple-taproot channel must be able to SPLICE — grow
+	// (splice-in) and shrink (splice-out) — which is QU!D's ONLY capacity mechanism.
+	// The splice tx spends the OLD key-path `0x5120||Q` funding output via an
+	// interactive MuSig2 key-path sign (both parties online), and the new funding
+	// output is the rotated `0x5120||Q'`. This test drives both directions through
+	// the real ChannelManager handlers and asserts the finalized splice tx's shared
+	// input is a single 64-byte key-path Schnorr witness over `0x5120||Q'`.
+	let taproot_cfg = taproot_splice_config();
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let initial_value_sat = 200_000;
+	let (channel_ready, funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, initial_value_sat, 100_000_000);
+	let channel_id = channel_ready.channel_id;
+
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], channel_id);
+	assert!(chan_type.supports_simple_taproot(), "channel must be simple-taproot, got {chan_type:?}");
+
+	// --- SPLICE-IN (grow) ---
+	let coinbase_tx1 = provide_anchor_reserves(&nodes);
+	let coinbase_tx2 = provide_anchor_reserves(&nodes);
+	let splice_in = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(initial_value_sat),
+		inputs: vec![
+			FundingTxInput::new_p2wpkh(coinbase_tx1.clone(), 0).unwrap(),
+			FundingTxInput::new_p2wpkh(coinbase_tx2.clone(), 0).unwrap(),
+		],
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	let (splice_in_tx, new_funding_spk_in, _n0, _n1) =
+		drive_taproot_splice(&nodes[0], &nodes[1], channel_id, splice_in);
+	// check_spends! runs libbitcoinconsensus over every input → cryptographic proof
+	// the key-path MuSig2 witness spends the OLD `0x5120||Q` funding output.
+	check_spends!(splice_in_tx, funding_tx, coinbase_tx1, coinbase_tx2);
+	assert_taproot_splice_tx(&splice_in_tx, &funding_tx, &new_funding_spk_in);
+
+	// Lock the splice-in so the channel's funding outpoint rotates to the new Q'.
+	mine_transaction(&nodes[0], &splice_in_tx);
+	mine_transaction(&nodes[1], &splice_in_tx);
+	lock_taproot_splice_after_blocks(&nodes[0], &nodes[1], ANTI_REORG_DELAY - 1);
+
+	// --- SPLICE-OUT (shrink) ---
+	let splice_out = SpliceContribution::SpliceOut {
+		outputs: vec![TxOut {
+			value: Amount::from_sat(initial_value_sat / 2),
+			script_pubkey: nodes[0].wallet_source.get_change_script().unwrap(),
+		}],
+	};
+	let (splice_out_tx, new_funding_spk_out, _m0, _m1) =
+		drive_taproot_splice(&nodes[0], &nodes[1], channel_id, splice_out);
+	// The splice-out spends the post-splice-in funding output (Q'); validate its
+	// key-path witness via consensus.
+	check_spends!(splice_out_tx, splice_in_tx);
+	assert_taproot_splice_tx(&splice_out_tx, &splice_in_tx, &new_funding_spk_out);
+}
+
+#[test]
+fn test_simple_taproot_channel_post_splice_payment() {
+	// §10 audit area 7/8 (post-splice NORMAL ops): after a splice LOCKS, a normal
+	// payment must succeed over the rotated `Q'`. The splice-initial commitment
+	// exchange has no revoke_and_ack, so the post-splice next MuSig2 verification nonce
+	// is advertised via `splice_locked` (the channel_ready analog). Before that fix,
+	// both sides reused the splice-height nonce for the first post-splice commitment,
+	// failing MuSig2 aggregation. The other taproot splice tests stop AT the splice
+	// (never transact afterward), so this is the unexercised cell.
+	let taproot_cfg = taproot_splice_config();
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let initial_value_sat = 200_000;
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, initial_value_sat, 100_000_000);
+	let channel_id = channel_ready.channel_id;
+	let cb1 = provide_anchor_reserves(&nodes);
+	let cb2 = provide_anchor_reserves(&nodes);
+	let splice_in = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(initial_value_sat),
+		inputs: vec![
+			FundingTxInput::new_p2wpkh(cb1, 0).unwrap(),
+			FundingTxInput::new_p2wpkh(cb2, 0).unwrap(),
+		],
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	let (splice_in_tx, _spk, _n0, _n1) =
+		drive_taproot_splice(&nodes[0], &nodes[1], channel_id, splice_in);
+	mine_transaction(&nodes[0], &splice_in_tx);
+	mine_transaction(&nodes[1], &splice_in_tx);
+	lock_taproot_splice_after_blocks(&nodes[0], &nodes[1], ANTI_REORG_DELAY - 1);
+	// A normal payment AFTER the splice locks (no in-flight HTLC during the splice).
+	send_payment(&nodes[0], &[&nodes[1]], 5_000_000);
+}
+
+#[test]
+fn test_simple_taproot_channel_justice_over_spliced_commitment() {
+	// §10 cluster-D #2 (splice × on-chain JUSTICE): the M9e-3 justice path was proven
+	// only over an ORIGINAL (un-spliced) funding scope `Q`. A splice rotates the
+	// funding scope to `Q'`, so a REVOKED POST-splice commitment is over `Q'` with the
+	// rotated funding keys, a new per-output key tree, and a new monitor `FundingScope`
+	// (promoted from `pending_funding`). This test drives the breach end-to-end on the
+	// SPLICED scope: splice-lock -> advance + revoke a post-splice state -> counterparty
+	// broadcasts the stale post-splice commitment -> assert the monitor DETECTS the
+	// P2TR breach over `Q'` and broadcasts a justice tx sweeping the revoked outputs.
+	//
+	// On the symmetric "revoked PRE-splice commitment broadcast AFTER the splice
+	// confirms" case: it is consensus-IMPOSSIBLE to confirm. The splice tx spends the
+	// old `0x5120||Q` funding output (the shared input), so once the splice confirms
+	// that UTXO no longer exists; an old-scope commitment double-spending it can never
+	// enter a block, so no justice is needed (and the monitor correctly drops the old
+	// scope's watch on promotion). During the in-flight splice window (pre-confirm) the
+	// old scope is still in `self.funding` and watched, so a pre-splice broadcast there
+	// would still be detected -- but post-confirmation it is moot by construction.
+	let taproot_cfg = taproot_splice_config();
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+
+	// Open BALANCED so the post-splice commitment carries node 0's `to_local`.
+	let initial_value_sat = 1_000_000;
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, initial_value_sat, 400_000_000);
+	let channel_id = channel_ready.channel_id;
+	assert!(
+		get_channel_type_features!(nodes[0], nodes[1], channel_id).supports_simple_taproot(),
+		"channel must be simple-taproot",
+	);
+
+	// --- SPLICE-IN, then LOCK so the funding scope rotates to Q'. ---
+	let cb1 = provide_anchor_reserves(&nodes);
+	let cb2 = provide_anchor_reserves(&nodes);
+	let splice_in = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(initial_value_sat),
+		inputs: vec![
+			FundingTxInput::new_p2wpkh(cb1, 0).unwrap(),
+			FundingTxInput::new_p2wpkh(cb2, 0).unwrap(),
+		],
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	let (splice_in_tx, _spk, _n0, _n1) =
+		drive_taproot_splice(&nodes[0], &nodes[1], channel_id, splice_in);
+	mine_transaction(&nodes[0], &splice_in_tx);
+	mine_transaction(&nodes[1], &splice_in_tx);
+	lock_taproot_splice_after_blocks(&nodes[0], &nodes[1], ANTI_REORG_DELAY - 1);
+
+	// Route (commit) an HTLC over the POST-splice channel WITHOUT claiming it: the
+	// current post-splice commitment now carries node 0's to_local, node 1's to_remote,
+	// and the in-flight HTLC -- all P2TR outputs over Q'. Snapshot it; this is the state
+	// we will REVOKE.
+	let (preimage, _payment_hash, ..) = route_payment(&nodes[0], &[&nodes[1]], 3_000_000);
+	let revoked_local_txn = get_local_commitment_txn!(nodes[0], channel_id);
+	let revoked_commitment_tx = revoked_local_txn[0].clone();
+	assert!(
+		revoked_commitment_tx.output.iter().all(|o| o.script_pubkey.is_p2tr()),
+		"every post-splice commitment output is P2TR (over Q')",
+	);
+	// Prove this commitment really spends the SPLICED funding output (Q'), not the
+	// original funding output.
+	assert_eq!(
+		revoked_commitment_tx.input[0].previous_output.txid,
+		splice_in_tx.compute_txid(),
+		"revoked commitment must spend the post-splice funding output",
+	);
+
+	// REVOKE that post-splice state by settling the HTLC (advances + revokes it).
+	claim_payment(&nodes[0], &[&nodes[1]], preimage);
+
+	// THE CHEAT: node 0 broadcasts the stale, revoked POST-splice commitment. Node 1's
+	// monitor must detect the breach over Q' when the block confirms.
+	mine_transaction(&nodes[1], &revoked_commitment_tx);
+	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed, [node_a_id], 2_000_000);
+	check_added_monitors(&nodes[1], 1);
+	let _ = nodes[1].node.get_and_clear_pending_msg_events();
+
+	// THE ASSERTION: node 1 broadcasts a justice tx sweeping the revoked post-splice
+	// commitment's P2TR outputs with valid taproot witnesses.
+	let justice_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
+	assert!(
+		!justice_txn.is_empty(),
+		"monitor must broadcast a justice tx for the revoked SPLICED taproot commitment (got 0)",
+	);
+	let mut swept_to_local = false;
+	let mut swept_any = false;
+	for jtx in justice_txn.iter() {
+		if !jtx.input.iter().any(|i| i.previous_output.txid == revoked_commitment_tx.compute_txid()) {
+			continue;
+		}
+		check_spends!(jtx, revoked_commitment_tx);
+		for input in jtx.input.iter() {
+			if input.previous_output.txid != revoked_commitment_tx.compute_txid() {
+				continue;
+			}
+			swept_any = true;
+			let spent = &revoked_commitment_tx.output[input.previous_output.vout as usize];
+			assert!(spent.script_pubkey.is_p2tr(), "justice spends a P2TR output over Q'");
+			let wit = input.witness.to_vec();
+			assert!(!wit.is_empty(), "taproot justice witness is non-empty");
+			let last = wit.last().unwrap();
+			let script_path = wit.len() >= 2 && last.len() == 65 && (last[0] & 0xfe) == 0xc0;
+			let key_path = wit.len() == 1 && (last.len() == 64 || last.len() == 65);
+			assert!(script_path || key_path, "valid taproot justice witness shape over Q'");
+			if script_path {
+				swept_to_local = true;
+			}
+		}
+	}
+	assert!(swept_any, "a justice tx must spend the revoked spliced commitment's outputs");
+	assert!(swept_to_local, "the revoked Q' to_local must be swept via its revoke tapleaf (script-path)");
+}
+
+#[test]
+fn test_simple_taproot_splice_nonces_distinct_across_two_splices() {
+	// M9f-0 guard (spec §9c/§9f-0): a channel splices MANY times over its life, each
+	// over a DIFFERENT splice tx. If two splice partials reused the same MuSig2 nonce
+	// `k` over different messages, the counterparty could solve for the funding
+	// private key. The per-splice nonce is keyed on the OLD funding txid the splice
+	// spends (unique per splice), so two consecutive splices MUST advertise DISTINCT
+	// nonces. Assert the `splice_init`/`splice_ack` pubnonces differ across splices.
+	let taproot_cfg = taproot_splice_config();
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let initial_value_sat = 200_000;
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, initial_value_sat, 100_000_000);
+	let channel_id = channel_ready.channel_id;
+
+	// SPLICE #1 (grow). Capture its nonces, then mine + lock so the channel's funding
+	// outpoint rotates and a SECOND splice spends a DIFFERENT old funding output.
+	let cb1 = provide_anchor_reserves(&nodes);
+	let cb2 = provide_anchor_reserves(&nodes);
+	let splice1 = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(initial_value_sat),
+		inputs: vec![
+			FundingTxInput::new_p2wpkh(cb1, 0).unwrap(),
+			FundingTxInput::new_p2wpkh(cb2, 0).unwrap(),
+		],
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	let (splice1_tx, _spk1, init_nonce_1, ack_nonce_1) =
+		drive_taproot_splice(&nodes[0], &nodes[1], channel_id, splice1);
+	mine_transaction(&nodes[0], &splice1_tx);
+	mine_transaction(&nodes[1], &splice1_tx);
+	lock_taproot_splice_after_blocks(&nodes[0], &nodes[1], ANTI_REORG_DELAY - 1);
+
+	// SPLICE #2 (grow), spending the NEW (post-splice-1) funding output.
+	let cb3 = provide_anchor_reserves(&nodes);
+	let cb4 = provide_anchor_reserves(&nodes);
+	let splice2 = SpliceContribution::SpliceIn {
+		value: Amount::from_sat(initial_value_sat),
+		inputs: vec![
+			FundingTxInput::new_p2wpkh(cb3, 0).unwrap(),
+			FundingTxInput::new_p2wpkh(cb4, 0).unwrap(),
+		],
+		change_script: Some(nodes[0].wallet_source.get_change_script().unwrap()),
+	};
+	let (_splice2_tx, _spk2, init_nonce_2, ack_nonce_2) =
+		drive_taproot_splice(&nodes[0], &nodes[1], channel_id, splice2);
+
+	// The two splices spend DIFFERENT old funding outputs ⇒ DISTINCT nonce heights ⇒
+	// DISTINCT pubnonces on BOTH sides (the §9f-0 reuse guard).
+	assert_ne!(
+		init_nonce_1.serialize(), init_nonce_2.serialize(),
+		"initiator splice nonce MUST differ across two splices (no nonce reuse — §9f-0)"
+	);
+	assert_ne!(
+		ack_nonce_1.serialize(), ack_nonce_2.serialize(),
+		"acceptor splice nonce MUST differ across two splices (no nonce reuse — §9f-0)"
+	);
 }

@@ -122,7 +122,10 @@ impl ChannelMonitorUpdate {
 				let funding_outpoint = channel_parameters
 					.funding_outpoint
 					.expect("Renegotiated funding must always have known outpoint");
-				let funding_script = channel_parameters.make_funding_redeemscript().to_p2wsh();
+				// Taproot-aware: `0x5120||Q'` for a simple-taproot splice, P2WSH otherwise
+				// (spec §9c). Watching the bare P2WSH for a taproot channel is wrong (the
+				// new funding output is key-path P2TR) — the silent-P2WSH class (M9a).
+				let funding_script = channel_parameters.funding_spk();
 				Some((funding_outpoint, funding_script))
 			},
 			_ => None,
@@ -374,8 +377,15 @@ fn write_legacy_holder_commitment_data<W: Writer>(
 	let delayed_payment_key = &tx_keys.broadcaster_delayed_payment_key;
 	let per_commitment_point = &tx_keys.per_commitment_point;
 
+	// Simple-taproot channels carry per-HTLC sigs as BIP340 Schnorr on the HCT TLV
+	// (`taproot_counterparty_htlc_sigs`), NOT in the ECDSA `counterparty_htlc_sigs`
+	// vec (which stays empty). Pair each non-dust HTLC with `None` ECDSA sig in that
+	// case so the legacy htlc_outputs serialization still walks every HTLC + source.
+	#[cfg(debug_assertions)]
+	let is_taproot = commitment_tx.taproot_counterparty_htlc_sigs.is_some();
 	let mut nondust_htlcs = commitment_tx.nondust_htlcs().iter()
-		.zip(commitment_tx.counterparty_htlc_sigs.iter());
+		.zip(commitment_tx.counterparty_htlc_sigs.iter().map(Some)
+			.chain(core::iter::repeat(None)));
 	let mut sources = htlc_data.nondust_htlc_sources.iter();
 
 	// Use an iterator to write `htlc_outputs` to avoid allocations.
@@ -386,6 +396,10 @@ fn write_legacy_holder_commitment_data<W: Writer>(
 			assert!(sources.next().is_none());
 			return None;
 		};
+		// For taproot the ECDSA sig is absent (sigs live on the HCT TLV); for legacy
+		// it must be present.
+		#[cfg(debug_assertions)]
+		debug_assert!(is_taproot || counterparty_htlc_sig.is_some());
 
 		let mut source = None;
 		if htlc.offered {
@@ -394,7 +408,7 @@ fn write_legacy_holder_commitment_data<W: Writer>(
 				panic!("Every offered non-dust HTLC should have a corresponding source");
 			}
 		}
-		Some((htlc, Some(counterparty_htlc_sig), source))
+		Some((htlc, counterparty_htlc_sig, source))
 	});
 
 	// Dust HTLCs go last.
@@ -1227,6 +1241,17 @@ pub(crate) struct ChannelMonitorImpl<Signer: EcdsaChannelSigner> {
 	holder_revocation_basepoint: RevocationBasepoint,
 	channel_id: ChannelId,
 	first_negotiated_funding_txo: OutPoint,
+	/// QU!D PATCH: the funding pubkeys of the FIRST negotiated funding scope, i.e. the pair the
+	/// channel was OPENED with. Companion to `first_negotiated_funding_txo`, and needed for the
+	/// same reason: a splice rotates BOTH — `send_splice_init`/`splice_ack` each derive a fresh
+	/// funding pubkey via `ChannelSigner::new_funding_pubkey(prev_funding_txid)` — so
+	/// `funding_pubkeys()`, which reads the CURRENT scope, cannot be used to reconstruct
+	/// anything that must be stable across the channel's life. QU!D's `BTCChannels` derives its
+	/// `channelId` from the ORIGINAL pair and the ORIGINAL outpoint, so both halves must be
+	/// pinned here or the id silently changes at splice lock. `None` only for monitors written
+	/// before this patch (see the read fallback). Non-secret: funding pubkeys are revealed
+	/// on-chain at funding.
+	first_negotiated_funding_pubkeys: Option<(PublicKey, PublicKey)>,
 
 	counterparty_commitment_params: CounterpartyCommitmentParameters,
 
@@ -1551,14 +1576,16 @@ pub(crate) fn write_chanmon_internal<Signer: EcdsaChannelSigner, W: Writer>(
 	let funding_outpoint = channel_monitor.get_funding_txo();
 	writer.write_all(&funding_outpoint.txid[..])?;
 	writer.write_all(&funding_outpoint.index.to_be_bytes())?;
-	let redeem_script = channel_monitor.funding.channel_parameters.make_funding_redeemscript();
-	let script_pubkey = redeem_script.to_p2wsh();
+	let script_pubkey = channel_monitor.funding.channel_parameters.funding_spk();
 	script_pubkey.write(writer)?;
 	channel_monitor.funding.current_counterparty_commitment_txid.write(writer)?;
 	channel_monitor.funding.prev_counterparty_commitment_txid.write(writer)?;
 
 	channel_monitor.counterparty_commitment_params.write(writer)?;
-	redeem_script.write(writer)?;
+	// Legacy serialized field (discarded on read): the 2-of-2 redeemscript. The
+	// authoritative watched funding scriptPubKey is `script_pubkey` above
+	// (taproot-aware) and the watch set is `outputs_to_watch` below.
+	channel_monitor.funding.channel_parameters.make_funding_redeemscript().write(writer)?;
 	channel_monitor.funding.channel_parameters.channel_value_satoshis.write(writer)?;
 
 	match channel_monitor.their_cur_per_commitment_points {
@@ -1755,6 +1782,7 @@ pub(crate) fn write_chanmon_internal<Signer: EcdsaChannelSigner, W: Writer>(
 		(34, channel_monitor.alternative_funding_confirmed, option),
 		(35, channel_monitor.is_manual_broadcast, required),
 		(37, channel_monitor.funding_seen_onchain, required),
+		(39, channel_monitor.first_negotiated_funding_pubkeys, option),
 	});
 
 	Ok(())
@@ -1870,9 +1898,12 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 
 		assert!(commitment_transaction_number_obscure_factor <= (1 << 48));
 		let holder_pubkeys = &channel_parameters.holder_pubkeys;
-		let counterparty_payment_script = chan_utils::get_countersigner_payment_script(
-			&channel_parameters.channel_type_features, &holder_pubkeys.payment_point
-		);
+		// Taproot-aware OUR-balance (`to_remote`) scriptPubKey to watch on the
+		// counterparty's broadcast (M9e-2): the taproot 1-CSV tapleaf output for a
+		// simple-taproot channel, P2WSH/P2WPKH otherwise. Same silent-P2WSH class as
+		// the funding_spk fix (M9c) — a P2WSH match would never recognize OUR taproot
+		// `to_remote`, leaving our balance unsweepable on a counterparty force-close.
+		let counterparty_payment_script = channel_parameters.counterparty_payment_spk();
 
 		let counterparty_channel_parameters = channel_parameters.counterparty_parameters.as_ref().unwrap();
 		let counterparty_delayed_payment_base_key = counterparty_channel_parameters.pubkeys.delayed_payment_basepoint;
@@ -1892,8 +1923,9 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 
 		let funding_outpoint = channel_parameters.funding_outpoint
 			.expect("Funding outpoint must be known during initialization");
-		let funding_redeem_script = channel_parameters.make_funding_redeemscript();
-		let funding_script = funding_redeem_script.to_p2wsh();
+		// Taproot-aware funding scriptPubKey to watch (spec §2/§9c): `0x5120||Q` for a
+		// simple-taproot channel, P2WSH 2-of-2 otherwise.
+		let funding_script = channel_parameters.funding_spk();
 		let mut outputs_to_watch = new_hash_map();
 		outputs_to_watch.insert(
 			funding_outpoint.txid, vec![(funding_outpoint.index as u32, funding_script.clone())],
@@ -1927,6 +1959,12 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 			holder_revocation_basepoint,
 			channel_id,
 			first_negotiated_funding_txo: funding_outpoint,
+			// QU!D PATCH: pin the OPENING pair here, while `channel_parameters` still describes the
+			// first funding scope. After a splice it describes the rotated one.
+			first_negotiated_funding_pubkeys: Some((
+				holder_pubkeys.funding_pubkey,
+				counterparty_channel_parameters.pubkeys.funding_pubkey,
+			)),
 
 			counterparty_commitment_params,
 			their_cur_per_commitment_points: None,
@@ -2118,9 +2156,91 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		self.inner.lock().unwrap().get_funding_script()
 	}
 
+	/// QU!D PATCH (see lib/rust-lightning/QUID_PATCHES.md): the channel's two
+	/// 2-of-2 funding pubkeys `(holder, counterparty)`. This is PUBLIC, non-secret
+	/// data — the same keys appear in the funding redeem script and are revealed
+	/// on-chain whenever the funding output is spent. QU!D needs them at OPEN time
+	/// (before any spend) to build `BTCChannels.openChannel` params; upstream LDK
+	/// only exposes funding keys via `#[cfg(test)]` accessors. Returns `None` until
+	/// the counterparty parameters are populated (i.e. post-negotiation).
+	pub fn funding_pubkeys(&self) -> Option<(PublicKey, PublicKey)> {
+		self.inner.lock().unwrap().funding_pubkeys()
+	}
+
+	/// QU!D PATCH (see lib/rust-lightning/QUID_PATCHES.md): the ORIGINAL funding
+	/// outpoint (the first negotiated one), STABLE across splices — unlike
+	/// [`get_funding_txo`](Self::get_funding_txo), which rotates to the post-splice
+	/// outpoint once a splice reaches its confirmation depth. QU!D's `BTCChannels`
+	/// keys a channel's id on its ORIGINAL funding outpoint, so the bridge uses this
+	/// to recompute the STABLE on-chain channelId for a spliced channel (the
+	/// reconciler / close / splice-mirror paths) instead of mis-keying on the
+	/// rotated outpoint. Non-secret (the outpoint is revealed on-chain at funding).
+	pub fn original_funding_txo(&self) -> OutPoint {
+		self.inner.lock().unwrap().first_negotiated_funding_txo
+	}
+
+	/// QU!D PATCH (see lib/rust-lightning/QUID_PATCHES.md): the funding pubkeys of the FIRST
+	/// negotiated funding scope — `(holder, counterparty)`, the pair the channel was OPENED with —
+	/// STABLE across splices, unlike [`funding_pubkeys`](Self::funding_pubkeys), which reads the
+	/// CURRENT scope and therefore rotates: `send_splice_init` and the `splice_ack` handler each
+	/// call `ChannelSigner::new_funding_pubkey(prev_funding_txid)`, tweaking the base funding key
+	/// by `SHA256(prev_funding_txid ‖ base_funding_secret)`.
+	///
+	/// Use this — together with [`original_funding_txo`](Self::original_funding_txo) — wherever a
+	/// value must be stable for the channel's life. QU!D's `BTCChannels` derives `channelId` from
+	/// exactly that pair, so using the live pair yields an id no channel on the EVM has.
+	///
+	/// ⚠️ Falls back to the CURRENT pair for monitors written before this patch. That is correct
+	/// for a never-spliced channel and wrong for a spliced one; there is no third option, because
+	/// the original pair was never persisted. Returns `None` before the counterparty funding
+	/// params are populated, matching `funding_pubkeys`.
+	pub fn original_funding_pubkeys(&self) -> Option<(PublicKey, PublicKey)> {
+		let inner = self.inner.lock().unwrap();
+		match inner.first_negotiated_funding_pubkeys {
+			Some(pair) => Some(pair),
+			None => inner.funding_pubkeys(),
+		}
+	}
+
+	/// QU!D PATCH (see lib/rust-lightning/QUID_PATCHES.md): outpoints of any PENDING
+	/// (renegotiated/splice) funding scopes — the NEW funding outpoint(s) of a
+	/// splice that has CONFIRMED but not yet LOCKED (so [`get_funding_txo`] still
+	/// returns the OLD, now-spent outpoint). Each outpoint's `txid` is the splice
+	/// transaction. The bridge reconciler uses this to avoid misclassifying a
+	/// confirmed-but-not-locked splice (which spends the old funding outpoint) as a
+	/// channel close. Non-secret (the outpoint is revealed on-chain at the splice).
+	///
+	/// [`get_funding_txo`]: Self::get_funding_txo
+	pub fn pending_funding_txos(&self) -> Vec<OutPoint> {
+		self.inner.lock().unwrap().pending_funding_txos()
+	}
+
 	/// Gets the channel_id of the channel this ChannelMonitor is monitoring for.
 	pub fn channel_id(&self) -> ChannelId {
 		self.inner.lock().unwrap().channel_id()
+	}
+
+	/// QU!D PATCH (see lib/rust-lightning/QUID_PATCHES.md): this channel's per-node
+	/// `channel_keys_id` — the KDF derivation index the node's `SignerProvider` uses
+	/// to re-derive the channel's signer (`derive_channel_signer(channel_keys_id)`).
+	/// This is NOT key material: it is a public-domain derivation INDEX (already
+	/// written to the monitor's on-disk state); knowing it does not reveal any secret
+	/// without the node's own seed. QU!D's dead-man-exit daemon (#114) reads it to
+	/// re-derive this channel's `ValidatingChannelSigner` off the FLEET-INTERNAL
+	/// `keys_manager` and pre-sign the unilateral exit IN-PLACE (the funding secret
+	/// key never leaves that signer). Upstream LDK exposes the live signer only via
+	/// `#[cfg(test)]` accessors, so this getter is the production route.
+	pub fn channel_keys_id(&self) -> [u8; 32] {
+		self.inner.lock().unwrap().channel_keys_id
+	}
+
+	/// The splice-parent funding txid of the CURRENT funding scope (`None` = base /
+	/// never-spliced). Read from the SAME `self.funding.channel_parameters` scope as
+	/// [`Self::get_funding_txo`], so a caller (the QU!D dead-man exit, #114) can sign the
+	/// exit with the ROTATED funding key that matches the on-chain `Q'` the exit spends —
+	/// a spliced channel would otherwise sign against the base key and fail.
+	pub fn splice_parent_funding_txid(&self) -> Option<bitcoin::Txid> {
+		self.inner.lock().unwrap().funding.channel_parameters.splice_parent_funding_txid
 	}
 
 	/// Gets the channel type of the corresponding channel.
@@ -2149,7 +2269,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		for funding in core::iter::once(&lock.funding).chain(&lock.pending_funding) {
 			let funding_outpoint = funding.funding_outpoint();
 			log_trace!(&logger, "Registering funding outpoint {} with the filter to monitor confirmations", &funding_outpoint);
-			let script_pubkey = funding.channel_parameters.make_funding_redeemscript().to_p2wsh();
+			let script_pubkey = funding.channel_parameters.funding_spk();
 			filter.register_tx(&funding_outpoint.txid, &script_pubkey);
 		}
 		for (txid, outputs) in lock.get_outputs_to_watch().iter() {
@@ -3683,7 +3803,10 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 
 			debug_assert!(htlc_outputs.iter().all(|(htlc, _, _)| htlc.transaction_output_index.is_none()));
 			debug_assert!(htlc_outputs.iter().all(|(_, sig_opt, _)| sig_opt.is_none()));
-			debug_assert_eq!(holder_commitment_tx.trust().nondust_htlcs().len(), holder_commitment_tx.counterparty_htlc_sigs.len());
+			// For simple-taproot channels the per-HTLC sigs are the BIP340 Schnorr
+			// `taproot_counterparty_htlc_sigs` (the ECDSA `counterparty_htlc_sigs` vec
+			// stays empty); `counterparty_htlc_sig_count` returns whichever applies.
+			debug_assert_eq!(holder_commitment_tx.trust().nondust_htlcs().len(), holder_commitment_tx.counterparty_htlc_sig_count());
 
 			let mut sources = nondust_htlc_sources.iter();
 			for htlc in holder_commitment_tx.trust().nondust_htlcs().iter() {
@@ -4127,7 +4250,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			return Err(());
 		}
 
-		let script_pubkey = channel_parameters.make_funding_redeemscript().to_p2wsh();
+		let script_pubkey = channel_parameters.funding_spk();
 		self.outputs_to_watch.insert(
 			alternative_funding_outpoint.txid,
 			vec![(alternative_funding_outpoint.index as u32, script_pubkey)],
@@ -4418,10 +4541,31 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			.expect("Funding outpoint must be set for active monitor")
 	}
 
+	/// QU!D PATCH: outpoints of any PENDING (renegotiated/splice) funding scopes —
+	/// the NEW funding outpoint(s) of a splice that has been negotiated but not yet
+	/// rotated into `funding` (pre-SpliceLocked). Each outpoint's `txid` is the
+	/// splice transaction. Empty outside an in-flight splice.
+	fn pending_funding_txos(&self) -> Vec<OutPoint> {
+		self.pending_funding
+			.iter()
+			.filter_map(|f| f.channel_parameters.funding_outpoint)
+			.collect()
+	}
+
 	/// Returns the P2WSH script we are currently monitoring the chain for spends. This will change
 	/// for every splice that has reached its intended confirmation depth.
 	fn get_funding_script(&self) -> ScriptBuf {
-		self.funding.channel_parameters.make_funding_redeemscript().to_p2wsh()
+		self.funding.channel_parameters.funding_spk()
+	}
+
+	// QU!D PATCH (see lib/rust-lightning/QUID_PATCHES.md): expose the 2-of-2
+	// funding pubkeys (holder, counterparty) for openChannel param construction.
+	fn funding_pubkeys(&self) -> Option<(PublicKey, PublicKey)> {
+		let params = &self.funding.channel_parameters;
+		Some((
+			params.holder_pubkeys.funding_pubkey,
+			params.counterparty_pubkeys()?.funding_pubkey,
+		))
 	}
 
 	pub fn channel_id(&self) -> ChannelId {
@@ -4456,7 +4600,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 				ClaimEvent::BumpCommitment {
 					package_target_feerate_sat_per_1000_weight, commitment_tx,
 					commitment_tx_fee_satoshis, pending_nondust_htlcs, anchor_output_idx,
-					channel_parameters,
+					channel_parameters, holder_per_commitment_point,
 				} => {
 					let channel_id = self.channel_id;
 					let counterparty_node_id = self.counterparty_node_id;
@@ -4477,6 +4621,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 								vout: anchor_output_idx,
 							},
 							value: commitment_tx.output[anchor_output_idx as usize].value,
+							per_commitment_point: holder_per_commitment_point,
 						},
 						pending_htlcs: pending_nondust_htlcs,
 						commitment_tx,
@@ -4690,11 +4835,24 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			let delayed_key = DelayedPaymentKey::from_basepoint(&self.onchain_tx_handler.secp_ctx, &self.counterparty_commitment_params.counterparty_delayed_payment_base_key, &PublicKey::from_secret_key(&self.onchain_tx_handler.secp_ctx, &per_commitment_key));
 
 			let revokeable_redeemscript = chan_utils::get_revokeable_redeemscript(&revocation_pubkey, self.counterparty_commitment_params.on_counterparty_tx_csv, &delayed_key);
-			let revokeable_p2wsh = revokeable_redeemscript.to_p2wsh();
+			// M9e-3: the revoked `to_local` output is P2WSH on legacy channels but a
+			// P2TR (NUMS-internal-key, [delay, revoke] tapleaves) on simple-taproot
+			// channels. Match whichever the negotiated type produces so we recognize the
+			// revoked output and build the `RevokedOutput` justice package (the taproot
+			// signer + package.rs `RevokedOutput` taproot finalize arm are M9e-complete).
+			let revokeable_to_local_spk =
+				if funding_spent.channel_parameters.channel_type_features.supports_simple_taproot() {
+					chan_utils::get_taproot_to_local_spk(
+						&self.onchain_tx_handler.secp_ctx, &revocation_pubkey,
+						self.counterparty_commitment_params.on_counterparty_tx_csv, &delayed_key,
+					)
+				} else {
+					revokeable_redeemscript.to_p2wsh()
+				};
 
 			// First, process non-htlc outputs (to_holder & to_counterparty)
 			for (idx, outp) in commitment_tx.output.iter().enumerate() {
-				if outp.script_pubkey == revokeable_p2wsh {
+				if outp.script_pubkey == revokeable_to_local_spk {
 					let revk_outp = RevokedOutput::build(
 						per_commitment_point, per_commitment_key, outp.value,
 						funding_spent.channel_parameters.clone(), height,
@@ -4974,8 +5132,40 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		// We make sure we're not vulnerable to this case by checking all inputs of the transaction,
 		// and claim those which spend the commitment transaction, have a witness of 5 elements, and
 		// have a corresponding output at the same index within the transaction.
+		// M9e-3: on simple-taproot channels the 2nd-level HTLC tx input is a BIP341
+		// SCRIPT-path spend of the commitment HTLC output (witness = [remote_sig,
+		// local_sig, (preimage,) leaf, control_block] = 4 or 5 elements, last = a
+		// taproot control block), NOT the legacy 5-element P2WSH witness. Recognize that
+		// shape so a revoked taproot 2nd-level tx is DETECTED (logged + the breach is
+		// already claimed directly): because the taproot HTLC tree's internal key IS the
+		// revocation key, our justice on the COMMITMENT HTLC output is a single key-path
+		// spend (built by `check_spend_counterparty_transaction`'s `RevokedHTLCOutput`
+		// arm, site 1) that competes with the counterparty's 2nd-level tx on the SAME
+		// commitment output — so the breach is covered without sweeping the 2nd-level
+		// tx's own output. Sweeping the 2nd-level output's revoke leaf would need new
+		// script/package/signer machinery (no `get_taproot_second_level_htlc_revoke_*`
+		// / `RevokedSecondLevelHTLCOutput` exists); building the legacy P2WSH
+		// `RevokedOutput` here would compute the wrong (NUMS) prevout SPK and broadcast
+		// an INVALID justice tx, so for taproot we must NOT take the legacy path.
+		let is_taproot =
+			self.funding.channel_parameters.channel_type_features.supports_simple_taproot();
 		for (idx, input) in tx.input.iter().enumerate() {
-			if input.previous_output.txid == *commitment_txid && input.witness.len() == 5 && tx.output.get(idx).is_some() {
+			let is_taproot_second_level = is_taproot
+				&& input.previous_output.txid == *commitment_txid
+				&& (input.witness.len() == 4 || input.witness.len() == 5)
+				&& input.witness.last().map_or(false, |cb| {
+					// A taproot control block is 33 + 32*m bytes (leaf version + internal
+					// key + merkle path); the HTLC tree has m=1 → 65 bytes. The first byte
+					// is the leaf version (0xc0 | parity).
+					cb.len() == 65 && (cb[0] & 0xfe) == 0xc0
+				});
+			if is_taproot_second_level {
+				// Detected a revoked taproot 2nd-level HTLC tx; the breach is claimed via
+				// the commitment-output key-path justice (site 1). No legacy package.
+				log_error!(logger, "Detected revoked counterparty taproot 2nd-level HTLC transaction {}:{} (breach claimed via commitment-output key-path justice)", htlc_txid, idx);
+				continue;
+			}
+			if !is_taproot && input.previous_output.txid == *commitment_txid && input.witness.len() == 5 && tx.output.get(idx).is_some() {
 				log_error!(logger, "Got broadcast of revoked counterparty HTLC transaction, spending {}:{}", htlc_txid, idx);
 				let revk_outp = RevokedOutput::build(
 					per_commitment_point, per_commitment_key, tx.output[idx].value,
@@ -5001,8 +5191,20 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 	) -> Vec<HTLCDescriptor> {
 		let tx = holder_tx.trust();
 		let mut htlcs = Vec::with_capacity(holder_tx.nondust_htlcs().len());
-		debug_assert_eq!(holder_tx.nondust_htlcs().len(), holder_tx.counterparty_htlc_sigs.len());
-		for (htlc, counterparty_sig) in holder_tx.nondust_htlcs().iter().zip(holder_tx.counterparty_htlc_sigs.iter()) {
+		// M9e-3: on simple-taproot channels the counterparty's per-HTLC sigs are the
+		// BIP340 Schnorr `taproot_counterparty_htlc_sigs` (the ECDSA
+		// `counterparty_htlc_sigs` vec stays EMPTY). Zipping the empty ECDSA vec would
+		// (debug) panic / (release) silently drop EVERY holder-HTLC descriptor, so the
+		// hop could not claim a swap HTLC on its own force-closed commitment. The taproot
+		// finalize path (`HolderHTLCOutput` / `find_taproot_counterparty_htlc_sig`) looks
+		// the Schnorr sig up by output index off the holder commitment, so the
+		// descriptor's ECDSA `counterparty_sig` field is unused for taproot — but
+		// `counterparty_htlc_sig_count()` still equals the non-dust HTLC count, so the
+		// invariant holds across both schemes.
+		let is_taproot =
+			funding.channel_parameters.channel_type_features.supports_simple_taproot();
+		debug_assert_eq!(holder_tx.nondust_htlcs().len(), holder_tx.counterparty_htlc_sig_count());
+		for (idx, htlc) in holder_tx.nondust_htlcs().iter().enumerate() {
 			assert!(htlc.transaction_output_index.is_some(), "Expected transaction output index for non-dust HTLC");
 
 			let preimage = if htlc.offered {
@@ -5012,6 +5214,29 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			} else {
 				// We can't build an HTLC-Success transaction without the preimage
 				continue;
+			};
+
+			// For taproot the ECDSA vec is empty; carry a placeholder ECDSA sig (never
+			// read — finalize uses the looked-up Schnorr sig). For legacy channels carry
+			// the real ECDSA `counterparty_sig` at this index.
+			let counterparty_sig = if is_taproot {
+				holder_tx.counterparty_htlc_sigs.get(idx).copied().unwrap_or_else(|| {
+					Signature::from_compact(&[1; 64]).expect("static valid placeholder sig")
+				})
+			} else {
+				holder_tx.counterparty_htlc_sigs[idx]
+			};
+
+			// M9e-4: for taproot the real per-HTLC counterparty sig is the BIP340 Schnorr
+			// sig at this output index, carried so the CPFP bump handler can build the
+			// script-path witness for the zero-fee holder-HTLC 2nd-level tx.
+			let counterparty_sig_taproot = if is_taproot {
+				holder_tx
+					.taproot_counterparty_htlc_sigs
+					.as_ref()
+					.and_then(|sigs| sigs.get(idx).copied())
+			} else {
+				None
 			};
 
 			htlcs.push(HTLCDescriptor {
@@ -5026,7 +5251,8 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 				feerate_per_kw: tx.negotiated_feerate_per_kw(),
 				htlc: htlc.clone(),
 				preimage,
-				counterparty_sig: *counterparty_sig,
+				counterparty_sig,
+				counterparty_sig_taproot,
 			});
 		}
 
@@ -5042,11 +5268,24 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 	) -> (Vec<PackageTemplate>, Option<(ScriptBuf, PublicKey, RevocationKey)>) {
 		let tx = holder_tx.trust();
 		let keys = tx.keys();
-		let redeem_script = chan_utils::get_revokeable_redeemscript(
-			&keys.revocation_key, self.on_holder_tx_csv, &keys.broadcaster_delayed_payment_key,
-		);
+		// M9e-3: our own `to_local` output is P2WSH on legacy channels but P2TR
+		// (NUMS-internal-key, [delay, revoke] tapleaves) on simple-taproot channels.
+		// Track whichever the negotiated type produced so `get_spendable_outputs`
+		// recognizes it on our force-close and emits the `DelayedPaymentOutput`
+		// SpendableOutput letting us sweep our balance after the CSV.
+		let to_local_spk =
+			if funding.channel_parameters.channel_type_features.supports_simple_taproot() {
+				chan_utils::get_taproot_to_local_spk(
+					&self.onchain_tx_handler.secp_ctx, &keys.revocation_key,
+					self.on_holder_tx_csv, &keys.broadcaster_delayed_payment_key,
+				)
+			} else {
+				chan_utils::get_revokeable_redeemscript(
+					&keys.revocation_key, self.on_holder_tx_csv, &keys.broadcaster_delayed_payment_key,
+				).to_p2wsh()
+			};
 		let broadcasted_holder_revokable_script = Some((
-			redeem_script.to_p2wsh(), holder_tx.per_commitment_point(), keys.revocation_key.clone(),
+			to_local_spk, holder_tx.per_commitment_point(), keys.revocation_key.clone(),
 		));
 
 		let claim_requests = self.get_broadcasted_holder_htlc_descriptors(funding, holder_tx).into_iter()
@@ -5238,7 +5477,17 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		&mut self, logger: &WithContext<L>
 	) -> Vec<Transaction> where L::Target: Logger {
 		log_debug!(logger, "Getting signed copy of latest holder commitment transaction!");
-		let commitment_tx = {
+		let commitment_tx = if self.channel_type_features().supports_simple_taproot() {
+			// Simple-taproot (BOLT #995) force-close: the funding spend is a key-path
+			// MuSig2 aggregate Schnorr sig formed at `commitment_signed` and stored on the
+			// holder commitment (spec §9a) — there is NO holder ECDSA sig to add at
+			// broadcast time, and the funding output is P2TR (not P2WSH 2-of-2). Mirror
+			// the production `HolderFundingOutput` finalize path (package.rs) and emit the
+			// single-64-byte key-path witness instead of the legacy 2-of-2 `add_holder_sig`
+			// (which would produce an INVALID P2WSH multisig witness on the P2TR funding
+			// output).
+			self.funding.current_holder_commitment_tx.get_taproot_signed_tx()
+		} else {
 			let sig = self.onchain_tx_handler.signer.unsafe_sign_holder_commitment(
 				&self.funding.channel_parameters, &self.funding.current_holder_commitment_tx,
 				&self.onchain_tx_handler.secp_ctx,
@@ -6000,6 +6249,28 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 								assert_eq!(&bitcoin::Address::p2wpkh(&bitcoin::CompressedPublicKey(bitcoin::PublicKey::from_slice(&input.witness.last().unwrap()).unwrap().inner), bitcoin::Network::Bitcoin).script_pubkey(), _script_pubkey);
 							} else if _script_pubkey == &chan_utils::shared_anchor_script_pubkey() {
 								assert!(input.witness.is_empty());
+							} else if _script_pubkey.is_p2tr() {
+								// Simple-taproot P2TR watched output. Two spend shapes are
+								// valid (spec §2/§9c + M9e/M9e-3 on-chain resolution):
+								//  - KEY-PATH (funding close/splice; revoked-HTLC key-path
+								//    breach): a single 64/65-byte BIP340 Schnorr sig, no
+								//    script to re-derive a P2TR address from.
+								//  - SCRIPT-PATH (to_local CSV sweep, to_local revoke
+								//    justice, HTLC timeout/success, 2nd-level HTLC tx): the
+								//    witness ends with a taproot control block (33+32*m
+								//    bytes; first byte = leaf version 0xc0|parity).
+								let wit = &input.witness;
+								let last = wit.last().unwrap();
+								let key_path =
+									wit.len() == 1 && (last.len() == 64 || last.len() == 65);
+								let script_path = wit.len() >= 2
+									&& last.len() >= 33
+									&& (last.len() - 33) % 32 == 0
+									&& (last[0] & 0xfe) == 0xc0;
+								assert!(
+									key_path || script_path,
+									"taproot watched-output spend must be a key-path or script-path spend",
+								);
 							} else { panic!(); }
 						}
 						return true;
@@ -6636,6 +6907,7 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 		let mut holder_pays_commitment_tx_fee = None;
 		let mut payment_preimages_with_info: Option<HashMap<_, _>> = None;
 		let mut first_negotiated_funding_txo = RequiredWrapper(None);
+		let mut first_negotiated_funding_pubkeys: Option<(PublicKey, PublicKey)> = None;
 		let mut channel_parameters = None;
 		let mut pending_funding = None;
 		let mut alternative_funding_confirmed = None;
@@ -6663,6 +6935,7 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 			(34, alternative_funding_confirmed, option),
 			(35, is_manual_broadcast, (default_value, false)),
 			(37, funding_seen_onchain, (default_value, true)),
+			(39, first_negotiated_funding_pubkeys, option),
 		});
 		// Note that `payment_preimages_with_info` was added (and is always written) in LDK 0.1, so
 		// we can use it to determine if this monitor was last written by LDK 0.1 or later.
@@ -6708,6 +6981,45 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 			counterparty_payment_script =
 				chan_utils::get_to_countersigner_keyed_anchor_redeemscript(&payment_point).to_p2wsh();
 		}
+
+		// Monitors for simple-taproot channels (M9e-2) serialized before the taproot
+		// `to_remote` recognition fix tracked the P2WSH `get_countersigner_payment_script`
+		// instead of the taproot 1-CSV tapleaf output. Correct it on deserialization so
+		// they can recognize + sweep OUR balance on a counterparty force-close.
+		if channel_parameters.channel_type_features.supports_simple_taproot()
+			&& !counterparty_payment_script.is_p2tr()
+		{
+			counterparty_payment_script = channel_parameters.counterparty_payment_spk();
+		}
+
+		// M9e-3: simple-taproot monitors serialized before the taproot HOLDER `to_local`
+		// recognition fix tracked the P2WSH revokeable script in
+		// `broadcasted_holder_revokable_script` instead of the P2TR `to_local` SPK, so a
+		// reloaded monitor would never emit a `DelayedPaymentOutput` for our own balance
+		// after a holder force-close. Recompute the taproot `to_local` SPK on
+		// deserialization (the stored per-commitment point + holder channel keys derive
+		// the broadcaster delayed-payment + revocation keys it commits to).
+		let broadcasted_holder_revokable_script = broadcasted_holder_revokable_script.map(
+			|(script, per_commitment_point, revocation_key): (ScriptBuf, PublicKey, RevocationKey)| {
+				if channel_parameters.channel_type_features.supports_simple_taproot()
+					&& !script.is_p2tr()
+				{
+					let secp_ctx = Secp256k1::new();
+					let directed = channel_parameters.as_holder_broadcastable();
+					let chan_keys = chan_utils::TxCreationKeys::from_channel_static_keys(
+						&per_commitment_point, directed.broadcaster_pubkeys(),
+						directed.countersignatory_pubkeys(), &secp_ctx,
+					);
+					let spk = chan_utils::get_taproot_to_local_spk(
+						&secp_ctx, &chan_keys.revocation_key, on_holder_tx_csv,
+						&chan_keys.broadcaster_delayed_payment_key,
+					);
+					(spk, per_commitment_point, revocation_key)
+				} else {
+					(script, per_commitment_point, revocation_key)
+				}
+			},
+		);
 
 		let channel_id = channel_id.unwrap_or(ChannelId::v1_from_funding_outpoint(outpoint));
 
@@ -6793,6 +7105,10 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 			holder_revocation_basepoint,
 			channel_id,
 			first_negotiated_funding_txo: first_negotiated_funding_txo.0.unwrap(),
+			// QU!D PATCH: absent only in monitors written before the patch existed. Left as `None`
+			// rather than back-filled from the CURRENT scope, so the accessor's fallback is visible
+			// at the call site instead of a rotated pair masquerading as the original one.
+			first_negotiated_funding_pubkeys,
 
 			counterparty_commitment_params,
 			their_cur_per_commitment_points,
@@ -7326,6 +7642,132 @@ mod tests {
 			}
 			assert_eq!(base_weight + inputs_total_weight, claim_tx.weight().to_wu() + /* max_length_isg */ (73 * inputs_weight.len() as u64 - sum_actual_sigs));
 		}
+	}
+
+	#[test]
+	/// QU!D CROSS-IMPLEMENTATION VECTOR (§FORCE-CLOSE-SKIPS-THE-STALE-GUARD).
+	/// Prints/asserts the `to_remote` scriptPubKey for a FIXED payment basepoint. The SAME vector is
+	/// pinned in Solidity (`ForceCloseLpOutput.t.sol`), so `ChannelLib.lpToRemoteOutputKey` is checked
+	/// against THE CODE THAT WILL ACTUALLY PRODUCE THE OUTPUT ON-CHAIN rather than against itself.
+	/// ⚠️ If this vector ever changes, the Solidity pin must change with it — the contract would
+	/// otherwise scan a commitment transaction for an output that is never there, and a force close
+	/// would silently report `lpPaidSats = 0` for every channel.
+	fn test_quid_to_remote_vector_for_solidity() {
+		let secp = Secp256k1::new();
+		let payment_point = PublicKey::from_secret_key(
+			&secp, &SecretKey::from_slice(&[0x11; 32]).unwrap());
+		let spk = crate::ln::chan_utils::get_taproot_to_remote_spk(&secp, &payment_point);
+		let spk_hex: String = spk.as_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+		let pp_hex: String = payment_point.serialize().iter().map(|b| format!("{:02x}", b)).collect();
+		println!("QUID_VECTOR payment_point={pp_hex}");
+		println!("QUID_VECTOR to_remote_spk={spk_hex}");
+		assert_eq!(&spk_hex[..4], "5120", "to_remote is a v1 taproot output");
+		assert_eq!(spk_hex.len(), 68, "OP_1 OP_PUSH32 <32 bytes>");
+	}
+
+	#[test]
+	/// QU!D PATCH TEST (§SPLICE-ROTATES-BOTH-FUNDING-KEYS): `original_funding_pubkeys` must survive
+	/// BOTH a serialization round-trip AND a funding-scope rotation.
+	///
+	/// 🔴 THE DEFECT THIS EXISTS TO CATCH, AND IT IS SILENT IN BOTH DIRECTIONS. The accessor falls
+	/// back to `funding_pubkeys()` when the field is absent, which is correct only for a monitor
+	/// written before the patch. If TLV 39 ever fails to persist, that fallback fires after every
+	/// RESTART and hands back the ROTATED pair while claiming to be the original — reintroducing the
+	/// exact bug the patch fixes, on the reload path, with no error anywhere. And if the field were
+	/// ever repointed at the live scope, the rotation half would break instead. So both halves are
+	/// asserted, and the rotation is asserted to be VISIBLE through `funding_pubkeys()` — otherwise
+	/// this test would pass against a monitor that simply never rotates.
+	fn test_original_funding_pubkeys_survive_rotation_and_round_trip() {
+		let secp_ctx = Secp256k1::new();
+		let keys = InMemorySigner::new(
+			SecretKey::from_slice(&[41; 32]).unwrap(),
+			SecretKey::from_slice(&[41; 32]).unwrap(),
+			SecretKey::from_slice(&[41; 32]).unwrap(),
+			SecretKey::from_slice(&[41; 32]).unwrap(),
+			true,
+			SecretKey::from_slice(&[41; 32]).unwrap(),
+			SecretKey::from_slice(&[41; 32]).unwrap(),
+			[41; 32],
+			[0; 32],
+			[0; 32],
+		);
+		let counterparty_pubkeys = ChannelPublicKeys {
+			funding_pubkey: PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[44; 32]).unwrap()),
+			revocation_basepoint: RevocationBasepoint::from(PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[45; 32]).unwrap())),
+			payment_point: PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[46; 32]).unwrap()),
+			delayed_payment_basepoint: DelayedPaymentBasepoint::from(PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[47; 32]).unwrap())),
+			htlc_basepoint: HtlcBasepoint::from(PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[48; 32]).unwrap())),
+		};
+		let funding_outpoint = OutPoint { txid: Txid::all_zeros(), index: u16::MAX };
+		let channel_id = ChannelId::v1_from_funding_outpoint(funding_outpoint);
+		let channel_parameters = ChannelTransactionParameters {
+			holder_pubkeys: keys.pubkeys(&secp_ctx),
+			holder_selected_contest_delay: 66,
+			is_outbound_from_holder: true,
+			counterparty_parameters: Some(CounterpartyChannelTransactionParameters {
+				pubkeys: counterparty_pubkeys,
+				selected_contest_delay: 67,
+			}),
+			funding_outpoint: Some(funding_outpoint),
+			splice_parent_funding_txid: None,
+			channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
+			channel_value_satoshis: 0,
+		};
+		let dummy_key = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
+		let shutdown_script = ShutdownScript::new_p2wpkh_from_pubkey(dummy_key);
+		let best_block = BestBlock::from_network(Network::Testnet);
+		let monitor = ChannelMonitor::new(
+			Secp256k1::new(), keys, Some(shutdown_script.into_inner()), 0, &ScriptBuf::new(),
+			&channel_parameters, true, 0,
+			HolderCommitmentTransaction::dummy(0, funding_outpoint, Vec::new()),
+			best_block, dummy_key, channel_id, false,
+		);
+
+		// ⚠️ REQUIRED BEFORE `encode()`, AND THE FIRST VERSION OF THIS TEST OMITTED IT: a monitor
+		// straight out of `new()` still carries SENTINEL commitment numbers with their high bits set,
+		// and they are serialized as 48-bit, so `encode()` trips
+		// `byte_utils.rs`'s `u & 0xffff_0000_0000_0000 == 0`. The sibling tests never serialize, which
+		// is why nothing else in this module needs these two calls.
+		let dummy_commitment_tx = HolderCommitmentTransaction::dummy(0, funding_outpoint, Vec::new());
+		monitor.provide_latest_holder_commitment_tx(dummy_commitment_tx, &Vec::new());
+		monitor.provide_latest_counterparty_commitment_tx(
+			Txid::from_byte_array(Sha256::hash(b"1").to_byte_array()),
+			Vec::new(), 281474976710655, dummy_key,
+		);
+
+		// The pair the channel OPENED with — what `BTCChannels` hashes into `channelId`.
+		let opening = monitor.original_funding_pubkeys().expect("counterparty params are populated");
+		assert_eq!(opening, monitor.funding_pubkeys().unwrap(),
+			"before any splice the original pair IS the live pair");
+
+		// ── 1. ROTATE THE FUNDING SCOPE, exactly as a splice lock does. ──
+		let rotated_holder = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[51; 32]).unwrap());
+		let rotated_counterparty = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[52; 32]).unwrap());
+		{
+			let mut inner = monitor.inner.lock().unwrap();
+			inner.funding.channel_parameters.holder_pubkeys.funding_pubkey = rotated_holder;
+			inner.funding.channel_parameters.counterparty_parameters.as_mut().unwrap()
+				.pubkeys.funding_pubkey = rotated_counterparty;
+		}
+		// The rotation must be VISIBLE, or the assertions below prove nothing.
+		assert_eq!(monitor.funding_pubkeys().unwrap(), (rotated_holder, rotated_counterparty),
+			"precondition: the live pair followed the rotated scope");
+		assert_eq!(monitor.original_funding_pubkeys().unwrap(), opening,
+			"the ORIGINAL pair must NOT follow a rotation -- this is what channelId is built from");
+
+		// ── 2. ROUND-TRIP. TLV 39 must persist, or the accessor's pre-patch fallback fires on
+		//    every reload and silently returns the ROTATED pair. ──
+		let encoded = monitor.encode();
+		let keys_manager = crate::sign::KeysManager::new(&[0u8; 32], 42, 42, false);
+		let mut r = &encoded[..];
+		let (_, reloaded) = <(BlockHash, ChannelMonitor<InMemorySigner>)>::read(
+			&mut r, (&keys_manager, &keys_manager),
+		).expect("monitor round-trips");
+		assert!(r.is_empty(), "the whole monitor was consumed");
+		assert_eq!(reloaded.original_funding_pubkeys().unwrap(), opening,
+			"TLV 39 did not survive the round-trip: the accessor fell back to the live (rotated) pair");
+		assert_eq!(reloaded.funding_pubkeys().unwrap(), (rotated_holder, rotated_counterparty),
+			"and the live pair still reflects the rotated scope after reload");
 	}
 
 	#[test]

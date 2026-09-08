@@ -6567,7 +6567,6 @@ pub fn test_counterparty_raa_skip_no_crash() {
 		channel_id,
 		per_commitment_secret,
 		next_per_commitment_point,
-		#[cfg(taproot)]
 		next_local_nonce: None,
 		release_htlc_message_paths: Vec::new(),
 	};
@@ -9998,4 +9997,1331 @@ pub fn test_dust_exposure_holding_cell_assertion() {
 
 	// Now that everything has settled, make sure the channels still work with a simple claim.
 	claim_payment(&nodes[2], &[&nodes[1]], payment_preimage_cb);
+}
+
+#[test]
+fn test_simple_taproot_channel_open_and_coop_close() {
+	// M6c functional test: drive a two-node **simple-taproot** channel through the
+	// real `ChannelManager` handlers — open (P2TR funding, `partial_signature_with_
+	// nonce` exchange → valid key-path MuSig2 funding sig), the first
+	// `commitment_signed`/`revoke_and_ack`, and a cooperative close. No HTLCs.
+	//
+	// The handlers run the recovered receive-side verification: on `funding_signed`/
+	// `commitment_signed`/`closing_signed`, each side aggregates its own MuSig2
+	// partial with the peer's `partial_signature_with_nonce` and checks the BIP340
+	// key-path Schnorr sig against the tweaked aggregate `Q` (instead of `verify_
+	// ecdsa` vs the redeemscript). A peer sig that did not verify vs `Q` is rejected
+	// with a channel-closing error, so a clean open→coop-close exchange *is* the
+	// assertion that the funding, commitment, and close sigs all verify vs `Q`.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	// `option_simple_taproot` is a no-HTLC-yet (M6c) channel type; don't let the
+	// harness/feature negotiation pull in anchors etc. for this minimal flow.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	// OPEN: open_channel/accept_channel (next_local_nonce TLV), funding_created/
+	// funding_signed (partial_signature_with_nonce over the counterparty commitment,
+	// MuSig2 key-path funding sig), funding confirm, channel_ready (fresh
+	// next_local_nonce), and the implied first commitment exchange.
+	//
+	// Use the *unannounced* helper: channel announcement (`announcement_signatures`)
+	// requires the taproot funding-key bitcoin-sig path, which is a later milestone
+	// (`get_announcement_sigs` taproot arm is still `todo!`). M6c only needs
+	// open + first-commitment + coop-close, none of which involves gossip.
+	let (channel_ready, funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0);
+	let chan_id = channel_ready.channel_id;
+
+	// Assert the negotiated channel type is in fact a simple-taproot channel (so the
+	// taproot MuSig2 send/verify arms were exercised, not the ECDSA fallback).
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(
+		chan_type.supports_simple_taproot(),
+		"negotiated channel type must be simple-taproot, got {:?}",
+		chan_type
+	);
+
+	// COOPERATIVE CLOSE (driven manually, since the `close_channel` helper asserts
+	// announced-channel gossip events this private channel doesn't emit):
+	// shutdown (shutdown_nonce) → closing_signed (partial_signature_with_nonce).
+	// Each side verifies the peer's closing partial aggregates to a key-path Schnorr
+	// sig over `0x5120||Q`; a non-verifying partial would close the channel with an
+	// error instead of producing the broadcastable close tx below.
+	nodes[0].node.close_channel(&chan_id, &node_b_id).unwrap();
+	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, node_b_id);
+	nodes[1].node.handle_shutdown(node_a_id, &node_0_shutdown);
+	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, node_a_id);
+	nodes[0].node.handle_shutdown(node_b_id, &node_1_shutdown);
+
+	// Fee negotiation + MuSig2 closing-partial exchange. For a SIMPLE-TAPROOT channel
+	// the closee (node 1) ACCEPTS the proposer's in-range fee in a SINGLE round
+	// (spec §9f-0: this guarantees each party signs exactly ONE close tx, so the
+	// per-close MuSig2 nonce can never be reused over two different messages — the
+	// funding-key-leak condition). So node 0 proposes, node 1 accepts+broadcasts, and
+	// node 0 finalizes+broadcasts WITHOUT a second closing_signed round.
+	let node_0_closing_signed =
+		get_event_msg!(nodes[0], MessageSendEvent::SendClosingSigned, node_b_id);
+	nodes[1].node.handle_closing_signed(node_a_id, &node_0_closing_signed);
+	let node_1_closing_signed =
+		get_event_msg!(nodes[1], MessageSendEvent::SendClosingSigned, node_a_id);
+	nodes[0].node.handle_closing_signed(node_b_id, &node_1_closing_signed);
+
+	let node_a_reason = ClosureReason::LocallyInitiatedCooperativeClosure;
+	check_closed_event!(nodes[0], 1, node_a_reason, [node_b_id], 1_000_000);
+	let node_b_reason = ClosureReason::CounterpartyInitiatedCooperativeClosure;
+	check_closed_event!(nodes[1], 1, node_b_reason, [node_a_id], 1_000_000);
+
+	// Both sides broadcast the SAME cooperative-close tx, and it spends the P2TR
+	// (`0x5120||Q`) funding output via the single 64-byte key-path Schnorr witness —
+	// the on-chain proof that the aggregated MuSig2 close sig verifies vs `Q`.
+	let tx_a = {
+		let mut b = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
+		assert_eq!(b.len(), 1, "node 0 broadcasts exactly the coop-close tx");
+		b.remove(0)
+	};
+	let tx_b = {
+		let mut b = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
+		assert_eq!(b.len(), 1, "node 1 broadcasts exactly the coop-close tx");
+		b.remove(0)
+	};
+	assert_eq!(tx_a, tx_b, "both nodes broadcast the identical coop-close tx");
+	check_spends!(tx_a, funding_tx);
+	// Key-path spend: a single 64-byte BIP340 Schnorr witness element.
+	assert_eq!(tx_a.input.len(), 1);
+	assert_eq!(tx_a.input[0].witness.len(), 1, "taproot key-path spend = one witness element");
+	assert_eq!(tx_a.input[0].witness.to_vec()[0].len(), 64, "BIP340 key-path Schnorr sig is 64 bytes");
+
+	assert!(nodes[0].node.list_channels().is_empty());
+	assert!(nodes[1].node.list_channels().is_empty());
+}
+
+#[test]
+fn test_simple_taproot_channel_restart_mid_coop_close_no_nonce_reuse() {
+	// FUNDING-KEY-LEAK GUARD (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9f): a simple-taproot
+	// cooperative close signs its closing partial with a DETERMINISTIC per-round MuSig2
+	// nonce `closing_nonce_height(closing_round)`. If a node sends its round-0 closing
+	// partial, then CRASHES and on restart re-proposes the close AT THE SAME round, it
+	// would re-derive the SAME nonce and sign a (possibly different-fee) close tx with it —
+	// a two-messages-one-nonce reuse that leaks the funding key.
+	//
+	// The committed fix persists `closing_round` + `closing_partial_sent_at_round` (channel
+	// write/read TLV 71/73) and, ON DESERIALIZE, advances `closing_round` by one if a
+	// partial was already sent before the crash. So after a restart mid-close the node
+	// re-proposes with a FRESH nonce at the next round.
+	//
+	// This test: open a simple-taproot channel, initiate coop close on node 0, exchange both
+	// shutdowns, capture node 0's round-0 closing partial pubnonce, then CRASH (reload) node
+	// 0 BEFORE that partial is delivered. Reconnect manually (reconnect_nodes panics on a
+	// mid-coop-close channel), re-drive the close, and assert the post-restart closing
+	// partial uses a DIFFERENT pubnonce than the captured round-0 one.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let persister;
+	let chain_monitor;
+	let node_a_reload;
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0);
+	let chan_id = channel_ready.channel_id;
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "must be a simple-taproot channel");
+
+	// Initiate the cooperative close on node 0 and exchange BOTH shutdowns.
+	nodes[0].node.close_channel(&chan_id, &node_b_id).unwrap();
+	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, node_b_id);
+	nodes[1].node.handle_shutdown(node_a_id, &node_0_shutdown);
+	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, node_a_id);
+	nodes[0].node.handle_shutdown(node_b_id, &node_1_shutdown);
+
+	// CAPTURE node 0's round-0 closing partial pubnonce. Do NOT deliver it to node 1 — we
+	// crash here, simulating a node that sent its round-0 partial then died.
+	let node_0_round0_closing_signed =
+		get_event_msg!(nodes[0], MessageSendEvent::SendClosingSigned, node_b_id);
+	let round0_pubnonce = node_0_round0_closing_signed
+		.partial_signature_with_nonce
+		.as_ref()
+		.expect("simple-taproot closing_signed must carry a partial_signature_with_nonce")
+		.1
+		.serialize();
+
+	// CRASH + RELOAD node 0 (the round-0 partial was sent but the channel persisted with
+	// `closing_partial_sent_at_round = true`).
+	let node_ser = nodes[0].node.encode();
+	let chan_mon = get_monitor!(nodes[0], chan_id).encode();
+	let mons = [&chan_mon[..]];
+	let config = taproot_cfg.clone();
+	reload_node!(nodes[0], config, &node_ser, &mons, persister, chain_monitor, node_a_reload);
+
+	// MANUAL reconnect (reconnect_nodes panics on a mid-cooperative-close channel).
+	nodes[1].node.peer_disconnected(node_a_id);
+
+	let init_a = msgs::Init {
+		features: nodes[0].node.init_features(),
+		networks: None,
+		remote_network_address: None,
+	};
+	let init_b = msgs::Init {
+		features: nodes[1].node.init_features(),
+		networks: None,
+		remote_network_address: None,
+	};
+	nodes[0].node.peer_connected(node_b_id, &init_b, true).unwrap();
+	let node_0_reestablish = get_chan_reestablish_msgs!(nodes[0], nodes[1]).pop().unwrap();
+	nodes[1].node.peer_connected(node_a_id, &init_a, false).unwrap();
+	let node_1_reestablish = get_chan_reestablish_msgs!(nodes[1], nodes[0]).pop().unwrap();
+
+	// Exchange channel_reestablish both ways; each side retransmits its Shutdown so the
+	// close dance restarts. On reconnect an unannounced channel also re-sends channel_ready,
+	// and node 0 (already holding node 1's shutdown from before the crash) re-proposes its
+	// closing_signed right after the reestablish — so pull the relevant messages out of the
+	// (multi-event) batch rather than asserting a single event.
+	fn extract_shutdown(events: &[MessageSendEvent], peer: PublicKey) -> msgs::Shutdown {
+		let mut shutdown = None;
+		for ev in events {
+			if let MessageSendEvent::SendShutdown { ref node_id, ref msg } = ev {
+				assert_eq!(*node_id, peer);
+				shutdown = Some(msg.clone());
+			}
+		}
+		shutdown.expect("expected a retransmitted Shutdown after reconnect")
+	}
+	fn extract_channel_ready(
+		events: &[MessageSendEvent], peer: PublicKey,
+	) -> msgs::ChannelReady {
+		for ev in events {
+			if let MessageSendEvent::SendChannelReady { ref node_id, ref msg } = ev {
+				assert_eq!(*node_id, peer);
+				return msg.clone();
+			}
+		}
+		panic!("expected a retransmitted ChannelReady after reconnect");
+	}
+
+	nodes[1].node.handle_channel_reestablish(node_a_id, &node_0_reestablish);
+	let node_1_events = nodes[1].node.get_and_clear_pending_msg_events();
+	let node_1_2nd_shutdown = extract_shutdown(&node_1_events, node_a_id);
+	let node_1_2nd_ready = extract_channel_ready(&node_1_events, node_a_id);
+
+	nodes[0].node.handle_channel_reestablish(node_b_id, &node_1_reestablish);
+	let node_0_events = nodes[0].node.get_and_clear_pending_msg_events();
+	let node_0_2nd_shutdown = extract_shutdown(&node_0_events, node_b_id);
+	let node_0_2nd_ready = extract_channel_ready(&node_0_events, node_b_id);
+
+	// On reconnect an unannounced channel re-sends channel_ready; deliver it both ways so
+	// each side considers the channel ready again (a precondition for closing-negotiation).
+	nodes[0].node.handle_channel_ready(node_b_id, &node_1_2nd_ready);
+	nodes[1].node.handle_channel_ready(node_a_id, &node_0_2nd_ready);
+	// Drain any channel_update emitted by the re-ready (announcement/update events).
+	let _ = nodes[0].node.get_and_clear_pending_msg_events();
+	let _ = nodes[1].node.get_and_clear_pending_msg_events();
+
+	// Feed node 1's retransmitted shutdown to node 0 and node 0's to node 1, completing the
+	// shutdown re-handshake so the close dance restarts. node 0's shutdown carries node 1's
+	// fresh cooperative-close nonce; with that stored, the (taproot) closing partial signer
+	// becomes available, so poke the signer to flush node 0's re-proposed closing_signed.
+	nodes[0].node.handle_shutdown(node_b_id, &node_1_2nd_shutdown);
+	nodes[1].node.handle_shutdown(node_a_id, &node_0_2nd_shutdown);
+	nodes[0].node.signer_unblocked(None);
+
+	// Node 0 re-proposes the close. THIS is the post-restart partial — it MUST use a fresh
+	// nonce (closing_round was advanced on deserialize).
+	let node_0_2nd_closing_signed =
+		get_event_msg!(nodes[0], MessageSendEvent::SendClosingSigned, node_b_id);
+	let post_restart_pubnonce = node_0_2nd_closing_signed
+		.partial_signature_with_nonce
+		.as_ref()
+		.expect("post-restart closing_signed must carry a partial_signature_with_nonce")
+		.1
+		.serialize();
+
+	// KEY ASSERTION: a fresh nonce after the restart (funding-key-leak guard).
+	assert_ne!(
+		post_restart_pubnonce.to_vec(),
+		round0_pubnonce.to_vec(),
+		"post-restart closing partial must use a FRESH nonce (funding-key-leak guard)"
+	);
+
+	// Complete the close: node 1 accepts+broadcasts, node 0 finalizes+broadcasts.
+	nodes[1].node.handle_closing_signed(node_a_id, &node_0_2nd_closing_signed);
+	let node_1_closing_signed =
+		get_event_msg!(nodes[1], MessageSendEvent::SendClosingSigned, node_a_id);
+	nodes[0].node.handle_closing_signed(node_b_id, &node_1_closing_signed);
+
+	let node_a_reason = ClosureReason::LocallyInitiatedCooperativeClosure;
+	check_closed_event!(nodes[0], 1, node_a_reason, [node_b_id], 1_000_000);
+	let node_b_reason = ClosureReason::CounterpartyInitiatedCooperativeClosure;
+	check_closed_event!(nodes[1], 1, node_b_reason, [node_a_id], 1_000_000);
+
+	// Both sides broadcast the identical valid coop-close tx (P2TR funding spend, single
+	// 64-byte key-path Schnorr witness). NOTE: node 0 was reloaded, which re-broadcasts the
+	// funding tx, so its broadcaster holds [funding_tx, coop_close_tx]; identify the
+	// coop-close tx by its single 64-byte key-path witness element.
+	let is_coop_close = |tx: &bitcoin::transaction::Transaction| {
+		tx.input.len() == 1
+			&& tx.input[0].witness.len() == 1
+			&& tx.input[0].witness.to_vec()[0].len() == 64
+	};
+	let tx_a = {
+		let b = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap();
+		let matches: Vec<_> = b.iter().filter(|t| is_coop_close(t)).cloned().collect();
+		assert_eq!(matches.len(), 1, "node 0 broadcasts exactly one coop-close tx");
+		matches.into_iter().next().unwrap()
+	};
+	let tx_b = {
+		let b = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap();
+		let matches: Vec<_> = b.iter().filter(|t| is_coop_close(t)).cloned().collect();
+		assert_eq!(matches.len(), 1, "node 1 broadcasts exactly one coop-close tx");
+		matches.into_iter().next().unwrap()
+	};
+	assert_eq!(tx_a, tx_b, "both nodes broadcast the identical coop-close tx");
+	assert_eq!(tx_a.input.len(), 1);
+	assert_eq!(tx_a.input[0].witness.len(), 1, "taproot key-path spend = one witness element");
+	assert_eq!(
+		tx_a.input[0].witness.to_vec()[0].len(),
+		64,
+		"BIP340 key-path Schnorr sig is 64 bytes"
+	);
+
+	assert!(nodes[0].node.list_channels().is_empty());
+	assert!(nodes[1].node.list_channels().is_empty());
+}
+
+#[test]
+fn test_simple_taproot_channel_force_close_offline() {
+	// M9a (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9a): a holder must be able to
+	// FORCE-CLOSE a simple-taproot channel — broadcast its OWN latest holder
+	// commitment unilaterally with a valid key-path MuSig2 funding signature —
+	// while the counterparty is OFFLINE. The funding sig is interactive (formed at
+	// `commitment_signed` from both partials + the deterministic per-height nonces)
+	// and persisted on the holder commitment so it can fire later with no peer.
+	//
+	// This is the non-happy path the green coop-close test cannot prove: coop close
+	// is a fresh interactive MuSig2 round (both online); force close must use the
+	// PRE-FORMED, STORED holder-commitment key-path sig.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	// OPEN (drives funding_created/funding_signed + the initial commitment exchange,
+	// which is exactly where the aggregated holder key-path funding sig is now formed
+	// and stored on the holder commitment for both sides).
+	let (channel_ready, funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0);
+	let chan_id = channel_ready.channel_id;
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "must be a simple-taproot channel");
+
+	let funding_txid = funding_tx.compute_txid();
+	// Locate the channel's P2TR funding output (`0x5120 || Q`) on the funding tx.
+	let (funding_vout, funding_spk, funding_value) = funding_tx
+		.output
+		.iter()
+		.enumerate()
+		.find_map(|(vout, txout)| {
+			if txout.script_pubkey.is_p2tr() {
+				Some((vout as u32, txout.script_pubkey.clone(), txout.value))
+			} else {
+				None
+			}
+		})
+		.expect("funding tx must have a P2TR funding output");
+	// Extract the tweaked aggregate funding key Q (the 32-byte x-only key in `0x5120||Q`).
+	let q = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&funding_spk.as_bytes()[2..])
+		.expect("P2TR spk carries a 32-byte x-only Q");
+
+	// GO OFFLINE: from here on node 1 (the counterparty) is never driven — not a
+	// single node-1 handler is invoked. The holder (node 0) must force-close purely
+	// from the PRE-FORMED, STORED holder-commitment key-path sig, with zero peer
+	// interaction. (No fresh MuSig2 round is possible — node 1 contributes nothing.)
+
+	// HOLDER FORCE-CLOSE: node 0 broadcasts its latest holder commitment unilaterally.
+	let msg = "offline force-close".to_owned();
+	nodes[0]
+		.node
+		.force_close_broadcasting_latest_txn(&chan_id, &node_b_id, msg.clone())
+		.unwrap();
+	let reason =
+		ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message: msg };
+	check_closed_event!(nodes[0], 1, reason, [node_b_id], 1_000_000);
+	check_added_monitors(&nodes[0], 1);
+	// Drain the single force-close message event (the queued `SendErrorMessage` to
+	// the now-offline peer). The channel is unannounced, so there is NO
+	// `BroadcastChannelUpdate` — `check_closed_broadcast!` would wrongly expect two.
+	let msg_events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(msg_events.len(), 1, "unannounced force-close emits only the error message");
+	assert!(matches!(
+		msg_events[0],
+		MessageSendEvent::HandleError {
+			action: msgs::ErrorAction::SendErrorMessage { .. }, ..
+		}
+	));
+
+	// Extract the broadcast holder commitment tx (spends the funding outpoint).
+	let broadcasts = nodes[0].tx_broadcaster.txn_broadcast();
+	let commitment_tx = broadcasts
+		.iter()
+		.find(|tx| {
+			tx.input.iter().any(|input| {
+				input.previous_output.txid == funding_txid
+					&& input.previous_output.vout == funding_vout
+			})
+		})
+		.expect("holder commitment transaction must be broadcast on force-close")
+		.clone();
+	check_spends!(commitment_tx, funding_tx);
+
+	// (a) KEY-PATH WITNESS SHAPE: exactly ONE 64-byte SIGHASH_DEFAULT Schnorr sig
+	// (NOT a 2-of-2 P2WSH script witness).
+	assert_eq!(commitment_tx.input.len(), 1, "commitment spends only the funding input");
+	let witness = commitment_tx.input[0].witness.to_vec();
+	assert_eq!(witness.len(), 1, "taproot key-path spend = exactly one witness element");
+	assert_eq!(witness[0].len(), 64, "BIP340 SIGHASH_DEFAULT key-path sig is 64 bytes");
+
+	// (b) THE SIG VERIFIES vs the tweaked aggregate Q over the BIP341 key-spend
+	// sighash of the broadcast commitment tx (it really would spend the funding utxo).
+	let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(&witness[0])
+		.expect("64-byte schnorr sig");
+	let prevouts = [bitcoin::TxOut { value: funding_value, script_pubkey: funding_spk }];
+	let sighash = bitcoin::sighash::SighashCache::new(&commitment_tx)
+		.taproot_key_spend_signature_hash(
+			0,
+			&bitcoin::sighash::Prevouts::All(&prevouts),
+			bitcoin::sighash::TapSighashType::Default,
+		)
+		.expect("key-spend sighash");
+	let secp = Secp256k1::verification_only();
+	let msg = bitcoin::secp256k1::Message::from_digest(*sighash.as_ref());
+	secp.verify_schnorr(&sig, &msg, &q)
+		.expect("force-close funding witness must verify vs the tweaked aggregate Q");
+}
+
+#[test]
+fn test_simple_taproot_channel_justice_to_local_sweep() {
+	// M9e-3 (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §M9e-3): the on-chain output
+	// DETECTION in `ChannelMonitor` was P2WSH-only for taproot, so when a
+	// counterparty broadcast a REVOKED simple-taproot commitment the monitor never
+	// recognized the P2TR `to_local` output, never built the `RevokedOutput` justice
+	// package, and broadcast ZERO justice txns — the counterparty stole the breached
+	// balance. M9e's signer-in-isolation tests proved witness PRODUCTION but never
+	// drove the real monitor block-confirmation -> detection -> package -> broadcast
+	// path, which is exactly where this SEVERE gap hid.
+	//
+	// This test drives that real path: node 0 revokes a state, node 1 mines node 0's
+	// stale commitment, and we assert node 1's monitor broadcasts a justice tx that
+	// SPENDS the revoked commitment (its taproot `to_local` + the in-flight HTLC
+	// output) with valid taproot SCRIPT-path witnesses. Before the fix: 0 broadcast.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+
+	// Open a BALANCED channel (push half to node 1) so the commitment carries a
+	// `to_local` for node 0 — the output the justice sweep targets.
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 400_000_000);
+	let chan_id = channel_ready.channel_id;
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "must be a simple-taproot channel");
+
+	// Add an in-flight HTLC (node 0 -> node 1) and HOLD it (do not settle), so the
+	// commitment we are about to revoke carries BOTH a taproot `to_local` AND a
+	// taproot HTLC output.
+	let (preimage, payment_hash, ..) = route_payment(&nodes[0], &[&nodes[1]], 3_000_000);
+
+	// Snapshot node 0's CURRENT commitment (the state we'll revoke). It has node 0's
+	// to_local, node 1's to_remote, and the in-flight HTLC output.
+	let revoked_local_txn = get_local_commitment_txn!(nodes[0], chan_id);
+	assert_eq!(revoked_local_txn.len(), 2, "commitment + the HTLC-timeout tx");
+	let revoked_commitment_tx = revoked_local_txn[0].clone();
+	// to_local (node0) + to_remote (node1) + HTLC = 3 outputs (no anchors negotiated).
+	assert_eq!(revoked_commitment_tx.output.len(), 3, "to_local + to_remote + HTLC");
+	assert!(
+		revoked_commitment_tx.output.iter().all(|o| o.script_pubkey.is_p2tr()),
+		"every taproot commitment output is P2TR",
+	);
+
+	// REVOKE that state: settle the HTLC, which advances + revokes the snapshot.
+	claim_payment(&nodes[0], &[&nodes[1]], preimage);
+	let _ = payment_hash;
+
+	// The CHEAT: node 0 broadcasts its stale, revoked commitment. Node 1's monitor
+	// must detect the breach when the block confirms.
+	mine_transaction(&nodes[1], &revoked_commitment_tx);
+	check_closed_event!(nodes[1], 1, ClosureReason::CommitmentTxConfirmed, [node_a_id], 1_000_000);
+	check_added_monitors(&nodes[1], 1);
+	// Drain the queued channel-closed error message (unannounced channel -> nothing to
+	// broadcast) so the per-node `Drop` excess-message-events check stays clean.
+	let _ = nodes[1].node.get_and_clear_pending_msg_events();
+
+	// THE ASSERTION: node 1 broadcasts at least one justice tx spending the revoked
+	// commitment. Pre-M9e-3 this vec was EMPTY (0 justice txn broadcast).
+	let justice_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
+	assert!(
+		!justice_txn.is_empty(),
+		"M9e-3: monitor must broadcast a justice tx for the revoked taproot commitment (got 0)",
+	);
+
+	// Each justice tx must SPEND the revoked commitment and carry valid taproot
+	// SCRIPT-path witnesses (revoke leaf for to_local, key-path for the HTLC breach).
+	let mut swept_to_local = false;
+	let mut swept_any_taproot_output = false;
+	for jtx in justice_txn.iter() {
+		let spends_revoked = jtx
+			.input
+			.iter()
+			.any(|i| i.previous_output.txid == revoked_commitment_tx.compute_txid());
+		if !spends_revoked {
+			continue;
+		}
+		check_spends!(jtx, revoked_commitment_tx);
+		for input in jtx.input.iter() {
+			if input.previous_output.txid != revoked_commitment_tx.compute_txid() {
+				continue;
+			}
+			swept_any_taproot_output = true;
+			let spent = &revoked_commitment_tx.output[input.previous_output.vout as usize];
+			assert!(spent.script_pubkey.is_p2tr(), "justice spends a P2TR output");
+			let wit = input.witness.to_vec();
+			assert!(!wit.is_empty(), "taproot justice witness is non-empty");
+			let last = wit.last().unwrap();
+			// to_local revoke = script-path (last elem = 65-byte control block);
+			// HTLC breach = key-path (single 64/65-byte Schnorr sig).
+			let script_path = wit.len() >= 2 && last.len() == 65 && (last[0] & 0xfe) == 0xc0;
+			let key_path = wit.len() == 1 && (last.len() == 64 || last.len() == 65);
+			assert!(script_path || key_path, "valid taproot justice witness shape");
+			if script_path {
+				swept_to_local = true;
+			}
+		}
+	}
+	assert!(swept_any_taproot_output, "a justice tx must spend the revoked commitment's outputs");
+	assert!(swept_to_local, "the revoked taproot to_local must be swept via its revoke tapleaf (script-path)");
+}
+
+#[test]
+fn test_simple_taproot_channel_holder_force_close_to_local_spendable() {
+	// M9e-3 (site 2): after a HOLDER force-close of a simple-taproot channel, the
+	// monitor must recognize its OWN P2TR `to_local` output and, after the CSV, emit a
+	// `SpendableOutputs` event (a `DelayedPaymentOutput`) so the hop can sweep its own
+	// balance. Pre-M9e-3 the monitor tracked the P2WSH revokeable script, never matched
+	// the P2TR output, and emitted NO spendable output -> the hop could not recover its
+	// funds. Mirrors the legacy `test_claim_sizeable_push_msat`, on a taproot channel.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	// Open with node 0 holding (push nothing) so node 0's commitment has a to_local.
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0);
+	let chan_id = channel_ready.channel_id;
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "must be a simple-taproot channel");
+
+	// HOLDER force-close: node 0 broadcasts its own latest commitment.
+	let message = "holder force-close".to_owned();
+	nodes[0]
+		.node
+		.force_close_broadcasting_latest_txn(&chan_id, &node_b_id, message.clone())
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+	let reason = ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
+	check_closed_event!(nodes[0], 1, reason, [node_b_id], 1_000_000);
+	// Drain the queued force-close error message (unannounced channel -> no broadcast).
+	let _ = nodes[0].node.get_and_clear_pending_msg_events();
+
+	let node_txn = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
+	let commitment_tx = node_txn
+		.iter()
+		.find(|tx| tx.output.iter().any(|o| o.script_pubkey.is_p2tr() && o.value.to_sat() > 1000))
+		.expect("holder commitment broadcast")
+		.clone();
+
+	// Confirm the holder commitment + the CSV delay, then the monitor should emit the
+	// DelayedPaymentOutput SpendableOutput for the taproot to_local.
+	mine_transaction(&nodes[0], &commitment_tx);
+	connect_blocks(&nodes[0], BREAKDOWN_TIMEOUT as u32);
+
+	let spend_txn = check_spendable_outputs!(nodes[0], node_cfgs[0].keys_manager);
+	assert!(
+		!spend_txn.is_empty(),
+		"M9e-3: holder force-close must yield a spendable taproot to_local output (got 0)",
+	);
+	assert!(
+		spend_txn.iter().any(|t| t.input.iter().any(|i| i.previous_output.txid == commitment_tx.compute_txid())),
+		"the spend must sweep our own to_local from the broadcast holder commitment",
+	);
+}
+
+#[test]
+fn test_simple_taproot_channel_holder_force_close_htlc_claim() {
+	// M9e-3 (site 3): with an in-flight HTLC, a HOLDER force-close must let the hop
+	// build its holder-HTLC claim. Pre-M9e-3 `get_broadcasted_holder_htlc_descriptors`
+	// zipped the EMPTY ECDSA `counterparty_htlc_sigs` (taproot sigs live in the Schnorr
+	// `taproot_counterparty_htlc_sigs`), so it (debug) panicked / dropped every
+	// descriptor -> no holder-HTLC claim package. Here node 1 holds an inbound HTLC it
+	// knows the preimage for and force-closes; the monitor must build + broadcast the
+	// HTLC-success claim against its own commitment.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 400_000_000);
+	let chan_id = channel_ready.channel_id;
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "must be a simple-taproot channel");
+
+	// node 0 -> node 1 HTLC, HELD (node 1 knows the preimage but hasn't fulfilled).
+	let (preimage, payment_hash, ..) = route_payment(&nodes[0], &[&nodes[1]], 3_000_000);
+	nodes[1].node.claim_funds(preimage);
+	expect_payment_claimed!(nodes[1], payment_hash, 3_000_000);
+	check_added_monitors(&nodes[1], 1);
+	// Drain node 1's update_fulfill so it stays unsettled on-chain (node 0 never ACKs).
+	let _ = nodes[1].node.get_and_clear_pending_msg_events();
+
+	// node 1 force-closes; it must build its holder-HTLC (success) claim for the
+	// preimage it holds.
+	let message = "holder force-close with htlc".to_owned();
+	nodes[1]
+		.node
+		.force_close_broadcasting_latest_txn(&chan_id, &node_a_id, message.clone())
+		.unwrap();
+	check_added_monitors(&nodes[1], 1);
+	let reason = ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
+	check_closed_event!(nodes[1], 1, reason, [node_a_id], 1_000_000);
+	let _ = nodes[1].node.get_and_clear_pending_msg_events();
+
+	let node_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
+	let commitment_tx = node_txn
+		.iter()
+		.find(|tx| tx.output.len() >= 3 && tx.output.iter().all(|o| o.script_pubkey.is_p2tr()))
+		.expect("holder commitment with the HTLC output")
+		.clone();
+
+	// Confirm the commitment; the monitor must build + broadcast the holder-HTLC claim
+	// (an HTLC-success 2nd-level tx) spending the commitment's taproot HTLC output.
+	mine_transaction(&nodes[1], &commitment_tx);
+	connect_blocks(&nodes[1], TEST_FINAL_CLTV);
+
+	let post_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
+	let htlc_claim = post_txn.iter().find(|tx| {
+		tx.input
+			.iter()
+			.any(|i| i.previous_output.txid == commitment_tx.compute_txid())
+			&& tx.input.iter().any(|i| {
+				let w = i.witness.to_vec();
+				// taproot 2nd-level HTLC-success script-path spend: ends with a 65-byte
+				// control block, and carries the 32-byte preimage element.
+				!w.is_empty()
+					&& w.last().map_or(false, |cb| cb.len() == 65 && (cb[0] & 0xfe) == 0xc0)
+					&& w.iter().any(|e| e.len() == 32)
+			})
+	});
+	assert!(
+		htlc_claim.is_some(),
+		"M9e-3: holder force-close with an in-flight HTLC must build the holder-HTLC success claim (got none)",
+	);
+}
+
+#[test]
+fn test_simple_taproot_channel_htlc_send_and_claim() {
+	// M9b (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9b): a simple-taproot channel must
+	// be able to CARRY an HTLC — the commitment tx-builder emits taproot HTLC outputs
+	// and the signer produces + the peer verifies plain BIP340 Schnorr HTLC sigs in
+	// `commitment_signed`. The happy two-node open/coop-close test cannot prove this:
+	// it never sends an HTLC, so the "Got wrong number of HTLC signatures (0)" path
+	// (which gated the live swap) is never hit.
+	//
+	// This test ADDS an HTLC (route_payment → commitment_signed carrying the taproot
+	// HTLC Schnorr-sig vec → revoke_and_ack, all through the real ChannelManager
+	// handlers; a wrong sig count or a non-verifying Schnorr sig closes the channel
+	// with an error, so the round completing IS the assertion) and CLAIMS it with the
+	// preimage (the success path drives a fresh taproot commitment round removing the
+	// HTLC output).
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	taproot_cfg.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	// M9g: with anchors now LIVE on the negotiated taproot type, the acceptor
+	// requires `manually_accept_inbound_channels` (LDK rejects anchor channels
+	// otherwise — the node must keep a UTXO reserve for CPFP). QU!D's
+	// `build_user_config` already sets this; mirror it here. The
+	// `create_unannounced_chan_*` helper auto-accepts when the flag is set.
+	taproot_cfg.manually_accept_inbound_channels = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0);
+	let chan_id = channel_ready.channel_id;
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "must be a simple-taproot channel");
+	// M9g: this channel negotiated anchors → the commitment now carries the two
+	// taproot anchor outputs.
+	assert!(
+		chan_type.supports_anchors_zero_fee_htlc_tx(),
+		"negotiated taproot type must carry anchors (M9g)"
+	);
+
+	// SEND an HTLC across the channel. `route_payment` drives the FULL commitment
+	// dance (update_add_htlc → commitment_signed [now carrying the taproot HTLC
+	// Schnorr sigs] → revoke_and_ack → commitment_signed → revoke_and_ack). If the
+	// sig count were wrong, or a Schnorr HTLC sig failed verification, a handler
+	// would close the channel and this call would panic.
+	let (preimage, _payment_hash, _secret, _id) =
+		route_payment(&nodes[0], &[&nodes[1]], 100_000_000);
+
+	assert!(
+		!nodes[1].node.list_channels().is_empty(),
+		"channel still open with the pending HTLC"
+	);
+
+	// CLAIM with the preimage (drives the success path: update_fulfill_htlc + a fresh
+	// taproot commitment_signed round — removing the HTLC output). Reaching here means
+	// every taproot HTLC commitment_signed round (add + claim) verified.
+	claim_payment(&nodes[0], &[&nodes[1]], preimage);
+}
+
+#[test]
+fn test_simple_taproot_channel_dust_htlc_trim_agreement() {
+	// §10 audit area 2 (dust-trim AGREEMENT): a near-dust HTLC on a taproot commitment
+	// must be trimmed IDENTICALLY by BOTH parties — the trim decision is baked into the
+	// signed commitment, so any disagreement ⇒ commitment-sig mismatch ⇒ spurious
+	// force-close. For an ANCHOR channel (which the QU!D taproot type is, M9g),
+	// `second_stage_tx_fees_sat` returns (0,0), so the trim threshold is simply
+	// `amount < broadcaster_dust_limit` with NO dependence on the (P2WSH-derived) HTLC
+	// tx-weight constants — making the decision exact AND identical on both sides. This
+	// test drives an HTLC BELOW the dust limit (trimmed → no commitment output) and one
+	// ABOVE it (real taproot HTLC output) through the real commitment handlers; a trim
+	// disagreement on either would close the channel (the rounds completing IS the
+	// assertion), then claims both to prove settle agreement too.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	taproot_cfg.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	taproot_cfg.manually_accept_inbound_channels = true;
+	// Allow the full channel value in flight so neither HTLC is capped by policy.
+	taproot_cfg.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0);
+	let chan_id = channel_ready.channel_id;
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "must be a simple-taproot channel");
+	assert!(chan_type.supports_anchors_zero_fee_htlc_tx(), "taproot type carries anchors (M9g)");
+
+	// BELOW the default dust limit (MIN_CHAN_DUST_LIMIT_SATOSHIS = 354 sat): this HTLC
+	// is trimmed on BOTH commitments (no on-chain output). If the two sides disagreed on
+	// the trim, the commitment_signed round would fail. 300_000 msat = 300 sat < 354.
+	let (dust_preimage, _dust_hash, _s, _i) = route_payment(&nodes[0], &[&nodes[1]], 300_000);
+	assert!(!nodes[1].node.list_channels().is_empty(), "channel survived the dust HTLC round");
+
+	// JUST ABOVE the dust limit (500 sat > 354): a real taproot HTLC output on both
+	// commitments; the commitment round must still verify.
+	let (live_preimage, _live_hash, _s2, _i2) = route_payment(&nodes[0], &[&nodes[1]], 500_000);
+	assert!(!nodes[1].node.list_channels().is_empty(), "channel survived the non-dust HTLC round");
+
+	// Both must settle cleanly (agreement on the resulting commitments).
+	claim_payment(&nodes[0], &[&nodes[1]], dust_preimage);
+	claim_payment(&nodes[0], &[&nodes[1]], live_preimage);
+}
+
+#[test]
+fn test_simple_taproot_channel_anchors_negotiated_and_emitted() {
+	// M9g (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9g): a QU!D simple-taproot channel
+	// must be an ANCHOR channel — the negotiated channel type carries BOTH
+	// `option_simple_taproot` AND `option_anchors_zero_fee_htlc_tx`, the commitment
+	// carries the two taproot anchor outputs, and a force-closed commitment exposes
+	// the holder's anchor for CPFP fee-bumping. Without anchors a force-close at a
+	// stale low feerate is stuck (no CPFP, no RBF of the pre-signed commitment),
+	// risking a missed HTLC CLTV deadline → loss.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	taproot_cfg.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	// Anchor channels require manual inbound acceptance (QU!D's build_user_config
+	// sets this; the node must keep a UTXO reserve for CPFP).
+	taproot_cfg.manually_accept_inbound_channels = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	// Open with a BALANCED split (push half the value to node 1) so BOTH sides hold
+	// a to_local/to_remote output → both taproot anchors are present (BOLT #3
+	// presence rule: an anchor is emitted only when its party has an output).
+	let (channel_ready, funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 400_000_000);
+	let chan_id = channel_ready.channel_id;
+
+	// (1) NEGOTIATED TYPE carries BOTH bits.
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "type must be simple-taproot");
+	assert!(
+		chan_type.supports_anchors_zero_fee_htlc_tx(),
+		"M9g: simple-taproot type must ALSO carry option_anchors_zero_fee_htlc_tx"
+	);
+
+	// (2) The HOLDER's latest commitment carries the TWO taproot anchor outputs.
+	// Anchor-channel force-closes broadcast the commitment via the CPFP BumpTransaction
+	// flow, so we read the signed holder commitment directly from the monitor. Each
+	// anchor is a 330-sat P2TR output (OP_1 PUSH32). The CPFP key-path spend of the
+	// holder anchor (witness + Schnorr validity vs the tweaked holder
+	// local_delayedpubkey, plus the M9g AnchorDescriptor / build_taproot_anchor_
+	// input_witness arms) is exercised by `quid-ln/tests/taproot_anchor_cpfp.rs`.
+	let holder_commitment_txn = get_local_commitment_txn!(nodes[0], chan_id);
+	let commitment_tx = holder_commitment_txn
+		.iter()
+		.find(|tx| tx.input.iter().any(|i| i.previous_output.txid == funding_tx.compute_txid()))
+		.expect("holder commitment present in monitor")
+		.clone();
+	check_spends!(commitment_tx, funding_tx);
+
+	let anchor_outputs: Vec<_> = commitment_tx
+		.output
+		.iter()
+		.filter(|txout| {
+			txout.value == bitcoin::Amount::from_sat(crate::ln::channel::ANCHOR_OUTPUT_VALUE_SATOSHI)
+				&& txout.script_pubkey.is_p2tr()
+		})
+		.collect();
+	assert_eq!(
+		anchor_outputs.len(),
+		2,
+		"M9g: a balanced simple-taproot commitment must carry exactly two taproot anchor outputs, got tx {:?}",
+		commitment_tx.output
+	);
+	for a in &anchor_outputs {
+		assert_eq!(a.script_pubkey.as_bytes()[0], 0x51, "anchor is P2TR (OP_1)");
+		assert_eq!(a.script_pubkey.len(), 34, "P2TR spk = OP_1 PUSH32");
+	}
+
+	// (3) FORCE-CLOSE still succeeds (the pre-signed holder commitment fires).
+	let msg = "m9g anchors force-close".to_owned();
+	nodes[0]
+		.node
+		.force_close_broadcasting_latest_txn(&chan_id, &node_b_id, msg.clone())
+		.unwrap();
+	let reason =
+		ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message: msg };
+	check_closed_event!(nodes[0], 1, reason, [node_b_id], 1_000_000);
+	check_added_monitors(&nodes[0], 1);
+	let _ = nodes[0].node.get_and_clear_pending_msg_events();
+}
+
+#[test]
+fn test_simple_taproot_channel_anchor_cpfp_bumps_htlc_claim() {
+	// §10 cluster-D #4 (anchors × on-chain RESOLUTION). M9g added the taproot anchor
+	// for CPFP; the worry is whether the bump flow can fee-bump a JUSTICE / HTLC-claim
+	// tx, not just the commitment. This test maps the layers on a simple-taproot +
+	// anchor channel (QU!D's production config):
+	//
+	//  (A) SOUND — COMMITMENT anchor CPFP: a force-close emits `BumpTransactionEvent::
+	//      ChannelClose`; the bump handler spends the TAPROOT anchor (BIP340 key-path,
+	//      `taproot_tx_input_witness`) to fee-bump the commitment. Asserted below.
+	//  (SOUND, elsewhere) JUSTICE (RevokedOutput) + COUNTERPARTY-HTLC claims are
+	//      MALLEABLE packages: they self-fund fee from the swept value and RBF-escalate
+	//      (no anchor needed), so "can the anchor bump a justice tx" is moot by
+	//      construction. Justice over a spliced Q' is proven in
+	//      `splicing_tests::test_simple_taproot_channel_justice_over_spliced_commitment`.
+	//  (SOUND, elsewhere) HOLDER-HTLC claim on a NON-anchor taproot channel goes through
+	//      the MALLEABLE path `PackageSolvingData::get_maybe_signed_htlc_tx`, which IS
+	//      taproot-aware (`sign_holder_htlc_transaction_taproot` +
+	//      `build_taproot_htlc_input_witness`) — proven by
+	//      `test_simple_taproot_channel_holder_force_close_htlc_claim`.
+	//
+	//  (B) M9e-4 FIX (this milestone) — the HOLDER-HTLC claim on an ANCHOR taproot
+	//      channel is ZERO-fee, so it routes through the EXTERNAL-FUNDING / CPFP bump
+	//      path: monitor emits `BumpTransactionEvent::HTLCResolution`, and
+	//      `BumpTransactionEventHandler` (events/bump_transaction/mod.rs ~L1197) signs the
+	//      2nd-level HTLC tx. Before M9e-4 it signed via the ECDSA
+	//      `EcdsaChannelSigner::sign_holder_htlc_transaction` (emits a P2WSH ECDSA sig)
+	//      + `HTLCDescriptor::tx_input_witness` (P2WSH, no taproot branch) → an INVALID
+	//      witness over the taproot HTLC tapscript output → validating signer panics
+	//      `IncorrectSignature`. M9e-4 routes it through
+	//      `sign_holder_htlc_transaction_taproot` + `HTLCDescriptor::taproot_tx_input_witness`
+	//      (the counterparty Schnorr sig now travels on the descriptor as
+	//      `counterparty_sig_taproot`), mirroring the malleable path at
+	//      `chain::package::get_maybe_signed_htlc_tx`. This is QU!D-critical: simple-taproot
+	//      channels are ALWAYS anchor channels (M9g), so this is the force-close HTLC-claim
+	//      path for any in-flight swap HTLC — a swap mid-flight when the channel
+	//      force-closes would otherwise be unclaimable ⇒ BTC loss.
+	//
+	// POSITIVE assertion (M9e-4): this test DRIVES the HTLCResolution bump handler (the
+	// previously-broken path) and asserts it produces a VALID taproot script-path
+	// 2nd-level HTLC witness (Schnorr sigs + preimage + tapleaf + 65-byte control block),
+	// no panic. Before the fix this handler call panicked `IncorrectSignature`.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	taproot_cfg.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	taproot_cfg.manually_accept_inbound_channels = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+
+	// node 1 needs an on-chain UTXO reserve to fund the CPFP children (anchor + HTLC).
+	let coinbase_tx = provide_anchor_reserves(&nodes);
+
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 400_000_000);
+	let chan_id = channel_ready.channel_id;
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "must be simple-taproot");
+	assert!(chan_type.supports_anchors_zero_fee_htlc_tx(), "must be an anchor channel");
+
+	// node 0 -> node 1 HTLC, HELD: node 1 knows the preimage so it will build an
+	// HTLC-success claim against its own commitment after force-closing.
+	let (preimage, payment_hash, ..) = route_payment(&nodes[0], &[&nodes[1]], 3_000_000);
+	nodes[1].node.claim_funds(preimage);
+	expect_payment_claimed!(nodes[1], payment_hash, 3_000_000);
+	check_added_monitors(&nodes[1], 1);
+	let _ = nodes[1].node.get_and_clear_pending_msg_events();
+
+	// node 1 force-closes. An anchor-channel force-close does NOT broadcast the
+	// commitment directly; it emits a `ChannelClose` BumpTransaction event so the
+	// commitment is CPFP'd via the anchor.
+	let message = "taproot anchor cpfp htlc claim".to_owned();
+	nodes[1]
+		.node
+		.force_close_broadcasting_latest_txn(&chan_id, &node_a_id, message.clone())
+		.unwrap();
+	check_added_monitors(&nodes[1], 1);
+	let reason = ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
+	check_closed_event!(nodes[1], 1, reason, [node_a_id], 1_000_000);
+	let _ = nodes[1].node.get_and_clear_pending_msg_events();
+
+	// (A) COMMITMENT anchor CPFP: the force-close emits a ChannelClose bump event whose
+	// anchor descriptor carries the simple-taproot per-commitment point, and the handler
+	// produces an anchor-spending child that lets the commitment confirm.
+	let bump_events = nodes[1].chain_monitor.chain_monitor.get_and_clear_pending_events();
+	let mut saw_channel_close_bump = false;
+	for ev in &bump_events {
+		if let Event::BumpTransaction(be) = ev {
+			if matches!(be, crate::events::bump_transaction::BumpTransactionEvent::ChannelClose { .. }) {
+				saw_channel_close_bump = true;
+			}
+			nodes[1].bump_tx_handler.handle_event(be);
+		}
+	}
+	assert!(saw_channel_close_bump, "anchor force-close must emit a ChannelClose CPFP bump event");
+
+	// Pull the CPFP-anchored commitment out of the broadcaster and confirm it.
+	let broadcast = nodes[1].tx_broadcaster.txn_broadcast();
+	let commitment_tx = broadcast
+		.iter()
+		.find(|tx| tx.output.len() >= 3 && tx.output.iter().filter(|o| o.script_pubkey.is_p2tr()).count() >= 3)
+		.expect("holder commitment with taproot to_local/to_remote/HTLC outputs")
+		.clone();
+	mine_transaction(&nodes[1], &commitment_tx);
+	let _ = &coinbase_tx;
+	// Advance to the HTLC's claim height; the held-preimage success claim becomes due.
+	connect_blocks(&nodes[1], TEST_FINAL_CLTV + crate::chain::package::LOW_FREQUENCY_BUMP_INTERVAL);
+
+	// (B) M9e-4 POSITIVE: the monitor emits an HTLCResolution bump event for the zero-fee
+	// taproot 2nd-level HTLC tx — proving the anchor-channel HTLC claim routes through the
+	// EXTERNAL-FUNDING / CPFP bump handler (NOT the taproot-aware malleable package path).
+	// DRIVE the handler (the previously-broken path) and assert it produces a VALID taproot
+	// script-path witness.
+	let mut saw_htlc_resolution = false;
+	for _ in 0..6 {
+		let evs = nodes[1].chain_monitor.chain_monitor.get_and_clear_pending_events();
+		for ev in &evs {
+			if let Event::BumpTransaction(
+				be @ crate::events::bump_transaction::BumpTransactionEvent::HTLCResolution { .. },
+			) = ev
+			{
+				saw_htlc_resolution = true;
+				// Pre-M9e-4 this call panicked `IncorrectSignature` (ECDSA sig over a
+				// taproot script-path output). Post-fix it must complete and broadcast a
+				// valid taproot 2nd-level HTLC tx.
+				nodes[1].bump_tx_handler.handle_event(be);
+			}
+		}
+		if saw_htlc_resolution {
+			break;
+		}
+		nodes[1].chain_monitor.chain_monitor.rebroadcast_pending_claims();
+		connect_blocks(&nodes[1], crate::chain::package::LOW_FREQUENCY_BUMP_INTERVAL);
+	}
+	assert!(
+		saw_htlc_resolution,
+		"§10 #4: anchor+taproot HTLC claim must route through the external-funding HTLCResolution \
+		 bump path",
+	);
+
+	// The driven bump handler must have broadcast an HTLC-claim tx spending the
+	// commitment's taproot HTLC output via a VALID script-path witness: ends with a
+	// 65-byte control block (`(cb[0] & 0xfe) == 0xc0`) and carries the 32-byte preimage
+	// (success leaf) — the same shape the malleable-path claim produces. An ECDSA/P2WSH
+	// witness (the pre-fix bug) would have neither (and the handler would have panicked).
+	let commitment_txid = commitment_tx.compute_txid();
+	let post_txn = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clone();
+	let htlc_claim = post_txn.iter().find(|tx| {
+		tx.input.iter().enumerate().any(|(i, inp)| {
+			inp.previous_output.txid == commitment_txid && {
+				let w = tx.input[i].witness.to_vec();
+				!w.is_empty()
+					&& w.last().map_or(false, |cb| cb.len() == 65 && (cb[0] & 0xfe) == 0xc0)
+					&& w.iter().any(|e| e.len() == 32)
+			}
+		})
+	});
+	assert!(
+		htlc_claim.is_some(),
+		"M9e-4: the CPFP bump handler must produce a VALID taproot script-path 2nd-level \
+		 HTLC witness for the anchor-channel holder-HTLC claim (got none / wrong witness)",
+	);
+}
+
+#[test]
+fn test_simple_taproot_channel_reconnect_nonce_resync() {
+	// M9d (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9d): MuSig2 verification nonces are
+	// EPHEMERAL — forgotten on a dropped connection (spec §1) — and must be re-sent
+	// fresh on reconnect via `channel_reestablish`'s `next_local_nonce`. Always-on
+	// hop/LP daemons reconnect constantly; without resync the next
+	// `commitment_signed` has NO counterparty pubnonce → the partial-sign panics/fails
+	// and the channel breaks.
+	//
+	// This exercises the NON-happy reconnect path the green open/coop-close + htlc
+	// tests cannot prove (they never go offline): open → exchange a commitment
+	// (route+claim a payment) → DISCONNECT both peers mid-channel → reconnect (drives
+	// `channel_reestablish` both ways, carrying each side's fresh holder nonce) → a
+	// SUBSEQUENT payment (a full `commitment_signed`/`revoke_and_ack` round)
+	// SUCCEEDS. Before the fix `channel_reestablish` carried no nonce, so post-
+	// reconnect `cur_counterparty_taproot_nonce` was the stale pre-disconnect one and
+	// the second payment's commitment_signed would fail.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	taproot_cfg.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	taproot_cfg.manually_accept_inbound_channels = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
+	let chan_id = channel_ready.channel_id;
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "must be a simple-taproot channel");
+
+	// FIRST payment: a normal taproot commitment dance BEFORE any disconnect (proves
+	// the channel signs fine while both peers stay online).
+	let (preimage_1, ..) = route_payment(&nodes[0], &[&nodes[1]], 50_000_000);
+	claim_payment(&nodes[0], &[&nodes[1]], preimage_1);
+
+	// DISCONNECT both peers mid-channel. Per spec §1 each side now FORGETS its MuSig2
+	// verification nonce; the stored `cur_counterparty_taproot_nonce` is stale.
+	nodes[0].node.peer_disconnected(node_b_id);
+	nodes[1].node.peer_disconnected(node_a_id);
+
+	// RECONNECT: drive `channel_reestablish` BOTH ways. With the M9d fix each
+	// reestablish carries the sender's FRESH holder verification nonce
+	// (`next_local_nonce`); the receive handler stores it as the new
+	// `cur_counterparty_taproot_nonce`.
+	connect_nodes(&nodes[0], &nodes[1]);
+	let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
+	let reestablish_2 = get_chan_reestablish_msgs!(nodes[1], nodes[0]);
+	assert_eq!(reestablish_1.len(), 1);
+	assert_eq!(reestablish_2.len(), 1);
+
+	// ASSERT the resync transport is actually present: a simple-taproot (unspliced)
+	// `channel_reestablish` MUST carry a single fresh `next_local_nonce` (and NOT the
+	// spliced map). This is the field that was missing pre-M9d.
+	assert!(
+		reestablish_1[0].next_local_nonce.is_some(),
+		"M9d: node 0's channel_reestablish must carry a fresh next_local_nonce"
+	);
+	assert!(
+		reestablish_1[0].next_local_nonces.is_empty(),
+		"unspliced channel uses the single next_local_nonce, not the map"
+	);
+	assert!(
+		reestablish_2[0].next_local_nonce.is_some(),
+		"M9d: node 1's channel_reestablish must carry a fresh next_local_nonce"
+	);
+
+	// Feed each reestablish into the peer (stores the fresh counterparty nonce) and
+	// drain the (empty, for this no-pending-update state) responses.
+	for msg in reestablish_1 {
+		nodes[1].node.handle_channel_reestablish(node_a_id, &msg);
+	}
+	for msg in reestablish_2 {
+		nodes[0].node.handle_channel_reestablish(node_b_id, &msg);
+	}
+	// Both sides re-send channel_ready on reconnect (unannounced channel); drain.
+	let _ = nodes[0].node.get_and_clear_pending_msg_events();
+	let _ = nodes[1].node.get_and_clear_pending_msg_events();
+
+	// THE PROOF: a SECOND payment after reconnect drives a fresh taproot
+	// `commitment_signed`/`revoke_and_ack` round in BOTH directions, partial-signing
+	// against the nonces re-exchanged above. Pre-M9d this would fail (no/stale
+	// counterparty pubnonce). Send 0→1 and 1→0 to exercise both signing directions.
+	let (preimage_2, ..) = route_payment(&nodes[0], &[&nodes[1]], 25_000_000);
+	claim_payment(&nodes[0], &[&nodes[1]], preimage_2);
+	let (preimage_3, ..) = route_payment(&nodes[1], &[&nodes[0]], 10_000_000);
+	claim_payment(&nodes[1], &[&nodes[0]], preimage_3);
+
+	assert!(!nodes[0].node.list_channels().is_empty(), "channel survived the reconnect");
+	assert!(!nodes[1].node.list_channels().is_empty(), "channel survived the reconnect");
+}
+
+#[test]
+fn test_simple_taproot_channel_reconnect_mid_signing() {
+	// §10 audit area 8 (reconnect MID-SIGNING): disconnect AFTER a commitment_signed is
+	// sent but BEFORE the revoke_and_ack, then reconnect. The M9d nonce resync
+	// (channel_reestablish next_local_nonce) must compose with the STANDARD LN
+	// retransmit of the un-acked commitment_signed without a nonce mismatch or
+	// double-sign. The deterministic per-height MuSig2 nonce is what makes this sound:
+	// the retransmitted commitment_signed reproduces the IDENTICAL partial (same height,
+	// same message, same re-derivable nonce), and the reestablish re-advertises the
+	// IDENTICAL nonce at the same height — but only an end-to-end test exercises the
+	// retransmit-after-resync path. The existing reconnect test reconnects from a QUIET
+	// state (no in-flight signing); this one reconnects mid-commitment.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	taproot_cfg.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	taproot_cfg.manually_accept_inbound_channels = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
+	let chan_id = channel_ready.channel_id;
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "must be a simple-taproot channel");
+
+	// Drive an HTLC up to (but not past) the commitment_signed → revoke_and_ack point,
+	// then disconnect so the round is left INCOMPLETE across the reconnect.
+	let (route, payment_hash, payment_preimage, payment_secret) =
+		get_route_and_payment_hash!(nodes[0], nodes[1], 50_000_000);
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(&nodes[0], 1);
+
+	let updates = get_htlc_update_msgs!(nodes[0], node_b_id);
+	// Deliver the update_add + commitment_signed to node 1 — node 1 will reply with its
+	// revoke_and_ack + commitment_signed, but we DISCONNECT before completing the round,
+	// leaving an in-flight, un-acked commitment on both sides (mid-signing).
+	nodes[1].node.handle_update_add_htlc(node_a_id, &updates.update_add_htlcs[0]);
+	nodes[1].node.handle_commitment_signed_batch_test(node_a_id, &updates.commitment_signed);
+	check_added_monitors(&nodes[1], 1);
+	// Node 1 now has a pending RAA + commitment_signed to send; drop the connection
+	// before any of it is exchanged.
+	let _ = nodes[1].node.get_and_clear_pending_msg_events();
+
+	nodes[0].node.peer_disconnected(node_b_id);
+	nodes[1].node.peer_disconnected(node_a_id);
+
+	// Reconnect: the canonical reconnect helper drives channel_reestablish BOTH ways
+	// (carrying each side's fresh M9d holder nonce) AND the standard retransmit of the
+	// un-acked HTLC-add/commitment. With taproot, the retransmitted commitment_signed's
+	// MuSig2 partial must still verify against the re-advertised nonce.
+	// State after the disconnect (mirrors `do_test_drop_messages_peer_disconnect`'s
+	// messages_delivered==3 case): node 0 delivered update_add + commitment_signed and
+	// is owed node 1's RAA + commitment_signed back; on reconnect node 0 re-sends its
+	// commitment_signed and still owes its own RAA.
+	let mut reconnect_args = ReconnectArgs::new(&nodes[0], &nodes[1]);
+	reconnect_args.pending_responding_commitment_signed.0 = true;
+	reconnect_args.pending_raa.0 = true;
+	reconnect_nodes(reconnect_args);
+
+	// The HTLC must now settle cleanly over the reconnected, mid-signing-recovered
+	// channel — proving resync + retransmit composed without a nonce mismatch.
+	expect_and_process_pending_htlcs(&nodes[1], false);
+	expect_payment_claimable!(nodes[1], payment_hash, payment_secret, 50_000_000);
+	claim_payment(&nodes[0], &[&nodes[1]], payment_preimage);
+
+	assert!(!nodes[0].node.list_channels().is_empty(), "channel survived mid-signing reconnect");
+	assert!(!nodes[1].node.list_channels().is_empty(), "channel survived mid-signing reconnect");
+}
+
+#[test]
+fn test_simple_taproot_channel_data_loss_protect_recovery_proof() {
+	// M9d GAP 2 (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9d, RECOVERY-REVIEW gate #5):
+	// CONFIRM that `option_data_loss_protect` flows correctly for a SIMPLE-TAPROOT
+	// channel. data_loss_protect keys on the per-commitment SECRET / point, not the
+	// output script type, so the message-level recovery proof is script-type-agnostic
+	// and works unchanged for taproot. This asserts it explicitly rather than
+	// assuming it.
+	//
+	// Verdict (documented): the data_loss_protect *fields* in `channel_reestablish`
+	// (`your_last_per_commitment_secret`, `my_current_per_commitment_point`) are
+	// produced + consumed identically for taproot — `my_current_per_commitment_point`
+	// is a vestigial dummy for ALL `option_static_remotekey` channels (simple-taproot
+	// is built ON static_remotekey), so a recovering wallet's `to_remote` balance is a
+	// STATIC-key output it can always reconstruct, not one keyed by a revealed point.
+	// No taproot-specific change to the data_loss_protect message path is needed.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	taproot_cfg.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	taproot_cfg.manually_accept_inbound_channels = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_cfg.clone()), Some(taproot_cfg.clone())],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	let (channel_ready, _funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 500_000_000);
+	let chan_id = channel_ready.channel_id;
+	let chan_type = get_channel_type_features!(nodes[0], nodes[1], chan_id);
+	assert!(chan_type.supports_simple_taproot(), "must be a simple-taproot channel");
+	// data_loss_protect's recovery model relies on static_remotekey (the to_remote
+	// balance is a static-key output, reconstructable without the revealed point).
+	// Simple-taproot is BUILT on static_remotekey, so the recovery model holds.
+	assert!(
+		chan_type.supports_static_remote_key(),
+		"simple-taproot must carry static_remotekey (data_loss_protect recovery basis)"
+	);
+
+	// Advance commitment state so each side HAS a previous remote per-commitment
+	// secret to reveal in the data_loss_protect (`your_last_per_commitment_secret`).
+	let (preimage, ..) = route_payment(&nodes[0], &[&nodes[1]], 50_000_000);
+	claim_payment(&nodes[0], &[&nodes[1]], preimage);
+
+	// Disconnect + reconnect to drive `channel_reestablish` (which carries the
+	// data_loss_protect fields).
+	nodes[0].node.peer_disconnected(node_b_id);
+	nodes[1].node.peer_disconnected(node_a_id);
+	connect_nodes(&nodes[0], &nodes[1]);
+	let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
+	let reestablish_2 = get_chan_reestablish_msgs!(nodes[1], nodes[0]);
+	assert_eq!(reestablish_1.len(), 1);
+	assert_eq!(reestablish_2.len(), 1);
+
+	// (1) The DATA-LOSS-PROTECT PROOF is present and real for the taproot channel:
+	// after a completed commitment, `your_last_per_commitment_secret` is the genuine
+	// revealed secret (NOT the all-zero "no previous secret" sentinel).
+	assert_ne!(
+		reestablish_1[0].your_last_per_commitment_secret, [0u8; 32],
+		"taproot channel_reestablish must carry the real data_loss_protect secret"
+	);
+	assert_ne!(
+		reestablish_2[0].your_last_per_commitment_secret, [0u8; 32],
+		"taproot channel_reestablish must carry the real data_loss_protect secret"
+	);
+
+	// (2) The peer ACCEPTS the data_loss_protect proof (the secret matches the
+	// expected per-commitment point at channel.rs's reestablish verification). If the
+	// proof were malformed/rejected the handler would close the channel; feeding both
+	// reestablish messages without a closure event confirms the proof verified — the
+	// data_loss_protect consume path is correct for taproot.
+	for msg in reestablish_1 {
+		nodes[1].node.handle_channel_reestablish(node_a_id, &msg);
+	}
+	for msg in reestablish_2 {
+		nodes[0].node.handle_channel_reestablish(node_b_id, &msg);
+	}
+	let _ = nodes[0].node.get_and_clear_pending_msg_events();
+	let _ = nodes[1].node.get_and_clear_pending_msg_events();
+
+	// Channel is intact (no data_loss_protect-triggered closure); recovery proof OK.
+	assert!(!nodes[0].node.list_channels().is_empty());
+	assert!(!nodes[1].node.list_channels().is_empty());
 }

@@ -46,7 +46,6 @@ use bitcoin::{consensus, Sequence, TxIn, Weight, Witness};
 use dnssec_prover::rr::Name;
 
 use crate::chain::ClaimId;
-#[cfg(taproot)]
 use crate::ln::msgs::PartialSignatureWithNonce;
 use crate::ln::msgs::{DecodeError, SerialId};
 use crate::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
@@ -1084,6 +1083,7 @@ impl Readable for Vec<u8> {
 }
 
 impl_for_vec!(ecdsa::Signature);
+impl_for_vec!(schnorr::Signature);
 impl_for_vec!(crate::chain::channelmonitor::ChannelMonitorUpdate);
 impl_for_vec!(crate::ln::channelmanager::MonitorUpdateCompletionAction);
 impl_for_vec!(crate::ln::channelmanager::PaymentClaimDetails);
@@ -1193,22 +1193,19 @@ impl Readable for SecretKey {
 	}
 }
 
-#[cfg(taproot)]
-impl Writeable for musig2::types::PublicNonce {
+impl Writeable for musig2::PubNonce {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		self.serialize().write(w)
 	}
 }
 
-#[cfg(taproot)]
-impl Readable for musig2::types::PublicNonce {
+impl Readable for musig2::PubNonce {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let buf: [u8; PUBLIC_KEY_SIZE * 2] = Readable::read(r)?;
-		musig2::types::PublicNonce::from_slice(&buf).map_err(|_| DecodeError::InvalidValue)
+		musig2::PubNonce::from_bytes(&buf).map_err(|_| DecodeError::InvalidValue)
 	}
 }
 
-#[cfg(taproot)]
 impl Writeable for PartialSignatureWithNonce {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		self.0.serialize().write(w)?;
@@ -1216,13 +1213,12 @@ impl Writeable for PartialSignatureWithNonce {
 	}
 }
 
-#[cfg(taproot)]
 impl Readable for PartialSignatureWithNonce {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let partial_signature_buf: [u8; SECRET_KEY_SIZE] = Readable::read(r)?;
-		let partial_signature = musig2::types::PartialSignature::from_slice(&partial_signature_buf)
+		let partial_signature = musig2::PartialSignature::from_slice(&partial_signature_buf)
 			.map_err(|_| DecodeError::InvalidValue)?;
-		let public_nonce: musig2::types::PublicNonce = Readable::read(r)?;
+		let public_nonce: musig2::PubNonce = Readable::read(r)?;
 		Ok(PartialSignatureWithNonce(partial_signature, public_nonce))
 	}
 }

@@ -83,6 +83,9 @@
 //!   (see [BOLT PR #1160](https://github.com/lightning/bolts/pull/1160) for more information).
 //! - `HtlcHold` - requires/supports holding HTLCs and forwarding on receipt of an onion message
 //!   (see [BOLT-2](https://github.com/lightning/bolts/pull/989/files) for more information).
+//! - `SimpleTaproot` - requires/supports simple taproot channels (`option_simple_taproot`, bits
+//!   80/81; also a channel type feature bit for explicit negotiation)
+//!   (see [bolt-simple-taproot.md](https://github.com/lightning/bolts/blob/master/bolt-simple-taproot.md) for more information).
 //!
 //! LDK knows about the following features, but does not support them:
 //! - `AnchorsNonzeroFeeHtlcTx` - the initial version of anchor outputs, which was later found to be
@@ -167,8 +170,12 @@ mod sealed {
 			ZeroConf,
 			// Byte 7
 			Trampoline | SimpleClose | SpliceProduction | SplicePrototype,
-			// Byte 8 - 16
-			,,,,,,,,,
+			// Byte 8 - 9
+			,,
+			// Byte 10
+			SimpleTaproot,
+			// Byte 11 - 16
+			,,,,,,
 			// Byte 17
 			AnchorZeroFeeCommitmentsStaging,
 			// Byte 18
@@ -196,8 +203,12 @@ mod sealed {
 			ZeroConf | Keysend,
 			// Byte 7
 			Trampoline | SimpleClose | SpliceProduction | SplicePrototype,
-			// Byte 8 - 16
-			,,,,,,,,,
+			// Byte 8 - 9
+			,,
+			// Byte 10
+			SimpleTaproot,
+			// Byte 11 - 16
+			,,,,,,
 			// Byte 17
 			AnchorZeroFeeCommitmentsStaging,
 			// Byte 18
@@ -267,8 +278,12 @@ mod sealed {
 		SCIDPrivacy,
 		// Byte 6
 		ZeroConf,
-		// Byte 7 - 16
-		,,,,,,,,,,
+		// Byte 7 - 9
+		,,,
+		// Byte 10
+		SimpleTaproot,
+		// Byte 11 - 16
+		,,,,,,
 		// Byte 17
 		AnchorZeroFeeCommitmentsStaging,
 	]);
@@ -703,6 +718,17 @@ mod sealed {
 		clear_splicing_production,
 		supports_splicing_production,
 		requires_splicing_production
+	);
+	define_feature!(
+		81,
+		SimpleTaproot,
+		[InitContext, NodeContext, ChannelTypeContext],
+		"Feature flags for `option_simple_taproot` (simple taproot channels). Bits 80/81 per the merged lightning/bolts `bolt-simple-taproot.md`.",
+		set_simple_taproot_optional,
+		set_simple_taproot_required,
+		clear_simple_taproot,
+		supports_simple_taproot,
+		requires_simple_taproot
 	);
 	// By default, allocate enough bytes to cover up to Splice. Update this as new features are
 	// added which we expect to appear commonly across contexts.
@@ -1333,6 +1359,52 @@ pub(crate) fn unset_features_mask_at_position<T: sealed::Context>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn simple_taproot_feature_bits_80_81() {
+		// `option_simple_taproot` is bits 80/81 per the merged `bolt-simple-taproot.md`:
+		// optional (odd) = 81, required (even) = 80. Byte offset 80/8 = 10.
+		assert_eq!(<sealed::InitContext as sealed::SimpleTaproot>::ODD_BIT, 81);
+		assert_eq!(<sealed::InitContext as sealed::SimpleTaproot>::EVEN_BIT, 80);
+		assert_eq!(<sealed::InitContext as sealed::SimpleTaproot>::BYTE_OFFSET, 10);
+
+		// Optional advertisement sets bit 81 (byte 10, local bit 1 => 0b0000_0010).
+		let mut init = InitFeatures::empty();
+		assert!(!init.supports_simple_taproot());
+		assert!(!init.requires_simple_taproot());
+		init.set_simple_taproot_optional();
+		assert!(init.supports_simple_taproot());
+		assert!(!init.requires_simple_taproot());
+		assert_eq!(init.le_flags().len(), 11);
+		assert_eq!(init.le_flags()[10], 0b0000_0010); // bit 81 set
+
+		// Parsing flags with bit 81 set is recognized (not an unknown bit).
+		let parsed = InitFeatures::from_le_bytes(init.le_flags().to_vec());
+		assert!(parsed.supports_simple_taproot());
+		assert!(!parsed.supports_unknown_bits());
+
+		// Required advertisement sets bit 80 (byte 10, local bit 0 => 0b0000_0001).
+		let mut req = NodeFeatures::empty();
+		req.set_simple_taproot_required();
+		assert!(req.supports_simple_taproot());
+		assert!(req.requires_simple_taproot());
+		assert_eq!(req.le_flags()[10], 0b0000_0001); // bit 80 set
+	}
+
+	#[test]
+	fn channel_type_features_roundtrip_simple_taproot() {
+		// `option_simple_taproot` is also a channel-type feature bit for explicit negotiation.
+		let mut ct = ChannelTypeFeatures::empty();
+		ct.set_simple_taproot_required();
+		assert!(ct.supports_simple_taproot());
+		assert!(ct.requires_simple_taproot());
+		// Round-trips through the byte encoding without being seen as an unknown bit.
+		let parsed = ChannelTypeFeatures::from_le_bytes(ct.le_flags().to_vec());
+		assert_eq!(parsed, ct);
+		assert!(parsed.requires_simple_taproot());
+		assert!(!parsed.supports_unknown_bits());
+		assert_eq!(parsed.le_flags()[10], 0b0000_0001); // bit 80 set
+	}
 
 	#[test]
 	fn sanity_test_unknown_bits() {

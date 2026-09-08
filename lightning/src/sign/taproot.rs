@@ -5,7 +5,7 @@ use bitcoin::secp256k1;
 use bitcoin::secp256k1::{schnorr::Signature, PublicKey, Secp256k1, SecretKey};
 use bitcoin::transaction::Transaction;
 
-use musig2::types::{PartialSignature, PublicNonce};
+use musig2::{PartialSignature, PubNonce as PublicNonce};
 
 use crate::ln::chan_utils::{
 	ClosingTransaction, CommitmentTransaction, HTLCOutputInCommitment, HolderCommitmentTransaction,
@@ -18,6 +18,23 @@ use crate::types::payment::PaymentPreimage;
 /// Taproot or have argument or return types that differ from the ones an ECDSA signer would be
 /// expected to have.
 pub trait TaprootChannelSigner: ChannelSigner {
+	/// Supply the late-bound per-channel MuSig2 signing context (the counterparty
+	/// funding pubkey + funding amount + the current cooperative-close nonce) for
+	/// a **simple taproot channel** (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §4/§5).
+	///
+	/// The MuSig2 funding key-path bodies need data the rest of this trait surface
+	/// does not pass: the counterparty funding pubkey (to build the per-channel
+	/// `KeyAggContext` → the `0x5120||Q` funding scriptPubKey) and the funding
+	/// amount (committed in the BIP341 key-path sighash). The `ChannelContext`
+	/// nonce-exchange handler calls this once both are known (the channel's
+	/// `channel_transaction_parameters` carry the counterparty parameters + the
+	/// funding outpoint), and again before each cooperative-close partial to
+	/// supply the peer's current closing nonce.
+	///
+	/// The default is a no-op so signers that never participate in a taproot
+	/// channel (or that source this data another way) need not implement it.
+	fn provide_taproot_context(&self, _ctx: crate::sign::TaprootSignerContext) {}
+
 	/// Generate a local nonce pair, which requires committing to ahead of time.
 	/// The counterparty needs the public nonce generated herein to compute a partial signature.
 	fn generate_local_nonce_pair(
@@ -150,6 +167,36 @@ pub trait TaprootChannelSigner: ChannelSigner {
 	fn partially_sign_closing_transaction(
 		&self, closing_tx: &ClosingTransaction, secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<PartialSignature, ()>;
+
+	/// Generate OUR public splice nonce for the splice that spends `prev_funding_txid`
+	/// (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9c). The secret nonce is derived at the
+	/// per-splice-unique [`crate::sign::splice_nonce_height`]`(prev_funding_txid)`, so
+	/// two distinct splice txs never reuse a nonce (the §9f-0 funding-key-leak guard).
+	/// Advertised via `splice_init`/`splice_ack` `splice_nonce` so the advertised
+	/// nonce equals the one we sign the shared input with. Default `None`.
+	fn generate_splice_nonce(
+		&self, _prev_funding_txid: &bitcoin::Txid, _secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Option<PublicNonce> {
+		None
+	}
+
+	/// Produce OUR MuSig2 key-path partial (with our pubnonce) over the splice tx's
+	/// shared (old-funding) input, which spends the previous `0x5120 || Q` funding
+	/// output (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9c). Interactive (both parties
+	/// online during splice negotiation), identical machinery to the coop-close
+	/// key-path sign. The secret nonce is the per-splice-unique
+	/// [`crate::sign::splice_nonce_height`]`(prev_funding_txid)`; `counterparty_nonce`
+	/// is the peer's advertised `splice_nonce`; `all_prevouts` lets the BIP341
+	/// key-path sighash commit to every input (a splice tx has > 1 input). The two
+	/// partials are aggregated into the single 64-byte key-path witness by the
+	/// signing session. Default `Err(())` for non-taproot signers.
+	fn partially_sign_splice_shared_input(
+		&self, _tx: &Transaction, _input_index: usize, _all_prevouts: &[bitcoin::TxOut],
+		_counterparty_nonce: PublicNonce, _prev_funding_txid: &bitcoin::Txid,
+		_secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<(PartialSignature, PublicNonce), ()> {
+		Err(())
+	}
 
 	// TODO: sign channel announcement
 }

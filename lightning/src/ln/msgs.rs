@@ -72,13 +72,25 @@ use crate::routing::gossip::{NodeAlias, NodeId};
 /// 21 million * 10^8 * 1000
 pub(crate) const MAX_VALUE_MSAT: u64 = 21_000_000_0000_0000_000;
 
-#[cfg(taproot)]
 /// A partial signature that also contains the Musig2 nonce its signer used
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartialSignatureWithNonce(
-	pub musig2::types::PartialSignature,
-	pub musig2::types::PublicNonce,
+	pub musig2::PartialSignature,
+	pub musig2::PubNonce,
 );
+
+// conduition `musig2::PartialSignature` (= `secp::MaybeScalar`) does not derive
+// `Hash` (the dead arik-so `musig2::types::PartialSignature` did). Several
+// message structs (`funding_signed`, `commitment_signed`, `closing_complete`)
+// derive `Hash` and embed this type, so we provide a manual `Hash` over the
+// canonical 32-byte partial-sig + 66-byte pubnonce serializations (consistent
+// with the derived `PartialEq`/`Eq`, which compare the same underlying values).
+impl core::hash::Hash for PartialSignatureWithNonce {
+	fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+		self.0.serialize().hash(state);
+		self.1.serialize().hash(state);
+	}
+}
 
 /// An error in decoding a message or struct.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -245,6 +257,10 @@ pub struct CommonOpenChannelFields {
 	/// The channel type that this channel will represent. As defined in the latest
 	/// specification, this field is required. However, it is an `Option` for legacy reasons.
 	pub channel_type: Option<ChannelTypeFeatures>,
+	/// For **simple taproot channels** only: the channel initiator's MuSig2
+	/// verification nonce for the first commitment (`next_local_nonce`, TLV type
+	/// 4, 66 bytes — `bolt-simple-taproot.md`). `None` for non-taproot channels.
+	pub next_local_nonce: Option<musig2::PubNonce>,
 }
 
 impl CommonOpenChannelFields {
@@ -373,9 +389,8 @@ pub struct AcceptChannel {
 	pub common_fields: CommonAcceptChannelFields,
 	/// The minimum value unencumbered by HTLCs for the counterparty to keep in the channel
 	pub channel_reserve_satoshis: u64,
-	#[cfg(taproot)]
 	/// Next nonce the channel initiator should use to create a funding output signature against
-	pub next_local_nonce: Option<musig2::types::PublicNonce>,
+	pub next_local_nonce: Option<musig2::PubNonce>,
 }
 
 /// An [`accept_channel2`] message to be sent by or received from the channel accepter.
@@ -410,12 +425,10 @@ pub struct FundingCreated {
 	pub funding_output_index: u16,
 	/// The signature of the channel initiator (funder) on the initial commitment transaction
 	pub signature: Signature,
-	#[cfg(taproot)]
 	/// The partial signature of the channel initiator (funder)
 	pub partial_signature_with_nonce: Option<PartialSignatureWithNonce>,
-	#[cfg(taproot)]
 	/// Next nonce the channel acceptor should use to finalize the funding output signature
-	pub next_local_nonce: Option<musig2::types::PublicNonce>,
+	pub next_local_nonce: Option<musig2::PubNonce>,
 }
 
 /// A [`funding_signed`] message to be sent to or received from a peer.
@@ -429,7 +442,6 @@ pub struct FundingSigned {
 	pub channel_id: ChannelId,
 	/// The signature of the channel acceptor (fundee) on the initial commitment transaction
 	pub signature: Signature,
-	#[cfg(taproot)]
 	/// The partial signature of the channel acceptor (fundee)
 	pub partial_signature_with_nonce: Option<PartialSignatureWithNonce>,
 }
@@ -448,6 +460,11 @@ pub struct ChannelReady {
 	/// The sender will accept payments to be forwarded over this SCID and forward them to this
 	/// messages' recipient.
 	pub short_channel_id_alias: Option<u64>,
+	/// For **simple taproot channels** only: a fresh MuSig2 verification nonce
+	/// (`next_local_nonce`, TLV type 4, 66 bytes — `bolt-simple-taproot.md` §4) the
+	/// counterparty must use when partial-signing the sender's next commitment.
+	/// `None` for non-taproot channels.
+	pub next_local_nonce: Option<musig2::PubNonce>,
 }
 
 /// A randomly chosen number that is used to identify inputs within an interactive transaction
@@ -483,6 +500,13 @@ pub struct SpliceInit {
 	pub funding_pubkey: PublicKey,
 	/// If set, only confirmed inputs added (by the splice acceptor) will be accepted
 	pub require_confirmed_inputs: Option<()>,
+	/// For a **simple-taproot channel** (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9c):
+	/// the sender's 66-byte MuSig2 public nonce for the interactive key-path sign of
+	/// the splice's shared (old-funding) input. The splice analog of `shutdown_nonce`
+	/// — exchanged during the splice handshake, before the splice tx is signed, and
+	/// derived at the per-splice-unique nonce height so two distinct splices never
+	/// reuse a nonce (the §9f-0 funding-key-leak guard). `None` for non-taproot.
+	pub splice_nonce: Option<musig2::PubNonce>,
 }
 
 /// A `splice_ack` message to be received by or sent to the splice initiator.
@@ -499,6 +523,17 @@ pub struct SpliceAck {
 	pub funding_pubkey: PublicKey,
 	/// If set, only confirmed inputs added (by the splice initiator) will be accepted
 	pub require_confirmed_inputs: Option<()>,
+	/// For a **simple-taproot channel** (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9c):
+	/// the acceptor's 66-byte MuSig2 public nonce for the key-path sign of the
+	/// splice's shared (old-funding) input. See [`SpliceInit::splice_nonce`].
+	pub splice_nonce: Option<musig2::PubNonce>,
+	/// For a **simple-taproot channel** (spec §9c): the acceptor's fresh MuSig2
+	/// VERIFICATION nonce for the splice's NEW-funding initial commitment, bound to
+	/// the rotated aggregate `Q'` (the acceptor can compute `Q'` here — it has both
+	/// rotated funding pubkeys). The initiator signs the acceptor's new commitment
+	/// against this nonce. Distinct from `splice_nonce` (which is bound to the OLD
+	/// `Q` for the shared-input spend). `None` for non-taproot channels.
+	pub splice_commitment_nonce: Option<musig2::PubNonce>,
 }
 
 /// A `splice_locked` message to be sent to or received from a peer.
@@ -510,6 +545,19 @@ pub struct SpliceLocked {
 	pub channel_id: ChannelId,
 	/// The ID of the new funding transaction that has been locked
 	pub splice_txid: Txid,
+	/// For a **simple-taproot channel** (spec §9c / §10 audit): the sender's fresh
+	/// MuSig2 VERIFICATION nonce for the FIRST post-splice (non-initial) commitment,
+	/// bound to the rotated aggregate `Q'`. This is the splice analog of
+	/// `channel_ready`'s `next_local_nonce`: the splice-initial `commitment_signed`
+	/// exchange has no `revoke_and_ack` (it revokes no prior state), so it cannot
+	/// advertise the next verification nonce the way a normal round does. Its
+	/// `next_local_nonce` is consumed by the peer's splice-initial REVERSE commitment
+	/// (at the splice height); the FOLLOWING commitment needs a fresh nonce, which is
+	/// advertised here at lock time (the channel cannot transact until the splice is
+	/// locked, so this is in time). Without it both sides reused the splice-height
+	/// nonce for the next commitment ⇒ MuSig2 "bad partial" ⇒ the spliced channel
+	/// could not transact. `None` for non-taproot channels.
+	pub next_local_nonce: Option<musig2::PubNonce>,
 }
 
 /// A [`tx_add_input`] message for adding an input during interactive transaction construction
@@ -593,8 +641,17 @@ pub struct TxSignatures {
 	pub tx_hash: Txid,
 	/// The list of witnesses
 	pub witnesses: Vec<Witness>,
-	/// Optional signature for the shared input -- the previous funding outpoint -- signed by both peers
+	/// Optional signature for the shared input -- the previous funding outpoint -- signed by both peers.
+	/// Used by **legacy P2WSH** splices, where the shared input is a 2-of-2 multisig and each peer's
+	/// ECDSA signature is concatenated into the witness. `None` for a simple-taproot channel, which
+	/// uses [`Self::splice_partial_signature`] instead.
 	pub shared_input_signature: Option<Signature>,
+	/// For a **simple-taproot channel** (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9c): the sender's
+	/// MuSig2 key-path partial (with its 66-byte pubnonce) over the splice tx's shared (old-funding)
+	/// input. Replaces [`Self::shared_input_signature`] (a taproot key-path spend has no 2-of-2
+	/// script witness — the two partials aggregate into ONE 64-byte BIP340 Schnorr witness). `None`
+	/// for non-taproot channels or non-splice interactive txs.
+	pub splice_partial_signature: Option<PartialSignatureWithNonce>,
 }
 
 /// A [`tx_init_rbf`] message which initiates a replacement of the transaction after it's been
@@ -649,6 +706,10 @@ pub struct Shutdown {
 	///
 	/// Must be in one of these forms: P2PKH, P2SH, P2WPKH, P2WSH, P2TR.
 	pub scriptpubkey: ScriptBuf,
+	/// For **simple taproot channels** only: the MuSig2 public nonce this peer will
+	/// use to produce its cooperative-close partial signature (`shutdown_nonce`, TLV
+	/// type 8, 66 bytes — `bolt-simple-taproot.md` §4). `None` for non-taproot.
+	pub shutdown_nonce: Option<musig2::PubNonce>,
 }
 
 /// The minimum and maximum fees which the sender is willing to place on the closing transaction.
@@ -679,6 +740,11 @@ pub struct ClosingSigned {
 	/// The minimum and maximum fees which the sender is willing to accept, provided only by new
 	/// nodes.
 	pub fee_range: Option<ClosingSignedFeeRange>,
+	/// For **simple taproot channels** only: the sender's MuSig2 key-path partial
+	/// signature on the closing transaction together with the public nonce it was
+	/// produced with (`partial_signature_with_nonce`, TLV type 2, 98 bytes). `None`
+	/// for non-taproot channels (which carry the ECDSA `signature` instead).
+	pub partial_signature_with_nonce: Option<PartialSignatureWithNonce>,
 }
 
 /// A [`closing_complete`] message to be sent to or received from a peer.
@@ -866,13 +932,26 @@ pub struct CommitmentSigned {
 	pub channel_id: ChannelId,
 	/// A signature on the commitment transaction
 	pub signature: Signature,
-	/// Signatures on the HTLC transactions
+	/// Signatures on the HTLC transactions (ECDSA, legacy P2WSH channels)
 	pub htlc_signatures: Vec<Signature>,
+	/// BIP340 **Schnorr** signatures on the second-level HTLC transactions for a
+	/// **simple taproot channel** (spec §3 — HTLC sigs are plain Schnorr, only the
+	/// funding spend is MuSig2). Empty for non-taproot channels; for taproot
+	/// channels `htlc_signatures` (ECDSA) is empty and this carries one sig per
+	/// non-dust HTLC, in commitment-output order.
+	pub htlc_partial_signatures: Vec<bitcoin::secp256k1::schnorr::Signature>,
 	/// The funding transaction, to discriminate among multiple pending funding transactions (e.g. in case of splicing)
 	pub funding_txid: Option<Txid>,
-	#[cfg(taproot)]
 	/// The partial Taproot signature on the commitment transaction
 	pub partial_signature_with_nonce: Option<PartialSignatureWithNonce>,
+	/// For a **simple-taproot SPLICE** (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9c):
+	/// the sender's fresh MuSig2 VERIFICATION nonce for its NEW-funding initial
+	/// commitment, bound to the rotated aggregate `Q'`. Carried on the splice's
+	/// initial `commitment_signed` so the receiver can partial-sign the sender's new
+	/// commitment against it (the initiator→acceptor analog of the acceptor's
+	/// `SpliceAck::splice_commitment_nonce`). `None` outside a taproot splice's
+	/// initial commitment.
+	pub next_local_nonce: Option<musig2::PubNonce>,
 }
 
 /// A [`revoke_and_ack`] message to be sent to or received from a peer.
@@ -886,9 +965,8 @@ pub struct RevokeAndACK {
 	pub per_commitment_secret: [u8; 32],
 	/// The next sender-broadcast commitment transaction's per-commitment point
 	pub next_per_commitment_point: PublicKey,
-	#[cfg(taproot)]
 	/// Musig nonce the recipient should use in their next commitment signature message
-	pub next_local_nonce: Option<musig2::types::PublicNonce>,
+	pub next_local_nonce: Option<musig2::PubNonce>,
 	/// A list of `(htlc_id, blinded_path)`. The receiver of this message will use the blinded paths
 	/// as reply paths to [`HeldHtlcAvailable`] onion messages that they send to the often-offline
 	/// receiver of this HTLC. The `htlc_id` is used by the receiver of this message to identify which
@@ -946,6 +1024,23 @@ pub struct ChannelReestablish {
 	///
 	/// Also contains a bitfield indicating which messages should be retransmitted.
 	pub my_current_funding_locked: Option<FundingLocked>,
+	/// For a **simple-taproot channel** (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9d):
+	/// the sender's FRESH MuSig2 verification nonce for its next holder commitment,
+	/// re-sent on reconnect (TLV type 4, 66 bytes). MuSig2 nonces are ephemeral —
+	/// forgotten on a dropped connection (spec §1) — so each side re-advertises a
+	/// fresh deterministic nonce here; the receiver stores it
+	/// (`cur_counterparty_taproot_nonce`) so the post-reconnect `commitment_signed`
+	/// can partial-sign against an exchanged nonce. `None` for non-taproot channels
+	/// (and on spliced channels, where `next_local_nonces` carries one nonce per
+	/// funding scope instead).
+	pub next_local_nonce: Option<musig2::PubNonce>,
+	/// For a **SPLICED simple-taproot channel** (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md`
+	/// §9d): the sender's fresh MuSig2 verification nonces keyed by funding TXID, one
+	/// per active funding scope (BOLT #995 uses a `next_local_nonces` map because a
+	/// splice creates a second funding scope). Re-sent on reconnect like
+	/// `next_local_nonce`. Empty for an unspliced channel (which uses the single
+	/// `next_local_nonce`) and for non-taproot channels.
+	pub next_local_nonces: Vec<(Txid, musig2::PubNonce)>,
 }
 
 /// Information exchanged during channel reestablishment about the next funding from interactive
@@ -2641,12 +2736,6 @@ impl Writeable for AcceptChannel {
 		self.common_fields.delayed_payment_basepoint.write(w)?;
 		self.common_fields.htlc_basepoint.write(w)?;
 		self.common_fields.first_per_commitment_point.write(w)?;
-		#[cfg(not(taproot))]
-		encode_tlv_stream!(w, {
-			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
-			(1, self.common_fields.channel_type, option),
-		});
-		#[cfg(taproot)]
 		encode_tlv_stream!(w, {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
@@ -2675,14 +2764,7 @@ impl LengthReadable for AcceptChannel {
 
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
-		#[cfg(not(taproot))]
-		decode_tlv_stream!(r, {
-			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
-			(1, channel_type, option),
-		});
-		#[cfg(taproot)]
-		let mut next_local_nonce: Option<musig2::types::PublicNonce> = None;
-		#[cfg(taproot)]
+		let mut next_local_nonce: Option<musig2::PubNonce> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
@@ -2708,7 +2790,6 @@ impl LengthReadable for AcceptChannel {
 				channel_type,
 			},
 			channel_reserve_satoshis,
-			#[cfg(taproot)]
 			next_local_nonce,
 		})
 	}
@@ -2806,6 +2887,7 @@ impl_writeable_msg!(SpliceInit, {
 	funding_pubkey,
 }, {
 	(2, require_confirmed_inputs, option), // `splice_init_tlvs`
+	(4, splice_nonce, option), // simple-taproot key-path splice nonce (spec §9c)
 });
 
 impl_writeable_msg!(SpliceAck, {
@@ -2814,12 +2896,16 @@ impl_writeable_msg!(SpliceAck, {
 	funding_pubkey,
 }, {
 	(2, require_confirmed_inputs, option), // `splice_ack_tlvs`
+	(4, splice_nonce, option), // simple-taproot key-path splice nonce (spec §9c)
+	(6, splice_commitment_nonce, option), // Q'-bound new-commitment verification nonce (spec §9c)
 });
 
 impl_writeable_msg!(SpliceLocked, {
 	channel_id,
 	splice_txid,
-}, {});
+}, {
+	(2, next_local_nonce, option), // simple-taproot post-splice next verification nonce (spec §9c / §10 audit)
+});
 
 impl Writeable for TxAddInput {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
@@ -2900,6 +2986,7 @@ impl_writeable_msg!(TxSignatures, {
 	witnesses,
 }, {
 	(0, shared_input_signature, option), // `signature`
+	(2, splice_partial_signature, option), // simple-taproot key-path splice partial (spec §9c)
 });
 
 impl_writeable_msg!(TxInitRbf, {
@@ -2936,6 +3023,8 @@ impl_writeable_msg!(ChannelReestablish, {
 	my_current_per_commitment_point,
 }, {
 	(1, next_funding, option),
+	(3, next_local_nonces, optional_vec), // simple-taproot reconnect nonce resync, spliced map by funding-txid (spec §9d)
+	(4, next_local_nonce, option), // simple-taproot reconnect verification-nonce resync (spec §9d)
 	(5, my_current_funding_locked, option),
 });
 
@@ -2951,7 +3040,10 @@ impl_writeable!(FundingLocked, {
 
 impl_writeable_msg!(ClosingSigned,
 	{ channel_id, fee_satoshis, signature },
-	{ (1, fee_range, option) }
+	{
+		(1, fee_range, option),
+		(2, partial_signature_with_nonce, option)
+	}
 );
 
 impl_writeable_msg!(ClosingComplete,
@@ -2977,16 +3069,6 @@ impl_writeable!(ClosingSignedFeeRange, {
 	max_fee_satoshis
 });
 
-#[cfg(not(taproot))]
-impl_writeable_msg!(CommitmentSigned, {
-	channel_id,
-	signature,
-	htlc_signatures
-}, {
-	(1, funding_txid, option),
-});
-
-#[cfg(taproot)]
 impl_writeable_msg!(CommitmentSigned, {
 	channel_id,
 	signature,
@@ -2994,6 +3076,8 @@ impl_writeable_msg!(CommitmentSigned, {
 }, {
 	(1, funding_txid, option),
 	(2, partial_signature_with_nonce, option),
+	(3, htlc_partial_signatures, optional_vec),
+	(4, next_local_nonce, option), // simple-taproot splice Q'-bound verification nonce (spec §9c)
 });
 
 impl_writeable!(DecodedOnionErrorPacket, {
@@ -3002,14 +3086,6 @@ impl_writeable!(DecodedOnionErrorPacket, {
 	pad
 });
 
-#[cfg(not(taproot))]
-impl_writeable_msg!(FundingCreated, {
-	temporary_channel_id,
-	funding_txid,
-	funding_output_index,
-	signature
-}, {});
-#[cfg(taproot)]
 impl_writeable_msg!(FundingCreated, {
 	temporary_channel_id,
 	funding_txid,
@@ -3020,13 +3096,6 @@ impl_writeable_msg!(FundingCreated, {
 	(4, next_local_nonce, option)
 });
 
-#[cfg(not(taproot))]
-impl_writeable_msg!(FundingSigned, {
-	channel_id,
-	signature
-}, {});
-
-#[cfg(taproot)]
 impl_writeable_msg!(FundingSigned, {
 	channel_id,
 	signature
@@ -3039,6 +3108,7 @@ impl_writeable_msg!(ChannelReady, {
 	next_per_commitment_point,
 }, {
 	(1, short_channel_id_alias, option),
+	(4, next_local_nonce, option),
 });
 
 pub(crate) fn write_features_up_to_13<W: Writer>(
@@ -3113,6 +3183,7 @@ impl Writeable for OpenChannel {
 		encode_tlv_stream!(w, {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
+			(4, self.common_fields.next_local_nonce, option),
 		});
 		Ok(())
 	}
@@ -3141,9 +3212,11 @@ impl LengthReadable for OpenChannel {
 
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
+		let mut next_local_nonce: Option<musig2::PubNonce> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
+			(4, next_local_nonce, option),
 		});
 		Ok(OpenChannel {
 			common_fields: CommonOpenChannelFields {
@@ -3165,6 +3238,7 @@ impl LengthReadable for OpenChannel {
 				channel_flags,
 				shutdown_scriptpubkey,
 				channel_type,
+				next_local_nonce,
 			},
 			push_msat,
 			channel_reserve_satoshis,
@@ -3197,6 +3271,7 @@ impl Writeable for OpenChannelV2 {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
 			(2, self.require_confirmed_inputs, option),
+			(4, self.common_fields.next_local_nonce, option),
 		});
 		Ok(())
 	}
@@ -3227,10 +3302,12 @@ impl LengthReadable for OpenChannelV2 {
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
 		let mut require_confirmed_inputs: Option<()> = None;
+		let mut next_local_nonce: Option<musig2::PubNonce> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
 			(2, require_confirmed_inputs, option),
+			(4, next_local_nonce, option),
 		});
 		Ok(OpenChannelV2 {
 			common_fields: CommonOpenChannelFields {
@@ -3252,6 +3329,7 @@ impl LengthReadable for OpenChannelV2 {
 				channel_flags,
 				shutdown_scriptpubkey,
 				channel_type,
+				next_local_nonce,
 			},
 			funding_feerate_sat_per_1000_weight,
 			locktime,
@@ -3261,16 +3339,6 @@ impl LengthReadable for OpenChannelV2 {
 	}
 }
 
-#[cfg(not(taproot))]
-impl_writeable_msg!(RevokeAndACK, {
-	channel_id,
-	per_commitment_secret,
-	next_per_commitment_point
-}, {
-	(75537, release_htlc_message_paths, optional_vec)
-});
-
-#[cfg(taproot)]
 impl_writeable_msg!(RevokeAndACK, {
 	channel_id,
 	per_commitment_secret,
@@ -3283,7 +3351,9 @@ impl_writeable_msg!(RevokeAndACK, {
 impl_writeable_msg!(Shutdown, {
 	channel_id,
 	scriptpubkey
-}, {});
+}, {
+	(8, shutdown_nonce, option)
+});
 
 impl_writeable_msg!(UpdateFailHTLC, {
 	channel_id,
@@ -4421,6 +4491,8 @@ mod tests {
 			my_current_per_commitment_point: public_key,
 			next_funding: None,
 			my_current_funding_locked: None,
+			next_local_nonce: None,
+			next_local_nonces: Vec::new(),
 		};
 
 		let encoded_value = cr.encode();
@@ -4476,6 +4548,8 @@ mod tests {
 				retransmit_flags: 1,
 			}),
 			my_current_funding_locked: None,
+			next_local_nonce: None,
+			next_local_nonces: Vec::new(),
 		};
 
 		let encoded_value = cr.encode();
@@ -4535,6 +4609,8 @@ mod tests {
 				),
 				retransmit_flags: 1,
 			}),
+			next_local_nonce: None,
+			next_local_nonces: Vec::new(),
 		};
 
 		let encoded_value = cr.encode();
@@ -4940,6 +5016,7 @@ mod tests {
 				} else {
 					None
 				},
+				next_local_nonce: None,
 			},
 			push_msat: 2536655962884945560,
 			channel_reserve_satoshis: 8665828695742877976,
@@ -5048,6 +5125,7 @@ mod tests {
 				} else {
 					None
 				},
+				next_local_nonce: None,
 			},
 			funding_feerate_sat_per_1000_weight: 821716,
 			locktime: 305419896,
@@ -5215,7 +5293,6 @@ mod tests {
 				channel_type: None,
 			},
 			channel_reserve_satoshis: 3608586615801332854,
-			#[cfg(taproot)]
 			next_local_nonce: None,
 		};
 		let encoded_value = accept_channel.encode();
@@ -5382,9 +5459,7 @@ mod tests {
 			.unwrap(),
 			funding_output_index: 255,
 			signature: sig_1,
-			#[cfg(taproot)]
 			partial_signature_with_nonce: None,
-			#[cfg(taproot)]
 			next_local_nonce: None,
 		};
 		let encoded_value = funding_created.encode();
@@ -5404,7 +5479,6 @@ mod tests {
 		let funding_signed = msgs::FundingSigned {
 			channel_id: ChannelId::from_bytes([2; 32]),
 			signature: sig_1,
-			#[cfg(taproot)]
 			partial_signature_with_nonce: None,
 		};
 		let encoded_value = funding_signed.encode();
@@ -5423,6 +5497,7 @@ mod tests {
 			channel_id: ChannelId::from_bytes([2; 32]),
 			next_per_commitment_point: pubkey_1,
 			short_channel_id_alias: None,
+			next_local_nonce: None,
 		};
 		let encoded_value = channel_ready.encode();
 		let target_value = <Vec<u8>>::from_hex("0202020202020202020202020202020202020202020202020202020202020202031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f").unwrap();
@@ -5443,6 +5518,7 @@ mod tests {
 			locktime: 0,
 			funding_pubkey: pubkey_1,
 			require_confirmed_inputs: Some(()),
+			splice_nonce: None,
 		};
 		let encoded_value = splice_init.encode();
 		assert_eq!(encoded_value.as_hex().to_string(), "0202020202020202020202020202020202020202020202020202020202020202fffffffffffe1dc0000007d000000000031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f0200");
@@ -5477,6 +5553,8 @@ mod tests {
 			funding_contribution_satoshis: -123456,
 			funding_pubkey: pubkey_1,
 			require_confirmed_inputs: Some(()),
+			splice_nonce: None,
+			splice_commitment_nonce: None,
 		};
 		let encoded_value = splice_ack.encode();
 		assert_eq!(encoded_value.as_hex().to_string(), "0202020202020202020202020202020202020202020202020202020202020202fffffffffffe1dc0031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f0200");
@@ -5490,6 +5568,7 @@ mod tests {
 				"c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e",
 			)
 			.unwrap(),
+			next_local_nonce: None,
 		};
 		let encoded_value = splice_locked.encode();
 		assert_eq!(encoded_value.as_hex().to_string(), "02020202020202020202020202020202020202020202020202020202020202026e96fe9f8b0ddcd729ba03cfafa5a27b050b39d354dd980814268dfa9a44d4c2");
@@ -5625,6 +5704,7 @@ mod tests {
 					<Vec<u8>>::from_hex("028fbbf0b16f5ba5bcb5dd37cd4047ce6f726a21c06682f9ec2f52b057de1dbdb5").unwrap()]),
 			],
 			shared_input_signature: Some(sig_1),
+			splice_partial_signature: None,
 		};
 		let encoded_value = tx_signatures.encode();
 		let mut target_value =
@@ -5761,6 +5841,7 @@ mod tests {
 			} else {
 				Address::p2wsh(&script, Network::Testnet).script_pubkey()
 			},
+			shutdown_nonce: None,
 		};
 		let encoded_value = shutdown.encode();
 		let mut target_value =
@@ -5814,6 +5895,7 @@ mod tests {
 			fee_satoshis: 2316138423780173,
 			signature: sig_1,
 			fee_range: None,
+			partial_signature_with_nonce: None,
 		};
 		let encoded_value = closing_signed.encode();
 		let target_value = <Vec<u8>>::from_hex("020202020202020202020202020202020202020202020202020202020202020200083a840000034dd977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a").unwrap();
@@ -5831,6 +5913,7 @@ mod tests {
 				min_fee_satoshis: 0xdeadbeef,
 				max_fee_satoshis: 0x1badcafe01234567,
 			}),
+			partial_signature_with_nonce: None,
 		};
 		let encoded_value_with_range = closing_signed_with_range.encode();
 		let target_value_with_range = <Vec<u8>>::from_hex("020202020202020202020202020202020202020202020202020202020202020200083a840000034dd977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a011000000000deadbeef1badcafe01234567").unwrap();
@@ -5940,12 +6023,13 @@ mod tests {
 			channel_id: ChannelId::from_bytes([2; 32]),
 			signature: sig_1,
 			htlc_signatures: if htlcs { vec![sig_2, sig_3, sig_4] } else { Vec::new() },
+			htlc_partial_signatures: Vec::new(),
 			funding_txid: Some(
 				Txid::from_str("c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e")
 					.unwrap(),
 			),
-			#[cfg(taproot)]
 			partial_signature_with_nonce: None,
+			next_local_nonce: None,
 		};
 		let encoded_value = commitment_signed.encode();
 		let mut target_value = "0202020202020202020202020202020202020202020202020202020202020202d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a".to_string();
@@ -5980,7 +6064,6 @@ mod tests {
 				1, 1, 1, 1,
 			],
 			next_per_commitment_point: pubkey_1,
-			#[cfg(taproot)]
 			next_local_nonce: None,
 			release_htlc_message_paths: Vec::new(),
 		};

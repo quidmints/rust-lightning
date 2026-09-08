@@ -34,19 +34,15 @@ use bitcoin::sighash::EcdsaSighashType;
 use bitcoin::transaction::Transaction;
 use bitcoin::Txid;
 
-#[cfg(taproot)]
 use crate::ln::msgs::PartialSignatureWithNonce;
-#[cfg(taproot)]
 use crate::sign::taproot::TaprootChannelSigner;
 use crate::sign::HTLCDescriptor;
 use crate::util::dyn_signer::DynSigner;
 use bitcoin::secp256k1;
-#[cfg(taproot)]
 use bitcoin::secp256k1::All;
 use bitcoin::secp256k1::{ecdsa::Signature, Secp256k1};
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-#[cfg(taproot)]
-use musig2::types::{PartialSignature, PublicNonce};
+use musig2::{PartialSignature, PubNonce as PublicNonce};
 
 /// Initial value for revoked commitment downward counter
 pub const INITIAL_REVOKED_COMMITMENT_NUMBER: u64 = 1 << 48;
@@ -524,15 +520,67 @@ impl EcdsaChannelSigner for TestChannelSigner {
 	) -> Signature {
 		self.inner.sign_splice_shared_input(channel_parameters, tx, input_index, secp_ctx)
 	}
+
+	// Simple-taproot on-chain resolution (M9e): delegate to the inner signer.
+	fn sign_justice_revoked_output_taproot(
+		&self, channel_parameters: &ChannelTransactionParameters, justice_tx: &Transaction,
+		input: usize, amount: u64, per_commitment_key: &SecretKey,
+		all_prevouts: &[bitcoin::TxOut], secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature, ()> {
+		EcdsaChannelSigner::sign_justice_revoked_output_taproot(
+			&self.inner, channel_parameters, justice_tx, input, amount, per_commitment_key,
+			all_prevouts, secp_ctx,
+		)
+	}
+
+	fn sign_justice_revoked_htlc_taproot(
+		&self, channel_parameters: &ChannelTransactionParameters, justice_tx: &Transaction,
+		input: usize, amount: u64, per_commitment_key: &SecretKey, htlc: &HTLCOutputInCommitment,
+		all_prevouts: &[bitcoin::TxOut], secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature, ()> {
+		EcdsaChannelSigner::sign_justice_revoked_htlc_taproot(
+			&self.inner, channel_parameters, justice_tx, input, amount, per_commitment_key, htlc,
+			all_prevouts, secp_ctx,
+		)
+	}
+
+	fn sign_holder_htlc_transaction_taproot(
+		&self, htlc_tx: &Transaction, input: usize, htlc_descriptor: &HTLCDescriptor,
+		secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature, ()> {
+		EcdsaChannelSigner::sign_holder_htlc_transaction_taproot(
+			&self.inner, htlc_tx, input, htlc_descriptor, secp_ctx,
+		)
+	}
+
+	fn sign_counterparty_htlc_transaction_taproot(
+		&self, channel_parameters: &ChannelTransactionParameters, htlc_tx: &Transaction,
+		input: usize, amount: u64, per_commitment_point: &PublicKey, htlc: &HTLCOutputInCommitment,
+		all_prevouts: &[bitcoin::TxOut], secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature, ()> {
+		EcdsaChannelSigner::sign_counterparty_htlc_transaction_taproot(
+			&self.inner, channel_parameters, htlc_tx, input, amount, per_commitment_point, htlc,
+			all_prevouts, secp_ctx,
+		)
+	}
 }
 
-#[cfg(taproot)]
 #[allow(unused)]
+// The simple-taproot (MuSig2) signer surface delegates to the inner `DynSigner`
+// (→ the backing `InMemorySigner`'s real key-path bodies), so the functional-test
+// harness can open/commit/close a taproot channel for real. The enforcement-state
+// policy checks the ECDSA path runs are not duplicated here — taproot signing is a
+// later-milestone concern for the test signer; the funds-safety checks live in
+// `quid_ln::ValidatingChannelSigner`, which is what production uses.
 impl TaprootChannelSigner for TestChannelSigner {
+	fn provide_taproot_context(&self, ctx: crate::sign::TaprootSignerContext) {
+		self.inner.provide_taproot_context(ctx)
+	}
+
 	fn generate_local_nonce_pair(
 		&self, commitment_number: u64, secp_ctx: &Secp256k1<All>,
 	) -> PublicNonce {
-		todo!()
+		self.inner.generate_local_nonce_pair(commitment_number, secp_ctx)
 	}
 
 	fn partially_sign_counterparty_commitment(
@@ -540,48 +588,87 @@ impl TaprootChannelSigner for TestChannelSigner {
 		inbound_htlc_preimages: Vec<PaymentPreimage>,
 		outbound_htlc_preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<All>,
 	) -> Result<(PartialSignatureWithNonce, Vec<secp256k1::schnorr::Signature>), ()> {
-		todo!()
+		self.inner.partially_sign_counterparty_commitment(
+			counterparty_nonce,
+			commitment_tx,
+			inbound_htlc_preimages,
+			outbound_htlc_preimages,
+			secp_ctx,
+		)
 	}
 
 	fn finalize_holder_commitment(
 		&self, commitment_tx: &HolderCommitmentTransaction,
 		counterparty_partial_signature: PartialSignatureWithNonce, secp_ctx: &Secp256k1<All>,
 	) -> Result<PartialSignature, ()> {
-		todo!()
+		self.inner.finalize_holder_commitment(
+			commitment_tx,
+			counterparty_partial_signature,
+			secp_ctx,
+		)
 	}
 
 	fn sign_justice_revoked_output(
 		&self, justice_tx: &Transaction, input: usize, amount: u64, per_commitment_key: &SecretKey,
 		secp_ctx: &Secp256k1<All>,
 	) -> Result<secp256k1::schnorr::Signature, ()> {
-		todo!()
+		TaprootChannelSigner::sign_justice_revoked_output(
+			&self.inner, justice_tx, input, amount, per_commitment_key, secp_ctx,
+		)
 	}
 
 	fn sign_justice_revoked_htlc(
 		&self, justice_tx: &Transaction, input: usize, amount: u64, per_commitment_key: &SecretKey,
 		htlc: &HTLCOutputInCommitment, secp_ctx: &Secp256k1<All>,
 	) -> Result<secp256k1::schnorr::Signature, ()> {
-		todo!()
+		TaprootChannelSigner::sign_justice_revoked_htlc(
+			&self.inner, justice_tx, input, amount, per_commitment_key, htlc, secp_ctx,
+		)
 	}
 
 	fn sign_holder_htlc_transaction(
 		&self, htlc_tx: &Transaction, input: usize, htlc_descriptor: &HTLCDescriptor,
 		secp_ctx: &Secp256k1<All>,
 	) -> Result<secp256k1::schnorr::Signature, ()> {
-		todo!()
+		TaprootChannelSigner::sign_holder_htlc_transaction(
+			&self.inner, htlc_tx, input, htlc_descriptor, secp_ctx,
+		)
 	}
 
 	fn sign_counterparty_htlc_transaction(
 		&self, htlc_tx: &Transaction, input: usize, amount: u64, per_commitment_point: &PublicKey,
 		htlc: &HTLCOutputInCommitment, secp_ctx: &Secp256k1<All>,
 	) -> Result<secp256k1::schnorr::Signature, ()> {
-		todo!()
+		TaprootChannelSigner::sign_counterparty_htlc_transaction(
+			&self.inner, htlc_tx, input, amount, per_commitment_point, htlc, secp_ctx,
+		)
 	}
 
 	fn partially_sign_closing_transaction(
 		&self, closing_tx: &ClosingTransaction, secp_ctx: &Secp256k1<All>,
 	) -> Result<PartialSignature, ()> {
-		todo!()
+		self.inner.partially_sign_closing_transaction(closing_tx, secp_ctx)
+	}
+
+	fn generate_splice_nonce(
+		&self, prev_funding_txid: &bitcoin::Txid, secp_ctx: &Secp256k1<All>,
+	) -> Option<PublicNonce> {
+		self.inner.generate_splice_nonce(prev_funding_txid, secp_ctx)
+	}
+
+	fn partially_sign_splice_shared_input(
+		&self, tx: &Transaction, input_index: usize, all_prevouts: &[bitcoin::TxOut],
+		counterparty_nonce: PublicNonce, prev_funding_txid: &bitcoin::Txid,
+		secp_ctx: &Secp256k1<All>,
+	) -> Result<(PartialSignature, PublicNonce), ()> {
+		self.inner.partially_sign_splice_shared_input(
+			tx,
+			input_index,
+			all_prevouts,
+			counterparty_nonce,
+			prev_funding_txid,
+			secp_ctx,
+		)
 	}
 }
 

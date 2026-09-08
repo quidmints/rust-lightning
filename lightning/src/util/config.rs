@@ -226,6 +226,21 @@ pub struct ChannelHandshakeConfig {
 	/// [`DecodeError::InvalidValue`]: crate::ln::msgs::DecodeError::InvalidValue
 	pub negotiate_anchor_zero_fee_commitments: bool,
 
+	/// If set, we attempt to negotiate the `option_simple_taproot` channel type (BOLT feature bits
+	/// 80/81, key-path MuSig2 funding) for new channels, advertising the feature and selecting the
+	/// taproot channel type when the counterparty supports it.
+	///
+	/// This is an explicit opt-in: when unset, channel opening falls back to the existing
+	/// (non-taproot) channel type so default behaviour is unchanged. (QU!D flips its channels to
+	/// taproot via this flag once the taproot commitment/nonce handlers are complete.)
+	///
+	/// Note that setting this to true does *not* prevent us from opening channels with
+	/// counterparties that do not support `option_simple_taproot`; we will simply fall back to the
+	/// otherwise-negotiated channel type.
+	///
+	/// Default value: `false`
+	pub negotiate_simple_taproot: bool,
+
 	/// The maximum number of HTLCs in-flight from our counterparty towards us at the same time.
 	///
 	/// Increasing the value can help improve liquidity and stability in
@@ -256,6 +271,7 @@ impl Default for ChannelHandshakeConfig {
 			their_channel_reserve_proportional_millionths: 10_000,
 			negotiate_anchors_zero_fee_htlc_tx: false,
 			negotiate_anchor_zero_fee_commitments: false,
+			negotiate_simple_taproot: false,
 			our_max_accepted_htlcs: 50,
 		}
 	}
@@ -278,6 +294,7 @@ impl Readable for ChannelHandshakeConfig {
 			their_channel_reserve_proportional_millionths: Readable::read(reader)?,
 			negotiate_anchors_zero_fee_htlc_tx: Readable::read(reader)?,
 			negotiate_anchor_zero_fee_commitments: Readable::read(reader)?,
+			negotiate_simple_taproot: Readable::read(reader)?,
 			our_max_accepted_htlcs: Readable::read(reader)?,
 		})
 	}

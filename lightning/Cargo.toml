@@ -50,6 +50,16 @@ backtrace = { version = "0.3", optional = true }
 libm = { version = "0.2", default-features = false }
 inventory = { version = "0.3", optional = true  }
 
+# BIP327 MuSig2 (conduition) — simple taproot channels. Folded into the DEFAULT
+# build (no `cfg(taproot)` gate): the taproot signer/message code compiles on a
+# plain `cargo build`. The 0.1.x line rides secp256k1 0.29 (matches our bitcoin
+# 0.32 stack: NO version conflict, NO shim, NO bitcoin-0.33 migration). EC math
+# runs on libsecp256k1 via the `secp256k1` backend; the protocol logic is
+# BIP327-vector-conforming + differentially-fuzzed against the BIP327 reference.
+# Replaces the dead arik-so/rust-musig2 (no taproot tweak). Pinned; review its ~6
+# protocol files (unaudited).
+musig2 = { version = "0.1.2", default-features = false, features = ["secp256k1"] }
+
 [dev-dependencies]
 regex = "1.5.6"
 lightning-types = { version = "0.3.0", path = "../lightning-types", features = ["_test_utils"] }
@@ -63,9 +73,6 @@ features = ["bitcoinconsensus", "secp-recovery"]
 
 [target.'cfg(ldk_bench)'.dependencies]
 criterion = { version = "0.4", optional = true, default-features = false }
-
-[target.'cfg(taproot)'.dependencies]
-musig2 = { git = "https://github.com/arik-so/rust-musig2", rev = "6f95a05718cbb44d8fe3fa6021aea8117aa38d50" }
 
 [lints]
 workspace = true

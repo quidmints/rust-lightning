@@ -2016,6 +2016,20 @@ pub fn create_unannounced_chan_between_nodes_with_value<'a, 'b, 'c, 'd>(
 		.unwrap();
 	let open_channel = get_event_msg!(nodes[a], MessageSendEvent::SendOpenChannel, node_b_id);
 	nodes[b].node.handle_open_channel(node_a_id, &open_channel);
+	// Anchor channels (incl. M9g simple-taproot-with-anchors) require
+	// `manually_accept_inbound_channels`; in that case node B emits an
+	// `OpenChannelRequest` instead of auto-replying with `accept_channel`.
+	if nodes[b].node.get_current_config().manually_accept_inbound_channels {
+		let events = nodes[b].node.get_and_clear_pending_events();
+		assert_eq!(events.len(), 1);
+		match &events[0] {
+			Event::OpenChannelRequest { temporary_channel_id, counterparty_node_id, .. } => nodes[b]
+				.node
+				.accept_inbound_channel(temporary_channel_id, counterparty_node_id, 42, None)
+				.unwrap(),
+			_ => panic!("Unexpected event"),
+		};
+	}
 	let accept_channel = get_event_msg!(nodes[b], MessageSendEvent::SendAcceptChannel, node_a_id);
 	nodes[a].node.handle_accept_channel(node_b_id, &accept_channel);
 
