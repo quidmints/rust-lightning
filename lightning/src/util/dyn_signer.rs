@@ -138,15 +138,16 @@ impl TaprootChannelSigner for DynSigner {
 	}
 
 	fn generate_splice_nonce(
-		&self, prev_funding_txid: &bitcoin::Txid, secp_ctx: &Secp256k1<All>,
+		&self, prev_funding_txid: &bitcoin::Txid, candidate_index: u64,
+		secp_ctx: &Secp256k1<All>,
 	) -> Option<PublicNonce> {
-		self.inner.generate_splice_nonce(prev_funding_txid, secp_ctx)
+		self.inner.generate_splice_nonce(prev_funding_txid, candidate_index, secp_ctx)
 	}
 
 	fn partially_sign_splice_shared_input(
 		&self, tx: &Transaction, input_index: usize, all_prevouts: &[bitcoin::TxOut],
 		counterparty_nonce: PublicNonce, prev_funding_txid: &bitcoin::Txid,
-		secp_ctx: &Secp256k1<All>,
+		candidate_index: u64, secp_ctx: &Secp256k1<All>,
 	) -> Result<(PartialSignature, PublicNonce), ()> {
 		self.inner.partially_sign_splice_shared_input(
 			tx,
@@ -154,6 +155,7 @@ impl TaprootChannelSigner for DynSigner {
 			all_prevouts,
 			counterparty_nonce,
 			prev_funding_txid,
+			candidate_index,
 			secp_ctx,
 		)
 	}

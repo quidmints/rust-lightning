@@ -2568,10 +2568,18 @@ pub const fn closing_nonce_height(round: u64) -> u64 {
 /// Closing nonces live near the top (`u64::MAX − round`). We map the txid into the
 /// strictly disjoint window `[2^48, 2^56)`, so a splice nonce can never collide with
 /// a commitment-height or closing-round nonce on the same shachain root.
-pub fn splice_nonce_height(prev_funding_txid: &Txid) -> u64 {
+///
+/// ## Per-candidate (§SPLICE-NONCE-PER-CANDIDATE)
+/// `candidate_index` is the channel's monotonic splice-negotiation counter, stamped on the
+/// `PendingFunding` when a negotiation STARTS and read from there by both the advertise site and
+/// the signing site. Two negotiations on one channel (an abort and a retry, a later RBF) spend the
+/// SAME previous funding txid, so the txid alone would give them one nonce over two messages —
+/// `x = (s1 − s2)/(e1 − e2)`. Hashing the index in keeps the height inside the same window.
+pub fn splice_nonce_height(prev_funding_txid: &Txid, candidate_index: u64) -> u64 {
 	let mut eng = Sha256::engine();
 	eng.input(b"quid-taproot-splice-nonce");
 	eng.input(prev_funding_txid.as_byte_array());
+	eng.input(&candidate_index.to_be_bytes());
 	let h = Sha256::from_engine(eng).to_byte_array();
 	let mut x = [0u8; 8];
 	x.copy_from_slice(&h[..8]);
@@ -2819,7 +2827,8 @@ impl TaprootChannelSigner for InMemorySigner {
 	}
 
 	fn generate_splice_nonce(
-		&self, prev_funding_txid: &bitcoin::Txid, secp_ctx: &Secp256k1<All>,
+		&self, prev_funding_txid: &bitcoin::Txid, candidate_index: u64,
+		secp_ctx: &Secp256k1<All>,
 	) -> Option<PublicNonce> {
 		// The splice signs the OLD (current) funding output, so the KeyAggContext is
 		// built from the CURRENT funding keys (the OLD `Q`), exactly as the closing /
@@ -2829,7 +2838,7 @@ impl TaprootChannelSigner for InMemorySigner {
 			key_agg,
 			our_index,
 			&self.commitment_seed,
-			crate::sign::splice_nonce_height(prev_funding_txid),
+			crate::sign::splice_nonce_height(prev_funding_txid, candidate_index),
 		)
 		.ok()
 	}
@@ -2837,7 +2846,7 @@ impl TaprootChannelSigner for InMemorySigner {
 	fn partially_sign_splice_shared_input(
 		&self, tx: &Transaction, input_index: usize, all_prevouts: &[bitcoin::TxOut],
 		counterparty_nonce: PublicNonce, prev_funding_txid: &bitcoin::Txid,
-		secp_ctx: &Secp256k1<All>,
+		candidate_index: u64, secp_ctx: &Secp256k1<All>,
 	) -> Result<(PartialSignature, PublicNonce), ()> {
 		// The splice tx spends the OLD funding output (the current `0x5120||Q`); the
 		// KeyAggContext is the CURRENT funding-key aggregate (spec §9c). A splice tx
@@ -2854,7 +2863,7 @@ impl TaprootChannelSigner for InMemorySigner {
 			counterparty_index,
 			self.taproot_holder_funding_key(),
 			&self.commitment_seed,
-			crate::sign::splice_nonce_height(prev_funding_txid),
+			crate::sign::splice_nonce_height(prev_funding_txid, candidate_index),
 			counterparty_nonce,
 			message,
 		)
@@ -3674,10 +3683,16 @@ fn taproot_closing_and_splice_nonce_heights_disjoint_and_distinct() {
 	// [2^48, 2^56 + 2^48) window (above commitments, below the closing range).
 	let txid_a = Txid::from_slice(&[0x11; 32]).unwrap();
 	let txid_b = Txid::from_slice(&[0x22; 32]).unwrap();
-	let sa = splice_nonce_height(&txid_a);
-	let sb = splice_nonce_height(&txid_b);
+	let sa = splice_nonce_height(&txid_a, 0);
+	let sb = splice_nonce_height(&txid_b, 0);
 	assert_ne!(sa, sb, "distinct splices get distinct nonce heights (§9f-0 reuse guard)");
-	for s in [sa, sb] {
+	// §SPLICE-NONCE-PER-CANDIDATE: two negotiations over the SAME previous funding txid get
+	// distinct heights (an abort-and-retry, a later RBF), and the same (txid, index) is stable —
+	// which is what lets the advertise site and the signing site derive one nonce.
+	let sa1 = splice_nonce_height(&txid_a, 1);
+	assert_ne!(sa, sa1, "same txid, next candidate → a fresh nonce height");
+	assert_eq!(sa, splice_nonce_height(&txid_a, 0), "(txid, index) → the same height, always");
+	for s in [sa, sb, sa1] {
 		assert!(s >= COMMITMENT_TOP, "splice nonce height is above the commitment range");
 		assert!(s < SPLICE_TOP, "splice nonce height is below the closing range");
 	}

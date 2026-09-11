@@ -2770,6 +2770,14 @@ impl AddSigned for u64 {
 struct PendingFunding {
 	funding_negotiation: Option<FundingNegotiation>,
 
+	/// (§SPLICE-NONCE-PER-CANDIDATE) The channel's splice-negotiation counter value this
+	/// negotiation was STARTED with — the `candidate_index` of `splice_nonce_height`. Stamped
+	/// exactly once, when this struct is built, and read from here by BOTH the site that
+	/// advertises our splice nonce and the site that signs the shared input with it, so the
+	/// two can never disagree. Never derived from `negotiated_candidates.len()`: that vector
+	/// restarts at zero for every new negotiation on the same channel.
+	candidate_index: u64,
+
 	/// Funding candidates that have been negotiated but have not reached enough confirmations
 	/// by both counterparties to have exchanged `splice_locked` and be promoted.
 	negotiated_candidates: Vec<FundingScope>,
@@ -2786,6 +2794,7 @@ impl_writeable_tlv_based!(PendingFunding, {
 	(3, negotiated_candidates, required_vec),
 	(5, sent_funding_txid, option),
 	(7, received_funding_txid, option),
+	(9, candidate_index, (default_value, 0)),
 });
 
 enum FundingNegotiation {
@@ -3024,6 +3033,13 @@ where
 	// node that round N's nonce was already used in a prior life; this flag can, so
 	// the reconnect bump fires after a restart and never re-signs a consumed round.
 	closing_partial_sent_at_round: bool,
+	// (§SPLICE-NONCE-PER-CANDIDATE) How many splice negotiations this channel has STARTED,
+	// as either side. Bumped before a `PendingFunding` is built and stamped onto it as
+	// `candidate_index`, so every negotiation — including an abort-and-retry or an RBF over the
+	// SAME previous funding txid — derives a fresh MuSig2 nonce for the shared input. PERSISTED
+	// (TLV 75) and bumped again on every reload: a bump that never reached disk before a crash
+	// must not be re-issued to the next negotiation. Mirrors `closing_round`.
+	splice_candidate_counter: u64,
 	// The counterparty's MuSig2 splice nonce (their `splice_init`/`splice_ack`
 	// `splice_nonce`) for the interactive key-path sign of the splice's shared
 	// (old-funding) input (spec §9c). Stored on splice handshake; consumed when we
@@ -3831,6 +3847,7 @@ where
 			cur_counterparty_closing_nonce: None,
 			closing_round: 0,
 			closing_partial_sent_at_round: false,
+			splice_candidate_counter: 0,
 			cur_counterparty_splice_nonce: None,
 
 			counterparty_next_commitment_transaction_number: INITIAL_COMMITMENT_NUMBER,
@@ -4085,6 +4102,7 @@ where
 			cur_counterparty_closing_nonce: None,
 			closing_round: 0,
 			closing_partial_sent_at_round: false,
+			splice_candidate_counter: 0,
 			cur_counterparty_splice_nonce: None,
 
 			counterparty_next_commitment_transaction_number: INITIAL_COMMITMENT_NUMBER,
@@ -6600,7 +6618,7 @@ where
 	/// `provide_taproot_context_to_signer` supplies it from `funding` (the current
 	/// scope). `None` for non-taproot channels.
 	fn generate_holder_splice_nonce(
-		&self, funding: &FundingScope, prev_funding_txid: &Txid,
+		&self, funding: &FundingScope, prev_funding_txid: &Txid, candidate_index: u64,
 	) -> Option<musig2::PubNonce> {
 		if !funding.get_channel_type().supports_simple_taproot() {
 			return None;
@@ -6608,7 +6626,15 @@ where
 		self.provide_taproot_context_to_signer(funding);
 		self.holder_signer
 			.as_taproot()
-			.and_then(|s| s.generate_splice_nonce(prev_funding_txid, &self.secp_ctx))
+			.and_then(|s| s.generate_splice_nonce(prev_funding_txid, candidate_index, &self.secp_ctx))
+	}
+
+	/// (§SPLICE-NONCE-PER-CANDIDATE) Take the index for a splice negotiation that is starting
+	/// NOW. The only place the counter moves forward at runtime; the caller stamps the result
+	/// onto the `PendingFunding` it is about to build.
+	fn next_splice_candidate_index(&mut self) -> u64 {
+		self.splice_candidate_counter = self.splice_candidate_counter.saturating_add(1);
+		self.splice_candidate_counter
 	}
 
 	/// Only allowed after [`FundingScope::channel_transaction_parameters`] is set.
@@ -9754,6 +9780,15 @@ where
 							err: "Taproot channel without a taproot signer".to_owned(),
 						}
 					})?;
+					// (§SPLICE-NONCE-PER-CANDIDATE) The index this negotiation was advertised
+					// with, read from where it was stamped — never recomputed here.
+					let candidate_index = self
+						.pending_splice
+						.as_ref()
+						.map(|p| p.candidate_index)
+						.ok_or_else(|| APIError::APIMisuseError {
+							err: "Taproot splice signing without a pending splice".to_owned(),
+						})?;
 					let (partial, our_pubnonce) = taproot_signer
 						.partially_sign_splice_shared_input(
 							&tx_owned,
@@ -9761,6 +9796,7 @@ where
 							&all_prevouts,
 							cp_nonce,
 							&prev_funding_txid,
+							candidate_index,
 							&self.context.secp_ctx,
 						)
 						.map_err(|()| APIError::APIMisuseError {
@@ -13110,17 +13146,21 @@ where
 
 		let funding_negotiation =
 			FundingNegotiation::AwaitingAck { context, new_holder_funding_key: funding_pubkey };
+		let candidate_index = self.context.next_splice_candidate_index();
 		self.pending_splice = Some(PendingFunding {
 			funding_negotiation: Some(funding_negotiation),
+			candidate_index,
 			negotiated_candidates: vec![],
 			sent_funding_txid: None,
 			received_funding_txid: None,
 		});
 
 		// Simple-taproot: advertise our MuSig2 splice nonce for the key-path sign of
-		// the shared (old-funding) input, derived per the OLD funding txid (spec §9c).
-		let splice_nonce = prev_funding_txid
-			.and_then(|txid| self.context.generate_holder_splice_nonce(&self.funding, &txid));
+		// the shared (old-funding) input, derived per the OLD funding txid AND this
+		// negotiation's stamped candidate index (spec §9c, §SPLICE-NONCE-PER-CANDIDATE).
+		let splice_nonce = prev_funding_txid.and_then(|txid| {
+			self.context.generate_holder_splice_nonce(&self.funding, &txid, candidate_index)
+		});
 
 		msgs::SpliceInit {
 			channel_id: self.context.channel_id,
@@ -13462,8 +13502,13 @@ where
 				self.context.cur_counterparty_splice_nonce = Some(nonce);
 			}
 		}
-		let splice_nonce = prev_funding_txid
-			.and_then(|txid| self.context.generate_holder_splice_nonce(&self.funding, &txid));
+		// (§SPLICE-NONCE-PER-CANDIDATE) One index for this negotiation: taken here, used for the
+		// nonce we advertise below, and stamped on the `PendingFunding` built below so the
+		// signing site reads the same value.
+		let candidate_index = self.context.next_splice_candidate_index();
+		let splice_nonce = prev_funding_txid.and_then(|txid| {
+			self.context.generate_holder_splice_nonce(&self.funding, &txid, candidate_index)
+		});
 
 		// Simple-taproot: also advertise our fresh Q'-BOUND verification nonce for the
 		// splice's NEW-funding initial commitment (the acceptor can compute Q' — it has
@@ -13480,6 +13525,7 @@ where
 				funding: splice_funding,
 				interactive_tx_constructor,
 			}),
+			candidate_index,
 			negotiated_candidates: Vec::new(),
 			received_funding_txid: None,
 			sent_funding_txid: None,
@@ -16140,6 +16186,7 @@ where
 		// `closing_round` and whether its nonce was consumed, so a restart mid-close
 		// cannot re-sign a round whose nonce already signed a different-fee close tx.
 		let closing_round = Some(self.context.closing_round);
+		let splice_candidate_counter = Some(self.context.splice_candidate_counter);
 		let closing_partial_sent_at_round = Some(self.context.closing_partial_sent_at_round);
 
 		let holder_commitment_point_current = self.holder_commitment_point.current_point();
@@ -16205,6 +16252,7 @@ where
 			(69, holding_cell_held_htlc_flags, optional_vec), // Added in 0.2
 			(71, closing_round, option), // Added: taproot coop-close round (restart nonce-reuse guard)
 			(73, closing_partial_sent_at_round, option), // Added: taproot coop-close round consumed flag
+			(75, splice_candidate_counter, option), // Added: §SPLICE-NONCE-PER-CANDIDATE (restart nonce-reuse guard)
 		});
 
 		Ok(())
@@ -16561,6 +16609,7 @@ where
 		let mut holder_commitment_point_pending_next_opt: Option<PublicKey> = None;
 		let mut is_manual_broadcast = None;
 		let mut closing_round: Option<u64> = None;
+		let mut splice_candidate_counter: Option<u64> = None;
 		let mut closing_partial_sent_at_round: Option<bool> = None;
 
 		let mut historical_scids = Some(Vec::new());
@@ -16623,6 +16672,7 @@ where
 			(69, holding_cell_held_htlc_flags_opt, optional_vec), // Added in 0.2
 			(71, closing_round, option), // Added: taproot coop-close round (restart nonce-reuse guard)
 			(73, closing_partial_sent_at_round, option), // Added: taproot coop-close round consumed flag
+			(75, splice_candidate_counter, option), // Added: §SPLICE-NONCE-PER-CANDIDATE
 		});
 
 		// Restart nonce-reuse guard (taproot coop-close). The reconnect bump in
@@ -16640,6 +16690,11 @@ where
 		let closing_round = closing_round
 			.unwrap_or(0)
 			.saturating_add(if closing_partial_sent_at_round.unwrap_or(false) { 1 } else { 0 });
+		// (§SPLICE-NONCE-PER-CANDIDATE) Unconditional bump on reload: a negotiation started and
+		// its bump lost before persistence would otherwise re-issue that index — one nonce over
+		// two candidates. An in-flight `PendingFunding` keeps the index stamped on it, so this
+		// changes only what the NEXT negotiation gets.
+		let splice_candidate_counter = splice_candidate_counter.unwrap_or(0).saturating_add(1);
 
 		let holder_ecdsa_signer = signer_provider.derive_channel_signer(channel_keys_id);
 
@@ -16957,6 +17012,7 @@ where
 				cur_counterparty_closing_nonce: None,
 				closing_round, // restart nonce-reuse guard applied above
 				closing_partial_sent_at_round: false, // consumed by the reload bump above
+				splice_candidate_counter, // reload bump applied above
 				cur_counterparty_splice_nonce: None,
 
 				counterparty_next_commitment_transaction_number,

@@ -175,7 +175,8 @@ pub trait TaprootChannelSigner: ChannelSigner {
 	/// Advertised via `splice_init`/`splice_ack` `splice_nonce` so the advertised
 	/// nonce equals the one we sign the shared input with. Default `None`.
 	fn generate_splice_nonce(
-		&self, _prev_funding_txid: &bitcoin::Txid, _secp_ctx: &Secp256k1<secp256k1::All>,
+		&self, _prev_funding_txid: &bitcoin::Txid, _candidate_index: u64,
+		_secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Option<PublicNonce> {
 		None
 	}
@@ -193,7 +194,7 @@ pub trait TaprootChannelSigner: ChannelSigner {
 	fn partially_sign_splice_shared_input(
 		&self, _tx: &Transaction, _input_index: usize, _all_prevouts: &[bitcoin::TxOut],
 		_counterparty_nonce: PublicNonce, _prev_funding_txid: &bitcoin::Txid,
-		_secp_ctx: &Secp256k1<secp256k1::All>,
+		_candidate_index: u64, _secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<(PartialSignature, PublicNonce), ()> {
 		Err(())
 	}
