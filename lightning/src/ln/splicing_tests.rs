@@ -237,92 +237,91 @@ pub fn complete_interactive_funding_negotiation<'a, 'b, 'c, 'd>(
 		.chain(initiator_change_script.into_iter())
 		.collect::<Vec<_>>();
 
-	let mut acceptor_sent_tx_complete = false;
+	// Interactive-tx is strictly turn-based (BOLT-2): the initiator moves first, each turn is
+	// exactly ONE message, and the negotiation ends on two consecutive `tx_complete`s. Drive it
+	// symmetrically. What the INITIATOR is expected to add is checked off against its contribution;
+	// what the ACCEPTOR adds is whatever it registered (QU!D PATCH: `register_acceptor_splice_
+	// contribution`) and is verified by the caller against the negotiated transaction.
+	//
+	// ⚠️ This replaced an initiator-centric loop that drained every initiator input and output
+	// BEFORE giving the acceptor a turn, and then bolted on an inner loop for acceptor outputs. It
+	// could not express `I: add_input(shared) → A: add_output(payout) → I: add_output(funding)`
+	// — the initiator still owing its funding output when the acceptor's output arrives — which
+	// is exactly the shape an acceptor contribution produces. With a zero acceptor contribution
+	// the sequence of messages here is identical to the old loop's.
+	let mut initiator_turn = true;
+	let mut prev_was_tx_complete = false;
 	loop {
-		if !expected_initiator_inputs.is_empty() {
-			let tx_add_input =
-				get_event_msg!(initiator, MessageSendEvent::SendTxAddInput, node_id_acceptor);
-			let input_prevout = BitcoinOutPoint {
-				txid: tx_add_input
-					.prevtx
-					.as_ref()
-					.map(|prevtx| prevtx.compute_txid())
-					.or(tx_add_input.shared_input_txid)
-					.unwrap(),
-				vout: tx_add_input.prevtx_out,
-			};
-			expected_initiator_inputs.remove(
-				expected_initiator_inputs.iter().position(|input| *input == input_prevout).unwrap(),
-			);
-			acceptor.node.handle_tx_add_input(node_id_initiator, &tx_add_input);
-		} else if !expected_initiator_scripts.is_empty() {
-			let tx_add_output =
-				get_event_msg!(initiator, MessageSendEvent::SendTxAddOutput, node_id_acceptor);
-			expected_initiator_scripts.remove(
-				expected_initiator_scripts
-					.iter()
-					.position(|script| *script == tx_add_output.script)
-					.unwrap(),
-			);
-			acceptor.node.handle_tx_add_output(node_id_initiator, &tx_add_output);
+		let (sender, receiver, expected_receiver) = if initiator_turn {
+			(initiator, acceptor, node_id_acceptor)
 		} else {
-			let mut msg_events = initiator.node.get_and_clear_pending_msg_events();
-			assert_eq!(
-				msg_events.len(),
-				if acceptor_sent_tx_complete { 2 } else { 1 },
-				"{msg_events:?}"
-			);
-			if let MessageSendEvent::SendTxComplete { ref msg, .. } = msg_events.remove(0) {
-				acceptor.node.handle_tx_complete(node_id_initiator, msg);
-			} else {
-				panic!();
-			}
-			if acceptor_sent_tx_complete {
-				if let MessageSendEvent::UpdateHTLCs { mut updates, .. } = msg_events.remove(0) {
-					return updates.commitment_signed.remove(0);
+			(acceptor, initiator, node_id_initiator)
+		};
+		let sender_id = sender.node.get_our_node_id();
+		let mut msg_events = sender.node.get_and_clear_pending_msg_events();
+		assert!(!msg_events.is_empty(), "no message on {}'s turn", if initiator_turn { "initiator" } else { "acceptor" });
+		match msg_events.remove(0) {
+			MessageSendEvent::SendTxAddInput { ref msg, node_id } => {
+				assert_eq!(node_id, expected_receiver);
+				if initiator_turn {
+					let input_prevout = BitcoinOutPoint {
+						txid: msg
+							.prevtx
+							.as_ref()
+							.map(|prevtx| prevtx.compute_txid())
+							.or(msg.shared_input_txid)
+							.unwrap(),
+						vout: msg.prevtx_out,
+					};
+					expected_initiator_inputs.remove(
+						expected_initiator_inputs
+							.iter()
+							.position(|input| *input == input_prevout)
+							.unwrap(),
+					);
 				}
-				panic!();
-			}
-		}
-
-		// QU!D PATCH: the acceptor may now CONTRIBUTE (see QUID_PATCHES.md,
-		// `register_acceptor_splice_contribution`), so its turn is no longer always a bare
-		// `tx_complete` — it may first add the outputs it funds from its own channel balance.
-		// ⚠️ WRITTEN AS A LOOP RATHER THAN A NEW PARAMETER SO EXISTING TESTS ARE UNTOUCHED: with no
-		// registration the acceptor still emits exactly one `tx_complete` on its first turn and this
-		// behaves identically to the code it replaces.
-		let mut msg_events = acceptor.node.get_and_clear_pending_msg_events();
-		loop {
-			assert_eq!(msg_events.len(), 1, "{msg_events:?}");
-			match msg_events.remove(0) {
-				MessageSendEvent::SendTxAddOutput { ref msg, .. } => {
-					initiator.node.handle_tx_add_output(node_id_acceptor, msg);
-					// The initiator answers each acceptor output with its own `tx_complete`; feed it
-					// back so the acceptor can take another turn.
-					let mut init_events = initiator.node.get_and_clear_pending_msg_events();
-					assert_eq!(init_events.len(), 1, "{init_events:?}");
-					match init_events.remove(0) {
-						MessageSendEvent::SendTxComplete { ref msg, .. } => {
-							acceptor.node.handle_tx_complete(node_id_initiator, msg);
-						},
-						// The initiator may still owe the SHARED input (the previous funding output),
-						// which it adds on its own turn — an acceptor output does not necessarily
-						// arrive after the initiator has finished contributing.
-						MessageSendEvent::SendTxAddInput { ref msg, .. } => {
-							acceptor.node.handle_tx_add_input(node_id_initiator, msg);
-						},
-						ev => panic!("unexpected initiator reply to an acceptor output: {ev:?}"),
+				receiver.node.handle_tx_add_input(sender_id, msg);
+				prev_was_tx_complete = false;
+			},
+			MessageSendEvent::SendTxAddOutput { ref msg, node_id } => {
+				assert_eq!(node_id, expected_receiver);
+				if initiator_turn {
+					expected_initiator_scripts.remove(
+						expected_initiator_scripts
+							.iter()
+							.position(|script| *script == msg.script)
+							.unwrap(),
+					);
+				}
+				receiver.node.handle_tx_add_output(sender_id, msg);
+				prev_was_tx_complete = false;
+			},
+			MessageSendEvent::SendTxComplete { ref msg, node_id } => {
+				assert_eq!(node_id, expected_receiver);
+				receiver.node.handle_tx_complete(sender_id, msg);
+				if prev_was_tx_complete {
+					// Two consecutive `tx_complete`s: the transaction is negotiated. Everything the
+					// initiator owed must have been added, and its `commitment_signed` follows —
+					// alongside its own final `tx_complete`, or in response to the acceptor's.
+					assert!(expected_initiator_inputs.is_empty(), "{expected_initiator_inputs:?}");
+					assert!(expected_initiator_scripts.is_empty(), "{expected_initiator_scripts:?}");
+					let mut initiator_events = if initiator_turn {
+						msg_events
+					} else {
+						initiator.node.get_and_clear_pending_msg_events()
+					};
+					assert_eq!(initiator_events.len(), 1, "{initiator_events:?}");
+					if let MessageSendEvent::UpdateHTLCs { mut updates, .. } = initiator_events.remove(0) {
+						return updates.commitment_signed.remove(0);
 					}
-					msg_events = acceptor.node.get_and_clear_pending_msg_events();
-				},
-				MessageSendEvent::SendTxComplete { ref msg, .. } => {
-					initiator.node.handle_tx_complete(node_id_acceptor, msg);
-					break;
-				},
-				ev => panic!("unexpected acceptor message: {ev:?}"),
-			}
+					panic!();
+				}
+				prev_was_tx_complete = true;
+			},
+			ev => panic!("unexpected interactive-tx message: {ev:?}"),
 		}
-		acceptor_sent_tx_complete = true;
+		assert!(msg_events.is_empty(), "more than one message in a turn: {msg_events:?}");
+		initiator_turn = !initiator_turn;
 	}
 }
 
@@ -336,14 +335,36 @@ pub fn sign_interactive_funding_tx<'a, 'b, 'c, 'd>(
 	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
 	acceptor.node.handle_commitment_signed(node_id_initiator, &initial_commit_sig_for_acceptor);
 
-	let msg_events = acceptor.node.get_and_clear_pending_msg_events();
-	assert_eq!(msg_events.len(), 2, "{msg_events:?}");
+	let mut msg_events = acceptor.node.get_and_clear_pending_msg_events();
 	if let MessageSendEvent::UpdateHTLCs { ref updates, .. } = &msg_events[0] {
 		let commitment_signed = &updates.commitment_signed[0];
 		initiator.node.handle_commitment_signed(node_id_acceptor, commitment_signed);
 	} else {
-		panic!();
+		panic!("{msg_events:?}");
 	}
+	// QU!D PATCH: an acceptor that CONTRIBUTED (`register_acceptor_splice_contribution`) has a
+	// local contribution in the signing session, so — exactly like the initiator below — LDK
+	// hands it `FundingTransactionReadyForSigning` instead of signing an empty witness set for
+	// it, and its `tx_signatures` follow `funding_transaction_signed`. With no contribution the
+	// acceptor's `tx_signatures` still arrive alongside its `commitment_signed`, as before.
+	if msg_events.len() == 1 {
+		let event = get_event!(acceptor, Event::FundingTransactionReadyForSigning);
+		if let Event::FundingTransactionReadyForSigning {
+			channel_id,
+			counterparty_node_id,
+			unsigned_transaction,
+			..
+		} = event
+		{
+			let partially_signed_tx = acceptor.wallet_source.sign_tx(unsigned_transaction).unwrap();
+			acceptor
+				.node
+				.funding_transaction_signed(&channel_id, &counterparty_node_id, partially_signed_tx)
+				.unwrap();
+		}
+		msg_events.extend(acceptor.node.get_and_clear_pending_msg_events());
+	}
+	assert_eq!(msg_events.len(), 2, "{msg_events:?}");
 	if let MessageSendEvent::SendTxSignatures { ref msg, .. } = &msg_events[1] {
 		initiator.node.handle_tx_signatures(node_id_acceptor, msg);
 	} else {

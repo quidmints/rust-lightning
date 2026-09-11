@@ -1092,11 +1092,15 @@ impl NegotiationContext {
 		self.outputs.iter().fold(0u64, |acc, (_, output)| acc.saturating_add(output.remote_value()))
 	}
 
+	/// The remote's own (non-shared) inputs. The shared funding input is charged to whoever bears
+	/// the common costs — see [`Self::remote_weight_contributed`] — not to whoever added it.
 	fn remote_inputs_weight(&self) -> Weight {
 		Weight::from_wu(
 			self.inputs
 				.iter()
-				.filter(|(serial_id, _)| self.is_serial_id_valid_for_counterparty(serial_id))
+				.filter(|(serial_id, input)| {
+					self.is_serial_id_valid_for_counterparty(serial_id) && !input.input.is_shared()
+				})
 				.fold(0u64, |weight, (_, input)| {
 					weight
 						.saturating_add(BASE_INPUT_WEIGHT)
@@ -1105,23 +1109,96 @@ impl NegotiationContext {
 		)
 	}
 
+	/// The weight of the common fields plus the shared funding input (splices) and shared funding
+	/// output — everything that is not any one party's own input or output.
+	fn common_weight(&self) -> u64 {
+		let shared_input = self
+			.inputs
+			.values()
+			.filter(|input| input.input.is_shared())
+			.fold(0u64, |weight, input| {
+				weight
+					.saturating_add(BASE_INPUT_WEIGHT)
+					.saturating_add(input.satisfaction_weight().to_wu())
+			});
+		let shared_output = self
+			.outputs
+			.values()
+			.filter(|output| output.output.is_shared())
+			.fold(0u64, |weight, output| {
+				weight.saturating_add(get_output_weight(output.script_pubkey()).to_wu())
+			});
+		TX_COMMON_FIELDS_WEIGHT.saturating_add(shared_input).saturating_add(shared_output)
+	}
+
+	/// QU!D PATCH (§ACCEPTOR-CONTRIBUTION-FEES): did the initiator contribute NOTHING? Read from
+	/// the negotiated data itself — its share of the shared input equals its share of the shared
+	/// output and it added no input or output of its own — so both sides derive the same answer
+	/// from the same transaction, with no extra field on the wire.
+	fn initiator_contributed_nothing(&self) -> bool {
+		let initiator_value = |local: u64, remote: u64| {
+			if self.holder_is_initiator { local } else { remote }
+		};
+		let shared_in = self
+			.inputs
+			.values()
+			.filter(|input| input.input.is_shared())
+			.fold(0u64, |acc, input| {
+				acc.saturating_add(initiator_value(input.local_value(), input.remote_value()))
+			});
+		let shared_out = self
+			.outputs
+			.values()
+			.filter(|output| output.output.is_shared())
+			.fold(0u64, |acc, output| {
+				acc.saturating_add(initiator_value(output.local_value(), output.remote_value()))
+			});
+		let initiator_added_own = self
+			.inputs
+			.iter()
+			.any(|(serial_id, input)| {
+				!input.input.is_shared() && serial_id.is_for_initiator()
+			}) || self.outputs.iter().any(|(serial_id, output)| {
+			!output.output.is_shared() && serial_id.is_for_initiator()
+		});
+		shared_in == shared_out && !initiator_added_own
+	}
+
 	fn remote_weight_contributed(&self) -> u64 {
+		// The receiving node:
+		// - MUST fail the negotiation if
+		//   - if is the non-initiator:
+		//     - the initiator's fees do not cover the common fields (version, segwit marker + flag,
+		//       input count, output count, locktime)
+		//
+		// QU!D PATCH (§ACCEPTOR-CONTRIBUTION-FEES): **THE FEE FOLLOWS THE CONTRIBUTION, NOT THE
+		// INITIATION.** The common costs — those fields, the shared funding input and the shared
+		// funding output — fall on the initiator UNLESS it contributed zero, in which case they fall
+		// on the acceptor, which is then the only party whose balance moves. This is the SAME rule
+		// `Channel::splice_channel` (initiator) and `Channel::splice_init` (acceptor) use to
+		// ESTIMATE their fee; before this patch the estimators had the rule and this validator did
+		// not, so a hop-initiated, LP-funded splice-out was aborted here with "Insufficient fees
+		// paid" — the initiator having paid exactly the zero it announced — while the transaction as
+		// a whole carried the full fee. With a non-zero initiator contribution (every upstream
+		// splice) the attribution is byte-identical to the spec's.
+		let remote_is_initiator = !self.holder_is_initiator;
+		let common_on_initiator = !self.initiator_contributed_nothing();
+		let remote_bears_common = remote_is_initiator == common_on_initiator;
 		self.remote_inputs_weight()
 			.to_wu()
 			.saturating_add(self.remote_outputs_weight().to_wu())
-			// The receiving node:
-			// - MUST fail the negotiation if
-			//   - if is the non-initiator:
-			//     - the initiator's fees do not cover the common fields (version, segwit marker + flag,
-			//       input count, output count, locktime)
-			.saturating_add(if !self.holder_is_initiator { TX_COMMON_FIELDS_WEIGHT } else { 0 })
+			.saturating_add(if remote_bears_common { self.common_weight() } else { 0 })
 	}
 
+	/// The remote's own (non-shared) outputs; the shared funding output is in
+	/// [`Self::common_weight`].
 	fn remote_outputs_weight(&self) -> Weight {
 		Weight::from_wu(
 			self.outputs
 				.iter()
-				.filter(|(serial_id, _)| self.is_serial_id_valid_for_counterparty(serial_id))
+				.filter(|(serial_id, output)| {
+					self.is_serial_id_valid_for_counterparty(serial_id) && !output.output.is_shared()
+				})
 				.fold(0u64, |weight, (_, output)| {
 					weight.saturating_add(get_output_weight(output.script_pubkey()).to_wu())
 				}),
