@@ -468,18 +468,25 @@ impl ConstructedTransaction {
 			.sum()
 	}
 
+	/// QU!D PATCH: `Err` when both sides' signatures are present and the shared (previous
+	/// funding) input still cannot be satisfied — a MuSig2 partial that fails to aggregate, a
+	/// missing partial, a bad sighash. This used to be `None`, indistinguishable from "not all
+	/// signatures received yet", so a splice whose partials disagreed (a signer using a nonce the
+	/// peer never saw) completed negotiation, exchanged `tx_signatures`, and was never broadcast —
+	/// with nothing in the logs. Measured 2026-09-11 on regtest: it cost an end-to-end run to see
+	/// what one log line would have said. The callers turn this into a warning to the peer.
 	fn finalize(
 		&self, holder_tx_signatures: &TxSignatures, counterparty_tx_signatures: &TxSignatures,
 		shared_input_sig: Option<&SharedInputSignature>,
-	) -> Option<Transaction> {
+	) -> Result<Transaction, String> {
 		let mut tx = self.tx.clone();
 		self.add_local_witnesses(&mut tx, holder_tx_signatures.witnesses.clone());
 		self.add_remote_witnesses(&mut tx, counterparty_tx_signatures.witnesses.clone());
 
 		if let Some(shared_input_index) = self.shared_input_index {
-			let shared_input_sig = shared_input_sig.or_else(|| {
+			let shared_input_sig = shared_input_sig.ok_or_else(|| {
 				debug_assert!(false);
-				None
+				"shared input present but no shared input signature context".to_string()
 			})?;
 
 			if let Some((holder_funding_pk, counterparty_funding_pk)) =
@@ -491,14 +498,13 @@ impl ConstructedTransaction {
 				// Schnorr witness that spends it (spec §9c). The two partials are
 				// commutative under nonce-sum, so the witness is identical on both
 				// sides regardless of who built it.
-				let holder = holder_tx_signatures.splice_partial_signature.as_ref().or_else(|| {
+				let holder = holder_tx_signatures.splice_partial_signature.as_ref().ok_or_else(|| {
 					debug_assert!(false);
-					None
+					"taproot splice: our tx_signatures carry no splice partial".to_string()
 				})?;
 				let counterparty =
-					counterparty_tx_signatures.splice_partial_signature.as_ref().or_else(|| {
-						debug_assert!(false);
-						None
+					counterparty_tx_signatures.splice_partial_signature.as_ref().ok_or_else(|| {
+						"taproot splice: counterparty tx_signatures carry no splice partial".to_string()
 					})?;
 
 				// The taproot key-path sighash commits to ALL prevouts (a splice tx
@@ -509,7 +515,7 @@ impl ConstructedTransaction {
 					shared_input_index as usize,
 					&all_prevouts,
 				)
-				.ok()?;
+				.map_err(|e| format!("taproot splice: key-path sighash failed: {e:?}"))?;
 				let message: [u8; 32] = *sighash.as_ref();
 
 				let agg_sig = crate::ln::chan_utils::verify_taproot_keyspend_partials(
@@ -521,21 +527,26 @@ impl ConstructedTransaction {
 					counterparty.0,
 					counterparty.1.clone(),
 				)
-				.ok()?;
+				.map_err(|e| {
+					format!(
+						"taproot splice: MuSig2 key-path partials do not aggregate to a valid signature \
+						 over the shared funding input ({e}); a partial was made with a nonce the peer \
+						 did not see, or over a different transaction"
+					)
+				})?;
 
 				let mut witness = Witness::new();
 				witness.push(agg_sig.as_ref());
 				tx.input[shared_input_index as usize].witness = witness;
 			} else {
 				let holder_shared_input_sig =
-					holder_tx_signatures.shared_input_signature.or_else(|| {
+					holder_tx_signatures.shared_input_signature.ok_or_else(|| {
 						debug_assert!(false);
-						None
+						"splice: our tx_signatures carry no shared input signature".to_string()
 					})?;
 				let counterparty_shared_input_sig =
-					counterparty_tx_signatures.shared_input_signature.or_else(|| {
-						debug_assert!(false);
-						None
+					counterparty_tx_signatures.shared_input_signature.ok_or_else(|| {
+						"splice: counterparty tx_signatures carry no shared input signature".to_string()
 					})?;
 
 				let mut witness = Witness::new();
@@ -554,7 +565,7 @@ impl ConstructedTransaction {
 			}
 		}
 
-		Some(tx)
+		Ok(tx)
 	}
 
 	/// Adds provided holder witnesses to holder inputs of unsigned transaction.
@@ -719,7 +730,7 @@ impl InteractiveTxSigningSession {
 			None
 		};
 
-		let funding_tx_opt = self.maybe_finalize_funding_tx();
+		let funding_tx_opt = self.maybe_finalize_funding_tx()?;
 
 		Ok((holder_tx_signatures, funding_tx_opt))
 	}
@@ -748,7 +759,7 @@ impl InteractiveTxSigningSession {
 
 		self.holder_tx_signatures = Some(tx_signatures);
 
-		let funding_tx_opt = self.maybe_finalize_funding_tx();
+		let funding_tx_opt = self.maybe_finalize_funding_tx()?;
 		let holder_tx_signatures = (self.holder_sends_tx_signatures_first
 			|| self.has_received_tx_signatures())
 		.then(|| {
@@ -806,15 +817,18 @@ impl InteractiveTxSigningSession {
 		})
 	}
 
-	fn maybe_finalize_funding_tx(&mut self) -> Option<Transaction> {
-		let holder_tx_signatures = self.holder_tx_signatures.as_ref()?;
-		let counterparty_tx_signatures = self.counterparty_tx_signatures.as_ref()?;
+	/// `Ok(None)` while either side's `tx_signatures` is still outstanding; `Err` when both are
+	/// present and the transaction still cannot be assembled (see `ConstructedTransaction::finalize`).
+	fn maybe_finalize_funding_tx(&mut self) -> Result<Option<Transaction>, String> {
+		let (Some(holder_tx_signatures), Some(counterparty_tx_signatures)) =
+			(self.holder_tx_signatures.as_ref(), self.counterparty_tx_signatures.as_ref())
+		else {
+			return Ok(None);
+		};
 		let shared_input_signature = self.shared_input_signature.as_ref();
-		self.unsigned_tx.finalize(
-			holder_tx_signatures,
-			counterparty_tx_signatures,
-			shared_input_signature,
-		)
+		self.unsigned_tx
+			.finalize(holder_tx_signatures, counterparty_tx_signatures, shared_input_signature)
+			.map(Some)
 	}
 
 	fn verify_interactive_tx_signatures<C: bitcoin::secp256k1::Verification>(
