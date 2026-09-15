@@ -1631,6 +1631,31 @@ pub fn taproot_splice_keyspend_sighash(
 		.map_err(|_| "taproot splice key-spend sighash computation failed")
 }
 
+/// Verify the counterparty's MuSig2 key-path partial ALONE (BIP-327
+/// `PartialSigVerify`) against the aggregate nonce it must have signed under —
+/// ours as advertised for this height plus theirs as carried beside the partial.
+/// No holder signer is involved: this is the receive-side check for
+/// `funding_created`/`funding_signed`/`commitment_signed`, and it is what lets our
+/// own partial wait until we actually broadcast.
+pub fn verify_taproot_keyspend_partial(
+	holder_funding_key: &PublicKey, counterparty_funding_key: &PublicKey, sighash: &[u8; 32],
+	our_pubnonce: &musig2::PubNonce, counterparty_partial: musig2::PartialSignature,
+	counterparty_pubnonce: &musig2::PubNonce,
+) -> Result<(), &'static str> {
+	use crate::sign::taproot_signer::channel_key_agg_ctx;
+	let holder = holder_funding_key.serialize();
+	let counterparty = counterparty_funding_key.serialize();
+	let (ctx, our_index) = channel_key_agg_ctx(&holder, &counterparty, &holder)
+		.map_err(|_| "taproot key aggregation failed")?;
+	let counterparty_key: musig2::secp256k1::PublicKey =
+		ctx.get_pubkey(1 - our_index).ok_or("taproot key aggregation failed")?;
+	let agg_nonce = musig2::AggNonce::sum([our_pubnonce, counterparty_pubnonce]);
+	musig2::verify_partial(
+		&ctx, counterparty_partial, &agg_nonce, counterparty_key, counterparty_pubnonce, *sighash,
+	)
+	.map_err(|_| "counterparty MuSig2 partial failed verification")
+}
+
 /// Aggregate the **counterparty's** key-path MuSig2 partial (with its nonce) and
 /// **our** partial (with its nonce) into the single BIP340 key-path Schnorr
 /// signature spending the `0x5120 || Q` funding output, then verify it under
@@ -2199,16 +2224,16 @@ pub struct HolderCommitmentTransaction {
 	// Which order the signatures should go in when constructing the final commitment tx witness.
 	// The user should be able to reconstruct this themselves, so we don't bother to expose it.
 	holder_sig_first: bool,
-	/// For **simple-taproot** channels (BOLT #995, key-path MuSig2) ONLY: the single
-	/// aggregated BIP340 key-path Schnorr signature spending the `0x5120 || Q` funding
-	/// output. Unlike the legacy P2WSH 2-of-2 model — where the holder completes the
-	/// witness with its own ECDSA sig at broadcast time — MuSig2 funding signing is
-	/// interactive (both parties online), so the aggregated sig MUST be formed during
-	/// `commitment_signed` (when both partials + the deterministic per-height nonces
-	/// are in hand) and stored here for a later UNILATERAL force-close broadcast while
-	/// the counterparty is offline (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §9a/§5).
-	/// `None` for legacy P2WSH channels (which use `counterparty_sig` + complete-at-broadcast).
-	pub taproot_key_path_sig: Option<schnorr::Signature>,
+	/// For **simple-taproot** channels (BOLT #995, key-path MuSig2) ONLY: the
+	/// counterparty's MuSig2 partial signature (with the nonce it signed under) over
+	/// this holder commitment, verified alone at `commitment_signed`
+	/// ([`verify_taproot_keyspend_partial`]) and stored so the holder can complete the
+	/// key-path witness at broadcast time — the taproot twin of `counterparty_sig`.
+	/// Our own partial is produced only when we actually force-close
+	/// (`EcdsaChannelSigner::sign_holder_commitment_taproot`), so a holder signer that is
+	/// slow or remote never blocks the receive path (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md`
+	/// §9a/§5). `None` for legacy P2WSH channels.
+	pub taproot_counterparty_partial: Option<crate::ln::msgs::PartialSignatureWithNonce>,
 	/// For **simple-taproot** channels ONLY: the counterparty's BIP340 Schnorr signatures
 	/// over each non-dust second-level HTLC tx (spec §3, M9b), in commitment-output order.
 	/// These replace the ECDSA `counterparty_htlc_sigs` (which stay empty for taproot) and
@@ -2237,12 +2262,11 @@ impl_writeable_tlv_based!(HolderCommitmentTransaction, {
 	(2, counterparty_sig, required),
 	(4, holder_sig_first, required),
 	(6, counterparty_htlc_sigs, required_vec),
-	// (8) simple-taproot aggregated key-path funding sig — persisted so a force-close
-	// (which fires when the counterparty is offline) survives a reboot (spec §9a). An
-	// odd-typed `option` keeps legacy (P2WSH) monitor records backward-compatible.
-	(8, taproot_key_path_sig, option),
 	// (10) simple-taproot counterparty second-level HTLC Schnorr sigs (M9b).
 	(10, taproot_counterparty_htlc_sigs, option),
+	// (12) simple-taproot counterparty key-path partial — persisted so a force-close
+	// (which fires when the counterparty is offline) survives a reboot (spec §9a).
+	(12, taproot_counterparty_partial, option),
 });
 
 impl HolderCommitmentTransaction {
@@ -2280,7 +2304,7 @@ impl HolderCommitmentTransaction {
 			counterparty_sig: dummy_sig,
 			counterparty_htlc_sigs,
 			holder_sig_first: false,
-			taproot_key_path_sig: None,
+			taproot_counterparty_partial: None,
 			taproot_counterparty_htlc_sigs: None,
 		}
 	}
@@ -2294,7 +2318,7 @@ impl HolderCommitmentTransaction {
 			counterparty_sig,
 			counterparty_htlc_sigs,
 			holder_sig_first: holder_funding_key.serialize()[..] < counterparty_funding_key.serialize()[..],
-			taproot_key_path_sig: None,
+			taproot_counterparty_partial: None,
 			taproot_counterparty_htlc_sigs: None,
 		}
 	}
@@ -2319,28 +2343,23 @@ impl HolderCommitmentTransaction {
 		}
 	}
 
-	/// Attach the aggregated BIP340 key-path Schnorr funding signature for a
-	/// simple-taproot channel (spec §9a). This is the MuSig2 aggregate formed at
-	/// `commitment_signed` over OUR holder commitment; carrying it on the holder
-	/// commitment lets us broadcast it unilaterally (key-path witness) for a
-	/// force-close. No effect on legacy P2WSH channels.
-	pub(crate) fn with_taproot_key_path_sig(mut self, sig: schnorr::Signature) -> Self {
-		self.taproot_key_path_sig = Some(sig);
+	/// Attach the counterparty's verified key-path partial (spec §9a) so a later
+	/// force-close can aggregate it with ours. No effect on legacy P2WSH channels.
+	pub(crate) fn with_taproot_counterparty_partial(
+		mut self, partial: crate::ln::msgs::PartialSignatureWithNonce,
+	) -> Self {
+		self.taproot_counterparty_partial = Some(partial);
 		self
 	}
 
-	/// Build the key-path (taproot) funding witness for a simple-taproot holder
-	/// commitment broadcast: a SINGLE 64-byte SIGHASH_DEFAULT BIP340 Schnorr sig
-	/// (NOT a 2-of-2 script witness). The aggregate sig must already be stored via
-	/// [`Self::with_taproot_key_path_sig`] (formed at `commitment_signed`). Returns
-	/// the unsigned tx unchanged if no key-path sig is present.
+	/// The key-path (taproot) funding witness for a simple-taproot holder commitment
+	/// broadcast: a SINGLE 64-byte SIGHASH_DEFAULT BIP340 Schnorr sig (NOT a 2-of-2
+	/// script witness) — the taproot twin of [`Self::add_holder_sig`].
 	#[rustfmt::skip]
-	pub(crate) fn get_taproot_signed_tx(&self) -> Transaction {
+	pub(crate) fn add_taproot_key_path_sig(&self, sig: schnorr::Signature) -> Transaction {
 		let mut tx = self.inner.built.transaction.clone();
-		if let Some(sig) = self.taproot_key_path_sig {
-			// SIGHASH_DEFAULT ⇒ exactly the 64-byte serialized Schnorr sig, no sighash byte.
-			tx.input[0].witness = Witness::from_slice(&[sig.as_ref().to_vec()]);
-		}
+		// SIGHASH_DEFAULT ⇒ exactly the 64-byte serialized Schnorr sig, no sighash byte.
+		tx.input[0].witness = Witness::from_slice(&[sig.as_ref().to_vec()]);
 		tx
 	}
 

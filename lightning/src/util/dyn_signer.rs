@@ -64,7 +64,7 @@ impl TaprootChannelSigner for DynSigner {
 
 	fn generate_local_nonce_pair(
 		&self, commitment_number: u64, secp_ctx: &Secp256k1<All>,
-	) -> PublicNonce {
+	) -> Result<PublicNonce, ()> {
 		self.inner.generate_local_nonce_pair(commitment_number, secp_ctx)
 	}
 
@@ -87,7 +87,7 @@ impl TaprootChannelSigner for DynSigner {
 		&self, commitment_tx: &HolderCommitmentTransaction,
 		counterparty_partial_signature: crate::ln::msgs::PartialSignatureWithNonce,
 		secp_ctx: &Secp256k1<All>,
-	) -> Result<PartialSignature, ()> {
+	) -> Result<(PartialSignature, PublicNonce), ()> {
 		self.inner.finalize_holder_commitment(
 			commitment_tx,
 			counterparty_partial_signature,
@@ -209,6 +209,9 @@ delegate!(DynSigner, EcdsaChannelSigner, inner,
 		secp_ctx: &Secp256k1<secp256k1::All>) -> Result<secp256k1::schnorr::Signature, ()>,
 	fn sign_holder_htlc_transaction_taproot(, htlc_tx: &Transaction, input: usize,
 		htlc_descriptor: &HTLCDescriptor, secp_ctx: &Secp256k1<secp256k1::All>)
+		-> Result<secp256k1::schnorr::Signature, ()>,
+	fn sign_holder_commitment_taproot(, channel_parameters: &ChannelTransactionParameters,
+		commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<secp256k1::All>)
 		-> Result<secp256k1::schnorr::Signature, ()>,
 	fn sign_counterparty_htlc_transaction_taproot(,
 		channel_parameters: &ChannelTransactionParameters, htlc_tx: &Transaction, input: usize,

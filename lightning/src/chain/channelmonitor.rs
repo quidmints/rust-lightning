@@ -5557,15 +5557,16 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 	) -> Vec<Transaction> where L::Target: Logger {
 		log_debug!(logger, "Getting signed copy of latest holder commitment transaction!");
 		let commitment_tx = if self.channel_type_features().supports_simple_taproot() {
-			// Simple-taproot (BOLT #995) force-close: the funding spend is a key-path
-			// MuSig2 aggregate Schnorr sig formed at `commitment_signed` and stored on the
-			// holder commitment (spec §9a) — there is NO holder ECDSA sig to add at
-			// broadcast time, and the funding output is P2TR (not P2WSH 2-of-2). Mirror
-			// the production `HolderFundingOutput` finalize path (package.rs) and emit the
-			// single-64-byte key-path witness instead of the legacy 2-of-2 `add_holder_sig`
-			// (which would produce an INVALID P2WSH multisig witness on the P2TR funding
-			// output).
-			self.funding.current_holder_commitment_tx.get_taproot_signed_tx()
+			// Simple-taproot (BOLT #995) force-close: the funding output is P2TR, so the
+			// witness is the single key-path MuSig2 signature (our partial aggregated
+			// with the counterparty's stored one), never the 2-of-2 `add_holder_sig`
+			// (which would be an INVALID P2WSH witness on a P2TR output). Mirrors the
+			// production `HolderFundingOutput` finalize path (package.rs).
+			let sig = self.onchain_tx_handler.signer.sign_holder_commitment_taproot(
+				&self.funding.channel_parameters, &self.funding.current_holder_commitment_tx,
+				&self.onchain_tx_handler.secp_ctx,
+			).expect("sign holder commitment");
+			self.funding.current_holder_commitment_tx.add_taproot_key_path_sig(sig)
 		} else {
 			let sig = self.onchain_tx_handler.signer.unsafe_sign_holder_commitment(
 				&self.funding.channel_parameters, &self.funding.current_holder_commitment_tx,

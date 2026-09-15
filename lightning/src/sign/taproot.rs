@@ -37,9 +37,17 @@ pub trait TaprootChannelSigner: ChannelSigner {
 
 	/// Generate a local nonce pair, which requires committing to ahead of time.
 	/// The counterparty needs the public nonce generated herein to compute a partial signature.
+	///
+	/// `Err` means the nonce is not available YET (an asynchronous or remote signer):
+	/// the message that was to carry it waits on the matching `signer_pending_*`
+	/// flag and is retried from [`ChannelManager::signer_unblocked`]. Deterministic
+	/// per height: asking twice for one height yields one nonce, which is what lets
+	/// the channel re-derive the nonce it advertised when the peer's partial arrives.
+	///
+	/// [`ChannelManager::signer_unblocked`]: crate::ln::channelmanager::ChannelManager::signer_unblocked
 	fn generate_local_nonce_pair(
 		&self, commitment_number: u64, secp_ctx: &Secp256k1<secp256k1::All>,
-	) -> PublicNonce;
+	) -> Result<PublicNonce, ()>;
 
 	/// Create a signature for a counterparty's commitment transaction and associated HTLC transactions.
 	///
@@ -63,22 +71,20 @@ pub trait TaprootChannelSigner: ChannelSigner {
 		outbound_htlc_preimages: Vec<PaymentPreimage>, secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<(PartialSignatureWithNonce, Vec<Signature>), ()>;
 
-	/// Creates a signature for a holder's commitment transaction.
+	/// Our MuSig2 key-path partial (with the nonce it was signed under) over OUR
+	/// holder commitment, against the counterparty's partial-with-nonce that
+	/// `commitment_signed` carried. Called only when we FORCE-CLOSE — the receive
+	/// path verifies the counterparty's partial alone and stores it — so `Err`
+	/// (not yet available) leaves the broadcast unsigned in the onchain handler,
+	/// retried from `ChannelMonitor::signer_unblocked`; it never closes a channel.
 	///
-	/// This will be called
-	/// - with a non-revoked `commitment_tx`.
-	/// - with the latest `commitment_tx` when we initiate a force-close.
-	///
-	/// This may be called multiple times for the same transaction.
-	///
-	/// An external signer implementation should check that the commitment has not been revoked.
-	///
-	// TODO: Document the things someone using this interface should enforce before signing.
+	/// This may be called multiple times for the same transaction. An external
+	/// signer implementation should check that the commitment has not been revoked.
 	fn finalize_holder_commitment(
 		&self, commitment_tx: &HolderCommitmentTransaction,
 		counterparty_partial_signature: PartialSignatureWithNonce,
 		secp_ctx: &Secp256k1<secp256k1::All>,
-	) -> Result<PartialSignature, ()>;
+	) -> Result<(PartialSignature, PublicNonce), ()>;
 
 	/// Create a signature for the given input in a transaction spending an HTLC transaction output
 	/// or a commitment transaction `to_local` output when our counterparty broadcasts an old state.
@@ -200,4 +206,52 @@ pub trait TaprootChannelSigner: ChannelSigner {
 	}
 
 	// TODO: sign channel announcement
+}
+
+/// The complete BIP340 key-path witness signature for OUR holder commitment on a
+/// simple-taproot channel: our partial from [`TaprootChannelSigner::finalize_holder_commitment`]
+/// aggregated with the counterparty's stored partial and checked against `Q`. The
+/// signer is handed the funding scope from `channel_parameters` first, because the
+/// monitor's signer copy has never seen the channel's nonce exchange. `Err` when the
+/// commitment carries no counterparty partial (not a taproot channel) or the signer
+/// cannot answer yet.
+pub fn taproot_holder_commitment_signature<S: TaprootChannelSigner + ?Sized>(
+	signer: &S, channel_parameters: &crate::ln::chan_utils::ChannelTransactionParameters,
+	commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<secp256k1::All>,
+) -> Result<Signature, ()> {
+	let psn = commitment_tx.taproot_counterparty_partial.clone().ok_or(())?;
+	let counterparty_funding_pubkey =
+		channel_parameters.counterparty_parameters.as_ref().ok_or(())?.pubkeys.funding_pubkey;
+	signer.provide_taproot_context(crate::sign::TaprootSignerContext {
+		counterparty_funding_pubkey,
+		funding_value_sat: channel_parameters.channel_value_satoshis,
+		counterparty_closing_nonce: None,
+		closing_round: 0,
+		splice_parent_funding_txid: channel_parameters.splice_parent_funding_txid,
+	});
+	let (our_partial, our_pubnonce) =
+		signer.finalize_holder_commitment(commitment_tx, psn.clone(), secp_ctx)?;
+	let funding_spk = crate::ln::chan_utils::channel_taproot_script_pubkey(
+		&channel_parameters.holder_pubkeys.funding_pubkey,
+		&counterparty_funding_pubkey,
+	)
+	.map_err(|_| ())?;
+	let sighash = crate::ln::chan_utils::taproot_funding_keyspend_sighash(
+		&commitment_tx.trust().built_transaction().transaction,
+		0,
+		bitcoin::Amount::from_sat(channel_parameters.channel_value_satoshis),
+		&funding_spk,
+	)
+	.map_err(|_| ())?;
+	let PartialSignatureWithNonce(cp_partial, cp_pubnonce) = psn;
+	crate::ln::chan_utils::verify_taproot_keyspend_partials(
+		&channel_parameters.holder_pubkeys.funding_pubkey,
+		&counterparty_funding_pubkey,
+		sighash.as_ref(),
+		our_partial,
+		our_pubnonce,
+		cp_partial,
+		cp_pubnonce,
+	)
+	.map_err(|_| ())
 }

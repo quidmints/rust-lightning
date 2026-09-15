@@ -292,6 +292,21 @@ pub trait EcdsaChannelSigner: ChannelSigner {
 		Err(())
 	}
 
+	/// The key-path witness signature for OUR holder commitment on a simple-taproot
+	/// channel, formed when we force-close (the taproot twin of
+	/// [`sign_holder_commitment`]): our partial aggregated with the counterparty's
+	/// partial stored on the commitment. `Err` leaves the broadcast unsigned and
+	/// retried from `ChannelMonitor::signer_unblocked`. See
+	/// [`crate::sign::taproot::taproot_holder_commitment_signature`].
+	///
+	/// [`sign_holder_commitment`]: Self::sign_holder_commitment
+	fn sign_holder_commitment_taproot(
+		&self, _channel_parameters: &ChannelTransactionParameters,
+		_commitment_tx: &HolderCommitmentTransaction, _secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature, ()> {
+		Err(())
+	}
+
 	/// Schnorr sig for OUR second-level HTLC-Success/Timeout tx spending our own
 	/// broadcast taproot commitment's HTLC output via its 2-of-2 leaf. Mirrors
 	/// [`sign_holder_htlc_transaction`] (which returns ECDSA). The counterparty's

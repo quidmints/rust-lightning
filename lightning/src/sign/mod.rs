@@ -2380,6 +2380,18 @@ impl EcdsaChannelSigner for InMemorySigner {
 		Ok(secp_ctx.sign_schnorr_no_aux_rand(&msg, &tweaked))
 	}
 
+	fn sign_holder_commitment_taproot(
+		&self, channel_parameters: &ChannelTransactionParameters,
+		commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<schnorr::Signature, ()> {
+		crate::sign::taproot::taproot_holder_commitment_signature(
+			self,
+			channel_parameters,
+			commitment_tx,
+			secp_ctx,
+		)
+	}
+
 	fn sign_holder_htlc_transaction_taproot(
 		&self, htlc_tx: &Transaction, input: usize, htlc_descriptor: &HTLCDescriptor,
 		secp_ctx: &Secp256k1<secp256k1::All>,
@@ -2610,7 +2622,7 @@ impl TaprootChannelSigner for InMemorySigner {
 
 	fn generate_local_nonce_pair(
 		&self, commitment_number: u64, secp_ctx: &Secp256k1<All>,
-	) -> PublicNonce {
+	) -> Result<PublicNonce, ()> {
 		let (key_agg, our_index, _cp_index, _value, _spk) = self
 			.taproot_key_agg(secp_ctx)
 			.expect("taproot context must be supplied before advertising a nonce");
@@ -2620,7 +2632,7 @@ impl TaprootChannelSigner for InMemorySigner {
 			&self.commitment_seed,
 			commitment_number,
 		)
-		.expect("local nonce derivation")
+		.map_err(|_| ())
 	}
 
 	fn partially_sign_counterparty_commitment(
@@ -2679,7 +2691,7 @@ impl TaprootChannelSigner for InMemorySigner {
 	fn finalize_holder_commitment(
 		&self, commitment_tx: &HolderCommitmentTransaction,
 		counterparty_partial_signature: PartialSignatureWithNonce, secp_ctx: &Secp256k1<All>,
-	) -> Result<PartialSignature, ()> {
+	) -> Result<(PartialSignature, PublicNonce), ()> {
 		let idx = commitment_tx.commitment_number();
 		let (key_agg, our_index, counterparty_index, funding_value_sat, funding_spk) =
 			self.taproot_key_agg(secp_ctx)?;
@@ -2696,7 +2708,7 @@ impl TaprootChannelSigner for InMemorySigner {
 		let message: [u8; 32] = *sighash.as_ref();
 
 		let PartialSignatureWithNonce(_cp_partial, cp_nonce) = counterparty_partial_signature;
-		let (partial, _our_pubnonce) = crate::sign::taproot_signer::our_key_path_partial(
+		crate::sign::taproot_signer::our_key_path_partial(
 			key_agg,
 			our_index,
 			counterparty_index,
@@ -2706,8 +2718,7 @@ impl TaprootChannelSigner for InMemorySigner {
 			cp_nonce,
 			message,
 		)
-		.map_err(|_| ())?;
-		Ok(partial)
+		.map_err(|_| ())
 	}
 
 	fn sign_justice_revoked_output(

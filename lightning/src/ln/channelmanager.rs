@@ -12468,6 +12468,12 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							msg,
 						});
 					}
+					if let Some(msg) = msgs.shutdown {
+						pending_msg_events.push(MessageSendEvent::SendShutdown {
+							node_id,
+							msg,
+						});
+					}
 				}
 				if let Some(funded_chan) = chan.as_funded() {
 					if let Some(msg) = msgs.channel_ready {
@@ -15194,8 +15200,8 @@ where
 							if peer_state_mutex_opt.is_none() { return NotifyOption::SkipPersistNoEvents; }
 							let mut peer_state = peer_state_mutex_opt.unwrap().lock().unwrap();
 							if let Some(chan) = peer_state.channel_by_id
-								.get(&msg.channel_id)
-								.and_then(Channel::as_funded)
+								.get_mut(&msg.channel_id)
+								.and_then(Channel::as_funded_mut)
 							{
 								if let Some(msg) = chan.get_outbound_shutdown() {
 									peer_state.pending_msg_events.push(MessageSendEvent::SendShutdown {

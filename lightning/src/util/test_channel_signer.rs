@@ -553,6 +553,15 @@ impl EcdsaChannelSigner for TestChannelSigner {
 		)
 	}
 
+	fn sign_holder_commitment_taproot(
+		&self, channel_parameters: &ChannelTransactionParameters,
+		commitment_tx: &HolderCommitmentTransaction, secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<bitcoin::secp256k1::schnorr::Signature, ()> {
+		EcdsaChannelSigner::sign_holder_commitment_taproot(
+			&self.inner, channel_parameters, commitment_tx, secp_ctx,
+		)
+	}
+
 	fn sign_counterparty_htlc_transaction_taproot(
 		&self, channel_parameters: &ChannelTransactionParameters, htlc_tx: &Transaction,
 		input: usize, amount: u64, per_commitment_point: &PublicKey, htlc: &HTLCOutputInCommitment,
@@ -579,7 +588,7 @@ impl TaprootChannelSigner for TestChannelSigner {
 
 	fn generate_local_nonce_pair(
 		&self, commitment_number: u64, secp_ctx: &Secp256k1<All>,
-	) -> PublicNonce {
+	) -> Result<PublicNonce, ()> {
 		self.inner.generate_local_nonce_pair(commitment_number, secp_ctx)
 	}
 
@@ -600,7 +609,7 @@ impl TaprootChannelSigner for TestChannelSigner {
 	fn finalize_holder_commitment(
 		&self, commitment_tx: &HolderCommitmentTransaction,
 		counterparty_partial_signature: PartialSignatureWithNonce, secp_ctx: &Secp256k1<All>,
-	) -> Result<PartialSignature, ()> {
+	) -> Result<(PartialSignature, PublicNonce), ()> {
 		self.inner.finalize_holder_commitment(
 			commitment_tx,
 			counterparty_partial_signature,

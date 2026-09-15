@@ -768,13 +768,17 @@ impl HolderFundingOutput {
 			.unwrap_or(onchain_tx_handler.channel_parameters());
 		let commitment_tx = self.commitment_tx.as_ref()
 			.unwrap_or(onchain_tx_handler.current_holder_commitment_tx());
-		// Simple-taproot (BOLT #995) force-close: the funding spend is a key-path
-		// MuSig2 aggregate Schnorr sig formed interactively at `commitment_signed`
-		// and stored on the holder commitment (spec §9a) — there is no holder ECDSA
-		// sig to add at broadcast time. Emit the single-64-byte key-path witness.
+		// Simple-taproot (BOLT #995) force-close: the funding spend is a single
+		// key-path MuSig2 signature — our partial, formed now, aggregated with the
+		// counterparty's partial stored on the holder commitment (spec §9a). A signer
+		// that cannot answer yet leaves the tx unsigned, retried on `signer_unblocked`,
+		// exactly as the ECDSA arm below.
 		if self.channel_type_features.supports_simple_taproot() {
-			let signed = commitment_tx.get_taproot_signed_tx();
-			return MaybeSignedTransaction(signed);
+			let maybe_signed_tx = onchain_tx_handler.signer
+				.sign_holder_commitment_taproot(channel_parameters, commitment_tx, &onchain_tx_handler.secp_ctx)
+				.map(|sig| commitment_tx.add_taproot_key_path_sig(sig))
+				.unwrap_or_else(|_| commitment_tx.trust().built_transaction().transaction.clone());
+			return MaybeSignedTransaction(maybe_signed_tx);
 		}
 		let maybe_signed_tx = onchain_tx_handler.signer
 			.sign_holder_commitment(channel_parameters, commitment_tx, &onchain_tx_handler.secp_ctx)
