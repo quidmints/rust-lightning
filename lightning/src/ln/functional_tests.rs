@@ -54,7 +54,7 @@ use crate::types::string::UntrustedString;
 use crate::util::config::{ChannelConfigUpdate, MaxDustHTLCExposure, UserConfig};
 use crate::util::errors::APIError;
 use crate::util::ser::{ReadableArgs, Writeable};
-use crate::util::test_channel_signer::TestChannelSigner;
+use crate::util::test_channel_signer::{SignerOp, TestChannelSigner};
 use crate::util::test_utils::{self, WatchtowerPersister};
 
 use bitcoin::hash_types::BlockHash;
@@ -10741,6 +10741,91 @@ fn test_simple_taproot_channel_htlc_send_and_claim() {
 	// taproot commitment_signed round — removing the HTLC output). Reaching here means
 	// every taproot HTLC commitment_signed round (add + claim) verified.
 	claim_payment(&nodes[0], &[&nodes[1]], preimage);
+}
+
+#[test]
+fn test_simple_taproot_channel_holder_nonce_answered_later() {
+	// The holder signer on a simple-taproot channel may answer LATER (a remote LP's
+	// phone): with `generate_local_nonce_pair` unavailable, receiving a
+	// `commitment_signed` must NOT close the channel — the peer's partial is verified
+	// alone — and the `revoke_and_ack` that would carry our next nonce waits on
+	// `signer_pending_revoke_and_ack` until `signer_unblocked`, after which the round
+	// completes and the HTLC is claimable. The channel closing, or the RAA going out
+	// without the nonce, would each fail this.
+	let mut taproot_cfg = test_default_channel_config();
+	taproot_cfg.channel_handshake_config.negotiate_simple_taproot = true;
+	taproot_cfg.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
+	taproot_cfg.manually_accept_inbound_channels = true;
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(taproot_cfg.clone()), Some(taproot_cfg)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let (channel_ready, _) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 0);
+	let chan_id = channel_ready.channel_id;
+	assert!(get_channel_type_features!(nodes[0], nodes[1], chan_id).supports_simple_taproot());
+
+	let (src, dst) = (&nodes[0], &nodes[1]);
+	let (src_node_id, dst_node_id) = (src.node.get_our_node_id(), dst.node.get_our_node_id());
+	let (route, payment_hash, preimage, payment_secret) =
+		get_route_and_payment_hash!(src, dst, 100_000_000);
+	src.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+	check_added_monitors(src, 1);
+	let payment_event = {
+		let mut events = src.node.get_and_clear_pending_msg_events();
+		assert_eq!(events.len(), 1);
+		SendEvent::from_event(events.remove(0))
+	};
+	assert_eq!(payment_event.node_id, dst_node_id);
+	dst.node.handle_update_add_htlc(src_node_id, &payment_event.msgs[0]);
+
+	// The nonce is not available when the commitment arrives.
+	dst.disable_channel_signer_op(&src_node_id, &chan_id, SignerOp::GenerateLocalNonce);
+	dst.node.handle_commitment_signed_batch_test(src_node_id, &payment_event.commitment_msg);
+	check_added_monitors(dst, 1);
+	assert!(!dst.node.list_channels().is_empty(), "the channel is open: the peer's partial verified alone");
+	let events = dst.node.get_and_clear_pending_msg_events();
+	assert!(events.is_empty(), "the RAA waits for the nonce; got {}", events.len());
+
+	// The signer answers.
+	dst.enable_channel_signer_op(&src_node_id, &chan_id, SignerOp::GenerateLocalNonce);
+	dst.node.signer_unblocked(Some((src_node_id, chan_id)));
+	// Both parked messages go out together, RAA first (the resend order).
+	let mut events = dst.node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 2, "the RAA and the commitment update it was holding back");
+	let raa = match events.remove(0) {
+		MessageSendEvent::SendRevokeAndACK { node_id, msg } => {
+			assert_eq!(node_id, src_node_id);
+			msg
+		},
+		e => panic!("expected the RAA first, got {:?}", e),
+	};
+	assert!(raa.next_local_nonce.is_some(), "the RAA carries the nonce it waited for");
+	let dst_cs = match events.remove(0) {
+		MessageSendEvent::UpdateHTLCs { node_id, updates, .. } => {
+			assert_eq!(node_id, src_node_id);
+			updates
+		},
+		e => panic!("expected the commitment update, got {:?}", e),
+	};
+	src.node.handle_revoke_and_ack(dst_node_id, &raa);
+	check_added_monitors(src, 1);
+	src.node.handle_commitment_signed_batch_test(dst_node_id, &dst_cs.commitment_signed);
+	check_added_monitors(src, 1);
+	let src_raa = get_event_msg!(src, MessageSendEvent::SendRevokeAndACK, dst_node_id);
+	dst.node.handle_revoke_and_ack(src_node_id, &src_raa);
+	check_added_monitors(dst, 1);
+	expect_and_process_pending_htlcs(dst, false);
+	expect_payment_claimable!(dst, payment_hash, payment_secret, 100_000_000);
+	claim_payment(src, &[dst], preimage);
 }
 
 #[test]

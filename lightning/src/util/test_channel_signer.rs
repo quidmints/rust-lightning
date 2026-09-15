@@ -108,6 +108,8 @@ pub enum SignerOp {
 	SignClosingTransaction,
 	SignHolderAnchorInput,
 	SignChannelAnnouncementWithFundingKey,
+	/// Simple taproot: `generate_local_nonce_pair`.
+	GenerateLocalNonce,
 }
 
 impl SignerOp {
@@ -126,6 +128,7 @@ impl SignerOp {
 			SignerOp::SignClosingTransaction,
 			SignerOp::SignHolderAnchorInput,
 			SignerOp::SignChannelAnnouncementWithFundingKey,
+			SignerOp::GenerateLocalNonce,
 		]
 	}
 }
@@ -589,6 +592,10 @@ impl TaprootChannelSigner for TestChannelSigner {
 	fn generate_local_nonce_pair(
 		&self, commitment_number: u64, secp_ctx: &Secp256k1<All>,
 	) -> Result<PublicNonce, ()> {
+		#[cfg(test)]
+		if !self.is_signer_available(SignerOp::GenerateLocalNonce) {
+			return Err(());
+		}
 		self.inner.generate_local_nonce_pair(commitment_number, secp_ctx)
 	}
 

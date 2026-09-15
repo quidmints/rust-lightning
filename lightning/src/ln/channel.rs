@@ -3018,6 +3018,16 @@ where
 	// first nonce is received. Never persisted across a reconnect (re-exchanged
 	// fresh); re-derivable on our side from the shachain root.
 	cur_counterparty_taproot_nonce: Option<musig2::PubNonce>,
+	// OUR most recently advertised `next_local_nonce` per funding scope (keyed by the
+	// scope's splice parent: `None` is the original funding), with the holder commitment
+	// height it is for. The receive path verifies the peer's partial under THIS, not under
+	// a fresh derivation, so a signer that is unavailable when `commitment_signed` arrives
+	// (it answered once, when we advertised) cannot turn the message into a close. Not
+	// persisted: a reconnect re-advertises. Behind a mutex only because the generators
+	// run on `&self` from inside borrows of sibling fields.
+	holder_taproot_nonces: Mutex<HashMap<Option<Txid>, (u64, musig2::PubNonce)>>,
+	// The same for the cooperative-close nonce, by `closing_round`.
+	holder_closing_nonce: Mutex<Option<(u64, musig2::PubNonce)>>,
 	// The counterparty's current cooperative-close nonce (their `shutdown_nonce`,
 	// then the `next_closee_nonce` from each RBF `closing_sig`). Spec §5.
 	cur_counterparty_closing_nonce: Option<musig2::PubNonce>,
@@ -3823,6 +3833,8 @@ where
 			shutdown_scriptpubkey,
 			destination_script,
 			cur_counterparty_taproot_nonce: None,
+			holder_taproot_nonces: Mutex::new(new_hash_map()),
+			holder_closing_nonce: Mutex::new(None),
 			cur_counterparty_closing_nonce: None,
 			closing_round: 0,
 			closing_partial_sent_at_round: false,
@@ -4080,6 +4092,8 @@ where
 			shutdown_scriptpubkey,
 			destination_script,
 			cur_counterparty_taproot_nonce: None,
+			holder_taproot_nonces: Mutex::new(new_hash_map()),
+			holder_closing_nonce: Mutex::new(None),
 			cur_counterparty_closing_nonce: None,
 			closing_round: 0,
 			closing_partial_sent_at_round: false,
@@ -6523,8 +6537,7 @@ where
 
 	/// Verify the counterparty's MuSig2 key-path partial over OUR holder commitment
 	/// at `commitment_number` (spec §3) — against the nonce we advertised for that
-	/// height, re-derived from the signer (deterministic per height, so it is the
-	/// one the peer signed under), and the peer's nonce carried beside the partial.
+	/// height (`holder_taproot_nonces`) and the peer's nonce carried beside the partial.
 	/// Our own partial is NOT produced here; it waits until we force-close
 	/// (`EcdsaChannelSigner::sign_holder_commitment_taproot`), so a slow holder
 	/// signer never turns a valid `commitment_signed` into a channel close.
@@ -6539,16 +6552,11 @@ where
 			&funding.get_funding_spk(),
 		)
 		.map_err(|_| ChannelError::close("taproot sighash computation failed".to_owned()))?;
-		self.provide_taproot_context_to_signer(funding);
-		let taproot_signer = self.holder_signer.as_taproot().ok_or_else(|| {
-			ChannelError::close("taproot channel without taproot signer".to_owned())
-		})?;
-		// The nonce we advertised for this height. A signer that cannot reproduce it
-		// never advertised it, so a partial "under" it cannot be the peer's honest work.
-		let our_pubnonce =
-			taproot_signer.generate_local_nonce_pair(commitment_number, &self.secp_ctx).map_err(
-				|_| ChannelError::close("holder taproot nonce for this height is unavailable".to_owned()),
-			)?;
+		// The nonce we advertised for this height. One we never advertised (and the
+		// signer cannot derive now) is one an honest peer never signed under.
+		let our_pubnonce = self.advertised_holder_nonce(funding, commitment_number).map_err(
+			|_| ChannelError::close("holder taproot nonce for this height is unavailable".to_owned()),
+		)?;
 		let PartialSignatureWithNonce(cp_partial, cp_pubnonce) = psn;
 		chan_utils::verify_taproot_keyspend_partial(
 			&funding.get_holder_pubkeys().funding_pubkey,
@@ -6577,10 +6585,30 @@ where
 			return Ok(None);
 		}
 		self.provide_taproot_context_to_signer(funding);
-		match self.holder_signer.as_taproot() {
-			Some(s) => s.generate_local_nonce_pair(commitment_number, &self.secp_ctx).map(Some),
-			None => Ok(None),
+		let Some(s) = self.holder_signer.as_taproot() else { return Ok(None) };
+		let nonce = s.generate_local_nonce_pair(commitment_number, &self.secp_ctx)?;
+		self.holder_taproot_nonces.lock().unwrap().insert(
+			funding.channel_transaction_parameters.splice_parent_funding_txid,
+			(commitment_number, nonce.clone()),
+		);
+		Ok(Some(nonce))
+	}
+
+	/// The nonce we advertised for `funding`'s scope at `commitment_number`, or — for a
+	/// height we never advertised, which an honest peer never signs under — the signer's
+	/// derivation of it.
+	fn advertised_holder_nonce(
+		&self, funding: &FundingScope, commitment_number: u64,
+	) -> Result<musig2::PubNonce, ()> {
+		let scope = funding.channel_transaction_parameters.splice_parent_funding_txid;
+		if let Some((height, nonce)) = self.holder_taproot_nonces.lock().unwrap().get(&scope) {
+			if *height == commitment_number {
+				return Ok(nonce.clone());
+			}
 		}
+		self.provide_taproot_context_to_signer(funding);
+		let s = self.holder_signer.as_taproot().ok_or(())?;
+		s.generate_local_nonce_pair(commitment_number, &self.secp_ctx)
 	}
 
 	/// Generate **our** cooperative-close MuSig2 nonce (`shutdown_nonce` for round 0,
@@ -6602,10 +6630,10 @@ where
 		}
 		self.provide_taproot_context_to_signer(funding);
 		let height = crate::sign::closing_nonce_height(self.closing_round);
-		match self.holder_signer.as_taproot() {
-			Some(s) => s.generate_local_nonce_pair(height, &self.secp_ctx).map(Some),
-			None => Ok(None),
-		}
+		let Some(s) = self.holder_signer.as_taproot() else { return Ok(None) };
+		let nonce = s.generate_local_nonce_pair(height, &self.secp_ctx)?;
+		*self.holder_closing_nonce.lock().unwrap() = Some((self.closing_round, nonce.clone()));
+		Ok(Some(nonce))
 	}
 
 	/// Generate **our** MuSig2 splice nonce (the `splice_init`/`splice_ack`
@@ -11461,14 +11489,22 @@ where
 	fn verify_taproot_closing_partial(
 		&self, closing_tx: &ClosingTransaction, counterparty_psn: &PartialSignatureWithNonce,
 	) -> Result<(), ChannelError> {
-		self.context.provide_taproot_context_to_signer(&self.funding);
-		let taproot_signer = self.context.holder_signer.as_taproot().ok_or_else(|| {
-			ChannelError::close("taproot channel without taproot signer".to_owned())
-		})?;
-		let our_pubnonce = taproot_signer.generate_local_nonce_pair(
-			crate::sign::closing_nonce_height(self.context.closing_round),
-			&self.context.secp_ctx,
-		).map_err(|_| ChannelError::close("holder closing taproot nonce is unavailable".to_owned()))?;
+		// The closing nonce we advertised for this round (`shutdown_nonce`, or the round's
+		// `closing_signed`); for a round we never advertised, the signer's derivation.
+		let advertised = self.context.holder_closing_nonce.lock().unwrap().clone();
+		let our_pubnonce = match advertised {
+			Some((round, nonce)) if round == self.context.closing_round => nonce,
+			_ => {
+				self.context.provide_taproot_context_to_signer(&self.funding);
+				let taproot_signer = self.context.holder_signer.as_taproot().ok_or_else(|| {
+					ChannelError::close("taproot channel without taproot signer".to_owned())
+				})?;
+				taproot_signer.generate_local_nonce_pair(
+					crate::sign::closing_nonce_height(self.context.closing_round),
+					&self.context.secp_ctx,
+				).map_err(|_| ChannelError::close("holder closing taproot nonce is unavailable".to_owned()))?
+			},
+		};
 		let PartialSignatureWithNonce(cp_partial, cp_pubnonce) = counterparty_psn;
 		chan_utils::verify_taproot_keyspend_partial(
 			&self.funding.get_holder_pubkeys().funding_pubkey,
@@ -17105,6 +17141,8 @@ where
 				shutdown_scriptpubkey,
 				destination_script,
 				cur_counterparty_taproot_nonce: None,
+				holder_taproot_nonces: Mutex::new(new_hash_map()),
+				holder_closing_nonce: Mutex::new(None),
 				cur_counterparty_closing_nonce: None,
 				closing_round, // restart nonce-reuse guard applied above
 				closing_partial_sent_at_round: false, // consumed by the reload bump above

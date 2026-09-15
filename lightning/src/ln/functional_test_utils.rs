@@ -673,7 +673,11 @@ impl<'a, 'b, 'c> Node<'a, 'b, 'c> {
 		if let Some(context) =
 			chan_lock.channel_by_id.get_mut(chan_id).map(|chan| chan.context_mut())
 		{
-			let signer = context.get_mut_signer().as_mut_ecdsa().unwrap();
+			// Both channel kinds hold a `TestChannelSigner` here.
+			let signer: &mut TestChannelSigner = match context.get_mut_signer() {
+				crate::sign::type_resolver::ChannelSignerType::Ecdsa(s) => s,
+				crate::sign::type_resolver::ChannelSignerType::Taproot(s) => s,
+			};
 			if available {
 				signer.enable_op(signer_op);
 			} else {
