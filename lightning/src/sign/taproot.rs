@@ -194,13 +194,17 @@ pub trait TaprootChannelSigner: ChannelSigner {
 	/// key-path sign. The secret nonce is the per-splice-unique
 	/// [`crate::sign::splice_nonce_height`]`(prev_funding_txid)`; `counterparty_nonce`
 	/// is the peer's advertised `splice_nonce`; `all_prevouts` lets the BIP341
-	/// key-path sighash commit to every input (a splice tx has > 1 input). The two
-	/// partials are aggregated into the single 64-byte key-path witness by the
-	/// signing session. Default `Err(())` for non-taproot signers.
+	/// key-path sighash commit to every input (a splice tx has > 1 input);
+	/// `next_counterparty_funding_pubkey` is the peer's ROTATED funding key for the new
+	/// scope, so a policy signer can recognise the continuing `0x5120 || Q'` output
+	/// among the splice's outputs. The two partials are aggregated into the single
+	/// 64-byte key-path witness by the signing session. Default `Err(())` for
+	/// non-taproot signers.
 	fn partially_sign_splice_shared_input(
 		&self, _tx: &Transaction, _input_index: usize, _all_prevouts: &[bitcoin::TxOut],
 		_counterparty_nonce: PublicNonce, _prev_funding_txid: &bitcoin::Txid,
-		_candidate_index: u64, _secp_ctx: &Secp256k1<secp256k1::All>,
+		_candidate_index: u64, _next_counterparty_funding_pubkey: &PublicKey,
+		_secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<(PartialSignature, PublicNonce), ()> {
 		Err(())
 	}

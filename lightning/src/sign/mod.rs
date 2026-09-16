@@ -2857,7 +2857,8 @@ impl TaprootChannelSigner for InMemorySigner {
 	fn partially_sign_splice_shared_input(
 		&self, tx: &Transaction, input_index: usize, all_prevouts: &[bitcoin::TxOut],
 		counterparty_nonce: PublicNonce, prev_funding_txid: &bitcoin::Txid,
-		candidate_index: u64, secp_ctx: &Secp256k1<All>,
+		candidate_index: u64, _next_counterparty_funding_pubkey: &PublicKey,
+		secp_ctx: &Secp256k1<All>,
 	) -> Result<(PartialSignature, PublicNonce), ()> {
 		// The splice tx spends the OLD funding output (the current `0x5120||Q`); the
 		// KeyAggContext is the CURRENT funding-key aggregate (spec §9c). A splice tx

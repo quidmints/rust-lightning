@@ -9813,12 +9813,21 @@ where
 					})?;
 					// (§SPLICE-NONCE-PER-CANDIDATE) The index this negotiation was advertised
 					// with, read from where it was stamped — never recomputed here.
-					let candidate_index = self
+					let pending_splice = self
 						.pending_splice
 						.as_ref()
-						.map(|p| p.candidate_index)
 						.ok_or_else(|| APIError::APIMisuseError {
 							err: "Taproot splice signing without a pending splice".to_owned(),
+						})?;
+					let candidate_index = pending_splice.candidate_index;
+					// The peer's ROTATED funding key: the new scope's, being signed for.
+					let next_counterparty_funding_pubkey = pending_splice
+						.funding_negotiation
+						.as_ref()
+						.and_then(|negotiation| negotiation.as_funding())
+						.map(|funding| *funding.counterparty_funding_pubkey())
+						.ok_or_else(|| APIError::APIMisuseError {
+							err: "Taproot splice signing without a negotiated funding scope".to_owned(),
 						})?;
 					let (partial, our_pubnonce) = taproot_signer
 						.partially_sign_splice_shared_input(
@@ -9828,6 +9837,7 @@ where
 							cp_nonce,
 							&prev_funding_txid,
 							candidate_index,
+							&next_counterparty_funding_pubkey,
 							&self.context.secp_ctx,
 						)
 						.map_err(|()| APIError::APIMisuseError {
