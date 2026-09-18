@@ -1888,8 +1888,9 @@ fn fail_splice_on_interactive_tx_error() {
 	let tx_abort = get_event_msg!(acceptor, MessageSendEvent::SendTxAbort, node_id_initiator);
 	initiator.node.handle_tx_abort(node_id_acceptor, &tx_abort);
 
-	// Fail signing the commitment transaction, which prevents the initiator from sending
-	// tx_complete.
+	// A signer that cannot yet sign the commitment transaction does NOT fail the splice: the
+	// initiator still sends tx_complete, parks the negotiation, and sends its commitment_signed
+	// (and only then its tx_signatures) once the signer is unblocked.
 	initiator.disable_channel_signer_op(
 		&node_id_acceptor,
 		&channel_id,
@@ -1925,20 +1926,45 @@ fn fail_splice_on_interactive_tx_error() {
 	let tx_complete = get_event_msg!(acceptor, MessageSendEvent::SendTxComplete, node_id_initiator);
 	initiator.node.handle_tx_complete(node_id_acceptor, &tx_complete);
 
-	let event = get_event!(initiator, Event::SpliceFailed);
-	match event {
-		Event::SpliceFailed { contributed_inputs, .. } => {
-			assert_eq!(contributed_inputs.len(), 1);
-			assert_eq!(contributed_inputs[0], contribution.inputs()[0].outpoint());
-		},
-		_ => panic!("Expected Event::SpliceFailed"),
-	}
+	// The negotiation completed: the initiator sends its own tx_complete, and nothing else —
+	// no SpliceFailed, no commitment_signed while the signer is blocked. The acceptor (whose
+	// signer works) sends its commitment_signed at once.
+	let tx_complete = get_event_msg!(initiator, MessageSendEvent::SendTxComplete, node_id_acceptor);
+	acceptor.node.handle_tx_complete(node_id_initiator, &tx_complete);
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
+	let acceptor_commitment_signed = get_htlc_update_msgs(acceptor, &node_id_initiator);
+	assert_eq!(acceptor_commitment_signed.commitment_signed.len(), 1);
+	initiator.node.handle_commitment_signed_batch_test(
+		node_id_acceptor,
+		&acceptor_commitment_signed.commitment_signed,
+	);
+	check_added_monitors(initiator, 1);
+	assert!(initiator.node.get_and_clear_pending_msg_events().is_empty());
 
-	let tx_abort = get_event_msg!(initiator, MessageSendEvent::SendTxAbort, node_id_acceptor);
-	acceptor.node.handle_tx_abort(node_id_initiator, &tx_abort);
-
-	let tx_abort = get_event_msg!(acceptor, MessageSendEvent::SendTxAbort, node_id_initiator);
-	initiator.node.handle_tx_abort(node_id_acceptor, &tx_abort);
+	// The signer comes back: the initiator's commitment_signed is sent from signer_unblocked, and
+	// the acceptor, holding both, answers with its tx_signatures.
+	initiator.enable_channel_signer_op(
+		&node_id_acceptor,
+		&channel_id,
+		SignerOp::SignCounterpartyCommitment,
+	);
+	initiator.node.signer_unblocked(None);
+	let initiator_commitment_signed = get_htlc_update_msgs(initiator, &node_id_acceptor);
+	assert_eq!(initiator_commitment_signed.commitment_signed.len(), 1);
+	assert!(initiator_commitment_signed.update_add_htlcs.is_empty());
+	acceptor.node.handle_commitment_signed_batch_test(
+		node_id_initiator,
+		&initiator_commitment_signed.commitment_signed,
+	);
+	check_added_monitors(acceptor, 1);
+	let _tx_signatures = get_event_msg!(acceptor, MessageSendEvent::SendTxSignatures, node_id_initiator);
+	// The initiator still has its own inputs to sign; the rest of the exchange is the ordinary
+	// splice path, exercised by the tests above.
+	let _ = get_event!(initiator, Event::FundingTransactionReadyForSigning);
+	initiator.node.get_and_clear_pending_events();
+	acceptor.node.get_and_clear_pending_events();
+	initiator.node.get_and_clear_pending_msg_events();
+	acceptor.node.get_and_clear_pending_msg_events();
 }
 
 #[test]

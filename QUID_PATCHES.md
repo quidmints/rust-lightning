@@ -217,3 +217,35 @@ the patch is small:
 
 **Upstream path is unchanged**: with no registration the contribution is `0i64` and
 `our_funding_outputs` is empty, exactly as before.
+
+## Async signing at the splice's initial `commitment_signed` (2026-09-18, quid SPRINT §5 item 6 finding 13)
+
+**Why.** The LP's funding half lives on its phone (`quid-ln::validating_signer::FundingHalf::Remote`):
+the signer asks over HTTP and is answered a poll later, so every partial it is asked for
+synchronously is `None` the first time. The V1 open already tolerates that (`signer_pending_funding`
+→ `signer_maybe_unblocked`). Splicing did not: at `tx_complete` the initiator's
+`get_initial_commitment_signed_v2` returned `None` and `funding_tx_constructed` aborted the
+negotiation with `Failed to compute commitment_signed signatures` (upstream's
+`// TODO(splicing): Support async signing`); the taproot acceptor's deferred path
+(`splice_initial_commitment_signed`) closed the channel outright. So no splice — a swap-out
+delivery, a withdrawal, capacity keeping — could complete against a remote half.
+
+**What.**
+* `ChannelContext.signer_pending_splice_commitment_signed` (not persisted, like its siblings).
+* `funding_tx_constructed`, splice arm: a `None` parks the negotiation at `AwaitingSignatures`, sets
+  the flag and returns `Ok((constructor, None))` — the shape the taproot acceptor already used to
+  defer. `splice_initial_commitment_signed`: the acceptor's `None` sets the flag instead of closing.
+* `FundedChannel::signer_maybe_unblocked`: with the flag set and the negotiation at
+  `AwaitingSignatures`, retries `get_initial_commitment_signed_v2`; on success clears the flag and
+  returns the message as a bare `CommitmentUpdate` (the same event `internal_commitment_signed`
+  uses for the deferred acceptor), together with our held-back `tx_signatures`
+  (`SignerResumeUpdates.tx_signatures`, `InteractiveTxSigningSession::holder_tx_signatures_to_send`).
+  A negotiation that is gone clears the flag.
+* `funding_transaction_signed` and `tx_signatures` (receipt) hold our `tx_signatures` back while the
+  flag is set — the peer refuses them before our `commitment_signed` ("Received tx_signatures before
+  initial commitment_signed") — and `ChannelManager::signer_unblocked` sends them after the
+  commitment update. This is upstream's other `TODO(dual_funding)` at the same place.
+
+**Upstream path is unchanged**: a signer that answers synchronously never sets the flag.
+Acceptance: quid's `daemon_box_e2e` with `QUID_BOX_RAIL_B=1` (a swap-out delivered by a vault
+splice-out whose LP half is the `quid-lp-twin` process).

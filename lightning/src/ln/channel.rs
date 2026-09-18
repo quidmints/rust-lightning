@@ -1165,6 +1165,9 @@ pub(super) struct SignerResumeUpdates {
 	pub signed_closing_tx: Option<Transaction>,
 	pub shutdown_result: Option<ShutdownResult>,
 	pub shutdown: Option<msgs::Shutdown>,
+	/// A splice's `tx_signatures` (ours) held back while its `commitment_signed` awaited the
+	/// signer, released with it.
+	pub tx_signatures: Option<msgs::TxSignatures>,
 }
 
 /// The return value of `channel_reestablish`
@@ -1609,6 +1612,7 @@ where
 					signed_closing_tx: None,
 					shutdown_result: None,
 					shutdown: None,
+					tx_signatures: None,
 				})
 			},
 			ChannelPhase::UnfundedInboundV1(chan) => {
@@ -1626,6 +1630,7 @@ where
 					signed_closing_tx: None,
 					shutdown_result: None,
 					shutdown: None,
+					tx_signatures: None,
 				})
 			},
 			ChannelPhase::UnfundedV2(_) => None,
@@ -2145,17 +2150,23 @@ where
 										});
 									Ok((interactive_tx_constructor, Some(commitment_signed)))
 								},
-								// TODO(splicing): Support async signing
+								// An asynchronous signer: park the negotiation at
+								// `AwaitingSignatures` and send the `commitment_signed` from
+								// `signer_maybe_unblocked` once the signature is there. The peer
+								// waits for it before its `tx_signatures`, and ours are held back
+								// until it has gone out.
 								None => {
-									// Restore the taken state for later error handling
+									log_trace!(
+										logger,
+										"Splice initial commitment_signed awaiting signer; setting signer_pending_splice_commitment_signed"
+									);
+									chan.context.signer_pending_splice_commitment_signed = true;
 									pending_splice.funding_negotiation =
-										Some(FundingNegotiation::ConstructingTransaction {
+										Some(FundingNegotiation::AwaitingSignatures {
+											is_initiator,
 											funding,
-											interactive_tx_constructor,
 										});
-									Err(AbortReason::InternalError(
-										"Failed to compute commitment_signed signatures",
-									))
+									Ok((interactive_tx_constructor, None))
 								},
 							}
 						})?
@@ -3121,6 +3132,12 @@ where
 	/// A simple-taproot channel whose `shutdown` (ours) is waiting for the signer's closing
 	/// nonce; sent from `signer_maybe_unblocked`.
 	signer_pending_shutdown: bool,
+	/// A splice whose initial `commitment_signed` (ours, over the new funding) is waiting for the
+	/// signer — an asynchronous signer answers a beat after `tx_complete` asks. The negotiation
+	/// stays at `AwaitingSignatures`; `signer_maybe_unblocked` produces the message, and our
+	/// `tx_signatures` are held back until it has gone out (the peer refuses them before our
+	/// `commitment_signed`).
+	signer_pending_splice_commitment_signed: bool,
 
 	// pending_update_fee is filled when sending and receiving update_fee.
 	//
@@ -3867,6 +3884,7 @@ where
 			signer_pending_funding: false,
 			signer_pending_closing: false,
 			signer_pending_shutdown: false,
+			signer_pending_splice_commitment_signed: false,
 			signer_pending_channel_ready: false,
 
 			last_sent_closing_fee: None,
@@ -4126,6 +4144,7 @@ where
 			signer_pending_funding: false,
 			signer_pending_closing: false,
 			signer_pending_shutdown: false,
+			signer_pending_splice_commitment_signed: false,
 			signer_pending_channel_ready: false,
 
 			last_sent_closing_fee: None,
@@ -8614,16 +8633,22 @@ where
 					.expect("Funding must exist for negotiated pending splice");
 				let holder_commitment_number =
 					self.holder_commitment_point.current_transaction_number();
-				Some(
-					self.context
-						.get_initial_commitment_signed_v2(funding, holder_commitment_number, logger)
-						.ok_or_else(|| {
-							ChannelError::close(
-								"Failed to compute deferred taproot splice commitment_signed"
-									.to_owned(),
-							)
-						})?,
-				)
+				match self.context.get_initial_commitment_signed_v2(
+					funding,
+					holder_commitment_number,
+					logger,
+				) {
+					Some(commitment_signed) => Some(commitment_signed),
+					// An asynchronous signer: sent from `signer_maybe_unblocked` instead.
+					None => {
+						log_trace!(
+							logger,
+							"Deferred splice commitment_signed awaiting signer; setting signer_pending_splice_commitment_signed"
+						);
+						self.context.signer_pending_splice_commitment_signed = true;
+						None
+					},
+				}
 			} else {
 				None
 			}
@@ -9876,11 +9901,17 @@ where
 			.interactive_tx_signing_session
 			.as_mut()
 			.expect("signing session present (validated above)");
-		let (tx_signatures, funding_tx) = signing_session
+		let (mut tx_signatures, funding_tx) = signing_session
 			.provide_holder_witnesses(tx_signatures, &self.context.secp_ctx)
 			.map_err(|err| APIError::APIMisuseError { err })?;
 
 		let logger = WithChannelContext::from(logger, &self.context, None);
+		if self.context.signer_pending_splice_commitment_signed && tx_signatures.is_some() {
+			// Our `commitment_signed` has not gone out yet (asynchronous signer): the peer
+			// refuses `tx_signatures` before it. Released from `signer_maybe_unblocked` with it.
+			log_trace!(logger, "Holding tx_signatures back until the splice commitment_signed is sent");
+			tx_signatures = None;
+		}
 		if tx_signatures.is_some() {
 			log_info!(
 				logger,
@@ -9946,7 +9977,7 @@ where
 			}
 		}
 
-		let (holder_tx_signatures, funding_tx) =
+		let (mut holder_tx_signatures, funding_tx) =
 			signing_session.received_tx_signatures(msg).map_err(|msg| ChannelError::Warn(msg))?;
 
 		let logger = WithChannelContext::from(logger, &self.context, None);
@@ -9955,6 +9986,11 @@ where
 			"Received tx_signatures for interactive funding transaction {}",
 			msg.tx_hash
 		);
+		if self.context.signer_pending_splice_commitment_signed && holder_tx_signatures.is_some() {
+			// Ours wait for our `commitment_signed` (asynchronous signer); released with it.
+			log_trace!(logger, "Holding tx_signatures back until the splice commitment_signed is sent");
+			holder_tx_signatures = None;
+		}
 
 		let (splice_negotiated, splice_locked) = if let Some(funding_tx) = funding_tx.clone() {
 			self.on_tx_signatures_exchange(funding_tx, best_block_height, &logger)
@@ -10370,6 +10406,37 @@ where
 			log_trace!(logger, "Attempting to generate pending commitment update...");
 			self.get_last_commitment_update_for_send(logger).ok()
 		} else { None };
+		// A splice's initial `commitment_signed` the signer could not give at `tx_complete` (or,
+		// for the taproot acceptor, at the peer's `commitment_signed`): retried here, sent as a
+		// bare commitment update, and our held-back `tx_signatures` released with it.
+		let mut tx_signatures = None;
+		if self.context.signer_pending_splice_commitment_signed && commitment_update.is_none() {
+			let funding = self.pending_splice.as_ref()
+				.and_then(|pending_splice| pending_splice.funding_negotiation.as_ref())
+				.filter(|negotiation| matches!(negotiation, FundingNegotiation::AwaitingSignatures { .. }))
+				.and_then(|negotiation| negotiation.as_funding());
+			if let Some(funding) = funding {
+				log_trace!(logger, "Attempting to generate pending splice commitment_signed...");
+				let holder_commitment_number = self.holder_commitment_point.current_transaction_number();
+				if let Some(commitment_signed) = self.context.get_initial_commitment_signed_v2(funding, holder_commitment_number, logger) {
+					log_trace!(logger, "Splice commitment_signed generated: clearing signer_pending_splice_commitment_signed");
+					self.context.signer_pending_splice_commitment_signed = false;
+					commitment_update = Some(msgs::CommitmentUpdate {
+						update_add_htlcs: Vec::new(),
+						update_fulfill_htlcs: Vec::new(),
+						update_fail_htlcs: Vec::new(),
+						update_fail_malformed_htlcs: Vec::new(),
+						update_fee: None,
+						commitment_signed: vec![commitment_signed],
+					});
+					tx_signatures = self.context.interactive_tx_signing_session.as_ref()
+						.and_then(|session| session.holder_tx_signatures_to_send());
+				}
+			} else {
+				// The negotiation is gone (aborted or completed); nothing is pending any more.
+				self.context.signer_pending_splice_commitment_signed = false;
+			}
+		}
 		let mut revoke_and_ack = if self.context.signer_pending_revoke_and_ack {
 			log_trace!(logger, "Attempting to generate pending revoke and ack...");
 			self.get_last_revoke_and_ack(path_for_release_htlc, logger)
@@ -10459,6 +10526,7 @@ where
 			signed_closing_tx,
 			shutdown_result,
 			shutdown,
+			tx_signatures,
 		}
 	}
 
@@ -17181,6 +17249,7 @@ where
 				signer_pending_funding: false,
 				signer_pending_closing: false,
 				signer_pending_shutdown: false,
+				signer_pending_splice_commitment_signed: false,
 				signer_pending_channel_ready: false,
 
 				pending_update_fee,

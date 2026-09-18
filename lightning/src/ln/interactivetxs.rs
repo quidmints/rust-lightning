@@ -673,6 +673,15 @@ impl InteractiveTxSigningSession {
 		&self.holder_tx_signatures
 	}
 
+	/// Our `tx_signatures`, if provided and due to be sent now: we send first, or the
+	/// counterparty's have arrived. What `provide_holder_witnesses` would have released, for a
+	/// channel that held them back while its `commitment_signed` awaited the signer.
+	pub fn holder_tx_signatures_to_send(&self) -> Option<TxSignatures> {
+		(self.holder_sends_tx_signatures_first || self.has_received_tx_signatures())
+			.then(|| self.holder_tx_signatures.clone())
+			.flatten()
+	}
+
 	pub fn received_commitment_signed(&mut self) {
 		self.has_received_commitment_signed = true;
 	}

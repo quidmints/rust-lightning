@@ -12462,6 +12462,14 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 							msg,
 						});
 					}
+					// A splice's `tx_signatures` held back behind its `commitment_signed`: after the
+					// commitment update above, in the order the peer requires.
+					if let Some(msg) = msgs.tx_signatures {
+						pending_msg_events.push(MessageSendEvent::SendTxSignatures {
+							node_id,
+							msg,
+						});
+					}
 					if let Some(msg) = msgs.closing_signed {
 						pending_msg_events.push(MessageSendEvent::SendClosingSigned {
 							node_id,
