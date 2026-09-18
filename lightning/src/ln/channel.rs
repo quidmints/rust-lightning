@@ -2912,6 +2912,12 @@ pub(crate) struct SpliceInstructions {
 	change_script: Option<ScriptBuf>,
 	funding_feerate_per_kw: u32,
 	locktime: u32,
+	/// The splice's candidate index and our MuSig2 splice nonce for it, taken at
+	/// `splice_channel` so the nonce is in hand BEFORE quiescence is proposed: a signer that
+	/// answers asynchronously (a remote funding half) cannot be asked inside `send_splice_init`,
+	/// where `None` would go out on the wire and leave the acceptor unable to sign the shared
+	/// input. `None` for a non-taproot channel.
+	splice_nonce: Option<(u64, musig2::PubNonce)>,
 }
 
 impl SpliceInstructions {
@@ -2930,6 +2936,7 @@ impl_writeable_tlv_based!(SpliceInstructions, {
 	(7, change_script, option),
 	(9, funding_feerate_per_kw, required),
 	(11, locktime, required),
+	(13, splice_nonce, option),
 });
 
 pub(crate) enum QuiescentAction {
@@ -6683,6 +6690,18 @@ where
 	fn next_splice_candidate_index(&mut self) -> u64 {
 		self.splice_candidate_counter = self.splice_candidate_counter.saturating_add(1);
 		self.splice_candidate_counter
+	}
+
+	/// The index the NEXT `next_splice_candidate_index` would return, without taking it: what
+	/// `splice_channel` derives the splice nonce for ahead of the negotiation (an asynchronous
+	/// signer is asked once per index, so the index must not move between the ask and its use).
+	fn peek_splice_candidate_index(&self) -> u64 {
+		self.splice_candidate_counter.saturating_add(1)
+	}
+
+	/// Take `index` as this negotiation's, moving the counter past it.
+	fn adopt_splice_candidate_index(&mut self, index: u64) {
+		self.splice_candidate_counter = self.splice_candidate_counter.max(index);
 	}
 
 	/// Only allowed after [`FundingScope::channel_transaction_parameters`] is set.
@@ -13286,6 +13305,28 @@ where
 
 		let (our_funding_inputs, our_funding_outputs, change_script) = contribution.into_tx_parts();
 
+		// Simple-taproot: our splice nonce for the shared-input sign travels in `splice_init`.
+		// Derive it NOW, for the index the negotiation will be stamped with, so a signer that
+		// answers asynchronously (a remote funding half) has been asked before quiescence is
+		// proposed; unavailable ⇒ the caller retries this call once the signer has answered —
+		// the same index is asked again, and the answer already given is read.
+		let splice_nonce = if self.funding.get_channel_type().supports_simple_taproot() {
+			let prev_funding_txid = self.funding.get_funding_txid().ok_or_else(|| APIError::APIMisuseError {
+				err: "Cannot splice a channel without a funding txid".to_owned(),
+			})?;
+			let candidate_index = self.context.peek_splice_candidate_index();
+			match self.context.generate_holder_splice_nonce(&self.funding, &prev_funding_txid, candidate_index) {
+				Some(nonce) => Some((candidate_index, nonce)),
+				None => {
+					return Err(APIError::APIMisuseError {
+						err: "splice nonce pending: the signer has not supplied our splice nonce yet; retry once it has".to_owned(),
+					});
+				},
+			}
+		} else {
+			None
+		};
+
 		let action = QuiescentAction::Splice(SpliceInstructions {
 			adjusted_funding_contribution,
 			our_funding_inputs,
@@ -13293,6 +13334,7 @@ where
 			change_script,
 			funding_feerate_per_kw,
 			locktime,
+			splice_nonce,
 		});
 		self.propose_quiescence(logger, action)
 			.map_err(|e| APIError::APIMisuseError { err: e.to_owned() })
@@ -13308,6 +13350,7 @@ where
 			change_script,
 			funding_feerate_per_kw,
 			locktime,
+			splice_nonce: stamped_nonce,
 		} = instructions;
 
 		let prev_funding_input = self.funding.to_splice_funding_input();
@@ -13345,7 +13388,15 @@ where
 
 		let funding_negotiation =
 			FundingNegotiation::AwaitingAck { context, new_holder_funding_key: funding_pubkey };
-		let candidate_index = self.context.next_splice_candidate_index();
+		// The index the nonce was derived for at `splice_channel`, if one was; a fresh one
+		// otherwise (a non-taproot channel, or instructions written before the nonce rode here).
+		let candidate_index = match stamped_nonce.as_ref() {
+			Some((index, _)) => {
+				self.context.adopt_splice_candidate_index(*index);
+				*index
+			},
+			None => self.context.next_splice_candidate_index(),
+		};
 		self.pending_splice = Some(PendingFunding {
 			funding_negotiation: Some(funding_negotiation),
 			candidate_index,
@@ -13357,9 +13408,12 @@ where
 		// Simple-taproot: advertise our MuSig2 splice nonce for the key-path sign of
 		// the shared (old-funding) input, derived per the OLD funding txid AND this
 		// negotiation's stamped candidate index (spec §9c, §SPLICE-NONCE-PER-CANDIDATE).
-		let splice_nonce = prev_funding_txid.and_then(|txid| {
-			self.context.generate_holder_splice_nonce(&self.funding, &txid, candidate_index)
-		});
+		let splice_nonce = match stamped_nonce {
+			Some((_, nonce)) => Some(nonce),
+			None => prev_funding_txid.and_then(|txid| {
+				self.context.generate_holder_splice_nonce(&self.funding, &txid, candidate_index)
+			}),
+		};
 
 		msgs::SpliceInit {
 			channel_id: self.context.channel_id,
@@ -13705,6 +13759,10 @@ where
 		// nonce we advertise below, and stamped on the `PendingFunding` built below so the
 		// signing site reads the same value.
 		let candidate_index = self.context.next_splice_candidate_index();
+		// ⚠️ An ACCEPTOR whose funding half answers asynchronously would send `splice_ack` without
+		// this nonce, as the initiator did before its nonce moved to `splice_channel`. Not on the
+		// fleet's path today (the vault initiates every splice of its channels); to be parked on
+		// the pending signer the same way if the hop ever initiates onto a remote-half channel.
 		let splice_nonce = prev_funding_txid.and_then(|txid| {
 			self.context.generate_holder_splice_nonce(&self.funding, &txid, candidate_index)
 		});

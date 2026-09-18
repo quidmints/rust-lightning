@@ -249,3 +249,17 @@ delivery, a withdrawal, capacity keeping — could complete against a remote hal
 **Upstream path is unchanged**: a signer that answers synchronously never sets the flag.
 Acceptance: quid's `daemon_box_e2e` with `QUID_BOX_RAIL_B=1` (a swap-out delivered by a vault
 splice-out whose LP half is the `quid-lp-twin` process).
+
+## The splice nonce is derived at `splice_channel` (2026-09-18, quid SPRINT §5 item 6 finding 17)
+
+**Why.** `send_splice_init` derived our MuSig2 splice nonce (`SpliceInit.splice_nonce`) when
+quiescence was reached; a signer that answers asynchronously (the LP's phone) had not answered
+yet, so `None` went out and the acceptor could never sign the shared input ("Missing
+counterparty splice nonce", forever).
+
+**What.** `FundedChannel::splice_channel` derives the nonce for `peek_splice_candidate_index()`
+before proposing quiescence and stores it in `SpliceInstructions.splice_nonce` (TLV 13, so a
+persisted quiescent action carries it); unavailable ⇒ `APIMisuseError("splice nonce pending…")`
+for the caller to retry — the same index is asked again, so the answer given meanwhile is read.
+`send_splice_init` adopts the stamped index (`adopt_splice_candidate_index`) and nonce; without
+one (non-taproot, or instructions written before this) it behaves as before.
