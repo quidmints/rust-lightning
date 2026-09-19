@@ -2553,6 +2553,7 @@ impl FundingScope {
 			chan_utils::channel_taproot_script_pubkey(
 				self.holder_funding_pubkey(),
 				self.counterparty_funding_pubkey(),
+				chan_utils::funder_funding_key(self.holder_funding_pubkey(), self.counterparty_funding_pubkey(), self.is_outbound()),
 			)
 			.expect("funding pubkeys are valid points")
 		} else {
@@ -2738,7 +2739,8 @@ impl FundingScope {
 		// so carry the funding pubkeys for MuSig2 aggregation at finalize rather than a
 		// P2WSH `witness_script` (spec §9c).
 		let taproot_funding_pubkeys = if self.get_channel_type().supports_simple_taproot() {
-			Some((*self.holder_funding_pubkey(), *self.counterparty_funding_pubkey()))
+			let funder = *chan_utils::funder_funding_key(self.holder_funding_pubkey(), self.counterparty_funding_pubkey(), self.is_outbound());
+			Some((*self.holder_funding_pubkey(), *self.counterparty_funding_pubkey(), funder))
 		} else {
 			None
 		};
@@ -6528,6 +6530,7 @@ where
 			*funding.counterparty_funding_pubkey(),
 			funding.get_value_satoshis(),
 			funding.channel_transaction_parameters.splice_parent_funding_txid,
+			funding.is_outbound(),
 		);
 	}
 
@@ -6536,18 +6539,19 @@ where
 	/// handed `&ChannelTransactionParameters` rather than a `FundingScope`). Assumes
 	/// the ORIGINAL (un-spliced) funding scope (no key rotation).
 	fn provide_taproot_context_raw(
-		&self, counterparty_funding_pubkey: PublicKey, funding_value_sat: u64,
+		&self, counterparty_funding_pubkey: PublicKey, funding_value_sat: u64, funder_is_holder: bool,
 	) {
 		self.provide_taproot_context_raw_with_splice(
 			counterparty_funding_pubkey,
 			funding_value_sat,
 			None,
+			funder_is_holder,
 		);
 	}
 
 	fn provide_taproot_context_raw_with_splice(
 		&self, counterparty_funding_pubkey: PublicKey, funding_value_sat: u64,
-		splice_parent_funding_txid: Option<Txid>,
+		splice_parent_funding_txid: Option<Txid>, funder_is_holder: bool,
 	) {
 		if let Some(taproot_signer) = self.holder_signer.as_taproot() {
 			let ctx = crate::sign::TaprootSignerContext {
@@ -6556,6 +6560,7 @@ where
 				counterparty_closing_nonce: self.cur_counterparty_closing_nonce.clone(),
 				closing_round: self.closing_round,
 				splice_parent_funding_txid,
+				funder_is_holder,
 			};
 			taproot_signer.provide_taproot_context(ctx);
 		}
@@ -6587,6 +6592,7 @@ where
 		chan_utils::verify_taproot_keyspend_partial(
 			&funding.get_holder_pubkeys().funding_pubkey,
 			funding.counterparty_funding_pubkey(),
+			funding.is_outbound(),
 			sighash.as_ref(),
 			&our_pubnonce,
 			*cp_partial,
@@ -6723,7 +6729,7 @@ where
 		let (signature, partial_signature_with_nonce) = if is_taproot {
 			let cp_funding = channel_parameters.counterparty_parameters.as_ref()
 				.expect("counterparty params set").pubkeys.funding_pubkey;
-			self.provide_taproot_context_raw(cp_funding, channel_parameters.channel_value_satoshis);
+			self.provide_taproot_context_raw(cp_funding, channel_parameters.channel_value_satoshis, channel_parameters.is_outbound_from_holder);
 			let cp_nonce = match self.cur_counterparty_taproot_nonce.clone() {
 				Some(n) => n,
 				None => {
@@ -6924,6 +6930,7 @@ where
 				*funding.counterparty_funding_pubkey(),
 				funding.get_value_satoshis(),
 				funding.channel_transaction_parameters.splice_parent_funding_txid,
+				funding.is_outbound(),
 			);
 			let cp_nonce = self.cur_counterparty_taproot_nonce.clone()?;
 			// §10 audit (HTLC ↔ splice): a splice can happen with HTLCs COMMITTED + in
@@ -11553,6 +11560,7 @@ where
 		let agg_sig = chan_utils::verify_taproot_keyspend_partials(
 			&self.funding.get_holder_pubkeys().funding_pubkey,
 			self.funding.counterparty_funding_pubkey(),
+			self.funding.is_outbound(),
 			&self.taproot_closing_message(closing_tx)?,
 			our_partial,
 			our_pubnonce,
@@ -11606,6 +11614,7 @@ where
 		chan_utils::verify_taproot_keyspend_partial(
 			&self.funding.get_holder_pubkeys().funding_pubkey,
 			self.funding.counterparty_funding_pubkey(),
+			self.funding.is_outbound(),
 			&self.taproot_closing_message(closing_tx)?,
 			&our_pubnonce,
 			*cp_partial,

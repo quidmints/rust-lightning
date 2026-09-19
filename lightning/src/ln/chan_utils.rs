@@ -1638,14 +1638,15 @@ pub fn taproot_splice_keyspend_sighash(
 /// `funding_created`/`funding_signed`/`commitment_signed`, and it is what lets our
 /// own partial wait until we actually broadcast.
 pub fn verify_taproot_keyspend_partial(
-	holder_funding_key: &PublicKey, counterparty_funding_key: &PublicKey, sighash: &[u8; 32],
+	holder_funding_key: &PublicKey, counterparty_funding_key: &PublicKey, is_outbound_from_holder: bool, sighash: &[u8; 32],
 	our_pubnonce: &musig2::PubNonce, counterparty_partial: musig2::PartialSignature,
 	counterparty_pubnonce: &musig2::PubNonce,
 ) -> Result<(), &'static str> {
 	use crate::sign::taproot_signer::channel_key_agg_ctx;
 	let holder = holder_funding_key.serialize();
 	let counterparty = counterparty_funding_key.serialize();
-	let (ctx, our_index) = channel_key_agg_ctx(&holder, &counterparty, &holder)
+	let funder = funder_funding_key(holder_funding_key, counterparty_funding_key, is_outbound_from_holder).serialize();
+	let (ctx, our_index) = channel_key_agg_ctx(&holder, &counterparty, &holder, &funder)
 		.map_err(|_| "taproot key aggregation failed")?;
 	let counterparty_key: musig2::secp256k1::PublicKey =
 		ctx.get_pubkey(1 - our_index).ok_or("taproot key aggregation failed")?;
@@ -1670,7 +1671,7 @@ pub fn verify_taproot_keyspend_partial(
 /// redeemscript check used by legacy P2WSH channels.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_taproot_keyspend_partials(
-	holder_funding_key: &PublicKey, counterparty_funding_key: &PublicKey, sighash: &[u8; 32],
+	holder_funding_key: &PublicKey, counterparty_funding_key: &PublicKey, is_outbound_from_holder: bool, sighash: &[u8; 32],
 	our_partial: musig2::PartialSignature, our_pubnonce: musig2::PubNonce,
 	counterparty_partial: musig2::PartialSignature, counterparty_pubnonce: musig2::PubNonce,
 ) -> Result<bitcoin::secp256k1::schnorr::Signature, &'static str> {
@@ -1679,7 +1680,8 @@ pub fn verify_taproot_keyspend_partials(
 	};
 	let holder = holder_funding_key.serialize();
 	let counterparty = counterparty_funding_key.serialize();
-	let (ctx, our_index) = channel_key_agg_ctx(&holder, &counterparty, &holder)
+	let funder = funder_funding_key(holder_funding_key, counterparty_funding_key, is_outbound_from_holder).serialize();
+	let (ctx, our_index) = channel_key_agg_ctx(&holder, &counterparty, &holder, &funder)
 		.map_err(|_| "taproot key aggregation failed")?;
 	let counterparty_index = 1 - our_index;
 	let q = aggregated_xonly(&ctx);
@@ -1703,17 +1705,66 @@ pub fn verify_taproot_keyspend_partials(
 	Ok(sig)
 }
 
+// === §LEAF-EXIT — the funder's unilateral exit as a leaf of the funding output ===
+//
+// The funding output is `P2TR(P, root)` where `P = KeyAgg(KeySort(p1, p2))` and `root` is the
+// hash of ONE leaf: `<FUNDER_EXIT_CSV_BLOCKS> OP_CSV OP_DROP <funder_xonly> OP_CHECKSIG`. The
+// cooperative path is the MuSig2 key path exactly as before (spec §2), with the BIP341 tweak
+// over this root instead of the empty one. The leaf lets the party that funded the channel spend
+// the output ALONE once it has been unspent for `FUNDER_EXIT_CSV_BLOCKS` — a relative lock, so
+// every splice (a new output) restarts the clock, nothing is pre-signed, nothing matures on a
+// calendar, and only the funder's key can exercise it. This is the LP's escape from a fleet that
+// stopped answering; it replaces the pre-signed dead-man exit rung entirely.
+
+/// How long the funding output must sit unspent before its funder may sweep it alone (relative,
+/// `OP_CHECKSEQUENCEVERIFY` in blocks). POLICY: the funder's wait on a dead counterparty, and the
+/// counterparty's guarantee that an idle channel is not swept from under it sooner. ~2 weeks.
+pub const FUNDER_EXIT_CSV_BLOCKS: u16 = 2016;
+
+/// The funder's exit leaf: `<FUNDER_EXIT_CSV_BLOCKS> OP_CSV OP_DROP <funder_xonly> OP_CHECKSIG`.
+/// `funder` is the funding pubkey of the party that opened the channel, for THIS scope (the
+/// funding keys rotate on every splice, and so does the leaf).
+#[rustfmt::skip]
+pub fn funder_exit_leaf(funder_funding_key: &PublicKey) -> ScriptBuf {
+	let (xonly, _) = funder_funding_key.x_only_public_key();
+	Builder::new()
+		.push_int(FUNDER_EXIT_CSV_BLOCKS as i64)
+		.push_opcode(opcodes::all::OP_CSV)
+		.push_opcode(opcodes::all::OP_DROP)
+		.push_x_only_key(&xonly)
+		.push_opcode(opcodes::all::OP_CHECKSIG)
+		.into_script()
+}
+
+/// The funding output's taproot merkle root: the single leaf's `TapLeafHash`.
+pub fn funding_taproot_merkle_root(funder_funding_key: &PublicKey) -> [u8; 32] {
+	use bitcoin::hashes::Hash;
+	TapLeafHash::from_script(&funder_exit_leaf(funder_funding_key), LeafVersion::TapScript).to_byte_array()
+}
+
+/// The funder's funding key of the pair, by role: the holder's if the holder opened the channel
+/// (`is_outbound_from_holder`), else the counterparty's.
+pub fn funder_funding_key<'a>(
+	holder_funding_key: &'a PublicKey, counterparty_funding_key: &'a PublicKey, is_outbound_from_holder: bool,
+) -> &'a PublicKey {
+	if is_outbound_from_holder { holder_funding_key } else { counterparty_funding_key }
+}
+
 /// The x-only **tweaked aggregate funding key** `Q` for a simple-taproot channel
-/// (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §2): `Q =
-/// KeyAgg(KeySort(p1,p2)).with_unspendable_taproot_tweak()` (BIP341 §158 empty
-/// merkle root). The KeySort makes this independent of argument order, so the two
-/// channel parties and the EVM mirror all derive the identical `Q`. This is the
-/// exact construction the MuSig2 signer (`quid_ln::taproot_signer`) uses; keeping
-/// it here lets the LDK tx-builder emit the matching `0x5120 || Q` funding SPK
-/// without depending on `quid-ln`.
+/// (`docs/TAPROOT-CHANNELS-BUILD-SPEC.md` §2, §LEAF-EXIT): `Q =
+/// KeyAgg(KeySort(p1,p2)).with_taproot_tweak(funding_taproot_merkle_root(funder))`. The KeySort
+/// makes this independent of argument order, so the two channel parties, the phone and the
+/// chain mirror all derive the identical `Q`. `funder_funding_key` must be one of the two.
+/// This is the exact construction the MuSig2 signer (`quid_ln::taproot_signer`) uses; keeping
+/// it here lets the LDK tx-builder emit the matching `0x5120 || Q` funding SPK without
+/// depending on `quid-ln`.
 pub fn taproot_funding_aggregate_xonly(
 	broadcaster_funding_key: &PublicKey, countersignatory_funding_key: &PublicKey,
+	funder_funding_key: &PublicKey,
 ) -> Result<XOnlyPublicKey, &'static str> {
+	if funder_funding_key != broadcaster_funding_key && funder_funding_key != countersignatory_funding_key {
+		return Err("the funder is neither funding key");
+	}
 	let a = broadcaster_funding_key.serialize();
 	let b = countersignatory_funding_key.serialize();
 	let (lo, hi) = if a[..] < b[..] { (a, b) } else { (b, a) };
@@ -1721,7 +1772,7 @@ pub fn taproot_funding_aggregate_xonly(
 	let hi_pk = musig2::secp256k1::PublicKey::from_slice(&hi).map_err(|_| "bad funding key")?;
 	let ctx = musig2::KeyAggContext::new([lo_pk, hi_pk])
 		.map_err(|_| "funding key aggregation failed")?
-		.with_unspendable_taproot_tweak()
+		.with_taproot_tweak(&funding_taproot_merkle_root(funder_funding_key))
 		.map_err(|_| "funding taproot tweak failed")?;
 	let q: musig2::secp256k1::PublicKey = ctx.aggregated_pubkey();
 	Ok(q.x_only_public_key().0)
@@ -1733,11 +1784,30 @@ pub fn taproot_funding_aggregate_xonly(
 /// taproot channels (spec §2).
 pub fn channel_taproot_script_pubkey(
 	broadcaster_funding_key: &PublicKey, countersignatory_funding_key: &PublicKey,
+	funder_funding_key: &PublicKey,
 ) -> Result<ScriptBuf, &'static str> {
-	let q = taproot_funding_aggregate_xonly(broadcaster_funding_key, countersignatory_funding_key)?;
+	let q = taproot_funding_aggregate_xonly(broadcaster_funding_key, countersignatory_funding_key, funder_funding_key)?;
 	Ok(ScriptBuf::new_p2tr_tweaked(
 		bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(q),
 	))
+}
+
+/// The funding output's full [`TaprootSpendInfo`] — what the funder's leaf spend needs for its
+/// control block (`[schnorr_sig, funder_exit_leaf, control_block]`). Internal key = the
+/// UNTWEAKED aggregate `P`; its output key equals [`taproot_funding_aggregate_xonly`].
+pub fn channel_taproot_spend_info<C: secp256k1::Verification>(
+	secp: &Secp256k1<C>, broadcaster_funding_key: &PublicKey, countersignatory_funding_key: &PublicKey,
+	funder_funding_key: &PublicKey,
+) -> Result<TaprootSpendInfo, &'static str> {
+	let a = broadcaster_funding_key.serialize();
+	let b = countersignatory_funding_key.serialize();
+	let (lo, hi) = if a[..] < b[..] { (a, b) } else { (b, a) };
+	let lo_pk = musig2::secp256k1::PublicKey::from_slice(&lo).map_err(|_| "bad funding key")?;
+	let hi_pk = musig2::secp256k1::PublicKey::from_slice(&hi).map_err(|_| "bad funding key")?;
+	let ctx = musig2::KeyAggContext::new([lo_pk, hi_pk]).map_err(|_| "funding key aggregation failed")?;
+	let p: musig2::secp256k1::PublicKey = ctx.aggregated_pubkey();
+	let internal = XOnlyPublicKey::from_slice(&p.x_only_public_key().0.serialize()).map_err(|_| "bad aggregate")?;
+	Ok(taproot_spend_info_one_leaf(secp, internal, &funder_exit_leaf(funder_funding_key)))
 }
 
 // === Taproot ON-CHAIN RESOLUTION (M9e) — script-path spend-info + witnesses ===
@@ -1997,6 +2067,7 @@ impl ChannelTransactionParameters {
 				channel_taproot_script_pubkey(
 					&self.holder_pubkeys.funding_pubkey,
 					&p.pubkeys.funding_pubkey,
+					funder_funding_key(&self.holder_pubkeys.funding_pubkey, &p.pubkeys.funding_pubkey, self.is_outbound_from_holder),
 				)
 				.expect("valid funding pubkeys")
 			} else {
@@ -3317,6 +3388,41 @@ pub fn get_commitment_transaction_number_obscure_factor(
 
 #[cfg(test)]
 mod tests {
+	/// §LEAF-EXIT: the funding output key is the MuSig2 aggregate tweaked with the FUNDER's exit
+	/// leaf — the same `Q` from the KeyAgg side (`taproot_funding_aggregate_xonly`) and from the
+	/// script-tree side (`channel_taproot_spend_info`, which is what the funder's sweep uses for
+	/// its control block); it depends on WHICH key is the funder's, not on argument order; and
+	/// the leaf is `<CSV> OP_CSV OP_DROP <funder_xonly> OP_CHECKSIG`.
+	#[test]
+	fn funding_output_commits_to_the_funders_exit_leaf() {
+		use super::{
+			channel_taproot_script_pubkey, channel_taproot_spend_info, funder_exit_leaf,
+			taproot_funding_aggregate_xonly, FUNDER_EXIT_CSV_BLOCKS,
+		};
+		use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+		let secp = Secp256k1::new();
+		let a = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[11u8; 32]).unwrap());
+		let b = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[22u8; 32]).unwrap());
+		let q_ab = taproot_funding_aggregate_xonly(&a, &b, &a).unwrap();
+		assert_eq!(q_ab, taproot_funding_aggregate_xonly(&b, &a, &a).unwrap(), "KeySort: argument order is immaterial");
+		assert_ne!(q_ab, taproot_funding_aggregate_xonly(&a, &b, &b).unwrap(), "the funder's key is in the tweak");
+		assert!(taproot_funding_aggregate_xonly(&a, &b, &PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[33u8; 32]).unwrap())).is_err(), "a funder that is neither key");
+		let info = channel_taproot_spend_info(&secp, &a, &b, &a).unwrap();
+		assert_eq!(info.output_key().to_x_only_public_key(), q_ab, "tree side == KeyAgg side");
+		let leaf = funder_exit_leaf(&a);
+		assert!(info.control_block(&(leaf.clone(), bitcoin::taproot::LeafVersion::TapScript)).is_some(), "the leaf is in the tree");
+		assert_eq!(
+			channel_taproot_script_pubkey(&a, &b, &a).unwrap(),
+			ScriptBuf::new_p2tr_tweaked(bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(q_ab))
+		);
+		// The leaf's shape: CSV delta, OP_CSV, OP_DROP, x-only funder key, OP_CHECKSIG.
+		let bytes = leaf.as_bytes();
+		assert_eq!(bytes[bytes.len() - 1], 0xac, "OP_CHECKSIG last");
+		assert_eq!(&bytes[bytes.len() - 34..bytes.len() - 1], &{ let mut v = vec![0x20]; v.extend_from_slice(&a.x_only_public_key().0.serialize()); v }[..], "the funder's x-only key pushed before it");
+		assert!(bytes.windows(2).any(|w| w == [0xb2, 0x75]), "OP_CSV OP_DROP");
+		assert_eq!(FUNDER_EXIT_CSV_BLOCKS, 2016);
+	}
+
 	use super::{ChannelPublicKeys, CounterpartyCommitmentSecrets};
 	use crate::chain;
 	use crate::ln::chan_utils::{

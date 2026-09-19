@@ -81,20 +81,25 @@ pub enum KeyAggError {
 }
 
 /// KeySort the two 33-byte compressed funding keys lexicographically, build the
-/// cached [`KeyAggContext`] with the BIP341 §158 key-path-only (empty merkle
-/// root) taproot tweak, and report our slot in the sorted list. Identical to
-/// `quid_ln::taproot_signer::channel_key_agg_ctx` and
-/// [`crate::ln::chan_utils::taproot_funding_aggregate_xonly`].
+/// cached [`KeyAggContext`] with the BIP341 taproot tweak over the funding output's merkle
+/// root — the funder's exit leaf (§LEAF-EXIT, `chan_utils::funding_taproot_merkle_root`) — and
+/// report our slot in the sorted list. Identical to `quid_ln::taproot_signer::channel_key_agg_ctx`
+/// and [`crate::ln::chan_utils::taproot_funding_aggregate_xonly`]. `funder_funding_pubkey` is one
+/// of the two (the party that opened the channel, for this scope).
 pub fn channel_key_agg_ctx(
-	lp: &[u8; 33], hop: &[u8; 33], my_funding_pubkey: &[u8; 33],
+	lp: &[u8; 33], hop: &[u8; 33], my_funding_pubkey: &[u8; 33], funder_funding_pubkey: &[u8; 33],
 ) -> Result<(KeyAggContext, usize), KeyAggError> {
+	if funder_funding_pubkey[..] != lp[..] && funder_funding_pubkey[..] != hop[..] {
+		return Err(KeyAggError::NotAParticipant);
+	}
+	let funder = bitcoin::secp256k1::PublicKey::from_slice(funder_funding_pubkey).map_err(|_| KeyAggError::BadPubkey)?;
 	let (lo, hi) = if lp[..] < hop[..] { (lp, hop) } else { (hop, lp) };
 	let lo_pk = PublicKey::from_slice(lo).map_err(|_| KeyAggError::BadPubkey)?;
 	let hi_pk = PublicKey::from_slice(hi).map_err(|_| KeyAggError::BadPubkey)?;
 
 	let ctx = KeyAggContext::new([lo_pk, hi_pk])
 		.map_err(|_| KeyAggError::Aggregate)?
-		.with_unspendable_taproot_tweak()
+		.with_taproot_tweak(&crate::ln::chan_utils::funding_taproot_merkle_root(&funder))
 		.map_err(|_| KeyAggError::Tweak)?;
 
 	let signer_index = if my_funding_pubkey[..] == lo[..] {
@@ -237,15 +242,15 @@ mod tests {
 		let height = 281_474_976_710_654u64;
 		let msg = [0x42u8; 32];
 
-		let (lp_ctx, lp_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
-		let (hop_ctx, hop_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub).unwrap();
+		let (lp_ctx, lp_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
+		let (hop_ctx, hop_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub, &lp_pub).unwrap();
 		let q = aggregated_xonly(&lp_ctx);
 
 		let lp_pn = local_pubnonce(lp_ctx, lp_idx, &lp_root, height).unwrap();
 		let hop_pn = local_pubnonce(hop_ctx, hop_idx, &hop_root, height).unwrap();
 
-		let (lp_ctx2, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
-		let (hop_ctx2, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub).unwrap();
+		let (lp_ctx2, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
+		let (hop_ctx2, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub, &lp_pub).unwrap();
 		let (lp_partial, lp_pn2) = our_key_path_partial(
 			lp_ctx2, lp_idx, hop_idx, lp_sec, &lp_root, height, hop_pn.clone(), msg,
 		)
@@ -256,7 +261,7 @@ mod tests {
 		.unwrap();
 		assert_eq!(lp_pn.serialize(), lp_pn2.serialize());
 
-		let (agg_ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
+		let (agg_ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
 		let sig = aggregate_key_path_partials(
 			agg_ctx, msg, lp_idx, lp_pn, lp_partial, hop_idx, hop_pn, hop_partial,
 		)
@@ -334,9 +339,9 @@ mod tests {
 		let msg = [0x5Cu8; 32];
 
 		let (lp_ctx, lp_idx) =
-			channel_key_agg_ctx(&lp_rot_pub, &hop_rot_pub, &lp_rot_pub).unwrap();
+			channel_key_agg_ctx(&lp_rot_pub, &hop_rot_pub, &lp_rot_pub, &lp_rot_pub).unwrap();
 		let (hop_ctx, hop_idx) =
-			channel_key_agg_ctx(&lp_rot_pub, &hop_rot_pub, &hop_rot_pub).unwrap();
+			channel_key_agg_ctx(&lp_rot_pub, &hop_rot_pub, &hop_rot_pub, &lp_rot_pub).unwrap();
 		// The two parties land at distinct, complementary slots.
 		assert_ne!(lp_idx, hop_idx);
 		assert_eq!(lp_idx, 1 - hop_idx);
@@ -345,8 +350,8 @@ mod tests {
 		let lp_pn = local_pubnonce(lp_ctx, lp_idx, &lp_root, height).unwrap();
 		let hop_pn = local_pubnonce(hop_ctx, hop_idx, &hop_root, height).unwrap();
 
-		let (lp_ctx2, _) = channel_key_agg_ctx(&lp_rot_pub, &hop_rot_pub, &lp_rot_pub).unwrap();
-		let (hop_ctx2, _) = channel_key_agg_ctx(&lp_rot_pub, &hop_rot_pub, &hop_rot_pub).unwrap();
+		let (lp_ctx2, _) = channel_key_agg_ctx(&lp_rot_pub, &hop_rot_pub, &lp_rot_pub, &lp_rot_pub).unwrap();
+		let (hop_ctx2, _) = channel_key_agg_ctx(&lp_rot_pub, &hop_rot_pub, &hop_rot_pub, &lp_rot_pub).unwrap();
 		let (lp_partial, lp_pn2) = our_key_path_partial(
 			lp_ctx2, lp_idx, hop_idx, lp_rot, &lp_root, height, hop_pn.clone(), msg,
 		)
@@ -357,7 +362,7 @@ mod tests {
 		.unwrap();
 		assert_eq!(lp_pn.serialize(), lp_pn2.serialize());
 
-		let (agg_ctx, _) = channel_key_agg_ctx(&lp_rot_pub, &hop_rot_pub, &lp_rot_pub).unwrap();
+		let (agg_ctx, _) = channel_key_agg_ctx(&lp_rot_pub, &hop_rot_pub, &lp_rot_pub, &lp_rot_pub).unwrap();
 		let sig = aggregate_key_path_partials(
 			agg_ctx, msg, lp_idx, lp_pn, lp_partial, hop_idx, hop_pn, hop_partial,
 		)
@@ -392,8 +397,8 @@ mod tests {
 			"counterparty-tagged seed must differ from the untagged holder seed at the same height",
 		);
 
-		let (ctx_h, idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
-		let (ctx_c, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
+		let (ctx_h, idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
+		let (ctx_c, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
 		let holder_pn = local_pubnonce(ctx_h, idx, &root, height).unwrap();
 		let cp_seed = derive_secnonce_seed_domain(&root, height, COUNTERPARTY_COMMITMENT_NONCE_TAG);
 		let cp_pn = FirstRound::new(ctx_c, cp_seed, idx, SecNonceSpices::new())
@@ -422,15 +427,15 @@ mod tests {
 		let height = 1_000u64;
 		let msg = [0x9Au8; 32];
 
-		let (_c, lp_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
-		let (_c2, hop_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub).unwrap();
+		let (_c, lp_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
+		let (_c2, hop_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub, &lp_pub).unwrap();
 
 		let cp = |seed: [u8; 32]| -> PubNonce {
-			let (ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub).unwrap();
+			let (ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub, &lp_pub).unwrap();
 			local_pubnonce(ctx, hop_idx, &seed, height).unwrap()
 		};
 		let sign_cp = |cpn: &PubNonce, m: [u8; 32]| {
-			let (ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
+			let (ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
 			our_key_path_partial_counterparty(
 				ctx, lp_idx, hop_idx, lp_sec, &root, height, cpn.clone(), m,
 			)
@@ -460,18 +465,18 @@ mod tests {
 		// Interop preserved: the partial still aggregates with the peer's to a BIP340 sig
 		// verifying vs Q, using the pubnonce we send alongside the partial.
 		let secp = Secp256k1::new();
-		let (agg_ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
+		let (agg_ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
 		let q = aggregated_xonly(&agg_ctx);
 		let (our_partial, our_pn) = sign_cp(&cp1, msg);
 		// The hop signs against our (bound) pubnonce, using the SAME seed that produced `cp1`
 		// so its re-derived nonce equals the `cp1` we aggregate against.
-		let (hop_ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub).unwrap();
+		let (hop_ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub, &lp_pub).unwrap();
 		let (hop_partial, hop_pn) = our_key_path_partial(
 			hop_ctx, hop_idx, lp_idx, hop_sec, &[0xB1; 32], height, our_pn.clone(), msg,
 		)
 		.unwrap();
 		assert_eq!(hop_pn.serialize(), cp1.serialize(), "hop re-derives the cp1 nonce");
-		let (agg_ctx2, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
+		let (agg_ctx2, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
 		let sig = aggregate_key_path_partials(
 			agg_ctx2, msg, lp_idx, our_pn, our_partial, hop_idx, cp1, hop_partial,
 		)
@@ -503,16 +508,16 @@ mod tests {
 		let msg = [0x9Au8; 32];
 
 		// Peer (hop) nonce — stable for this fixed height (the peer re-derives it too).
-		let (hop_ctx, hop_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub).unwrap();
+		let (hop_ctx, hop_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub, &lp_pub).unwrap();
 		let hop_pn = local_pubnonce(hop_ctx, hop_idx, &[0x55; 32], height).unwrap();
 
 		// "Pre-reboot": our local pubnonce for (root, height).
-		let (lp_ctx_a, lp_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
+		let (lp_ctx_a, lp_idx) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
 		let pn_before = local_pubnonce(lp_ctx_a, lp_idx, &lp_root, height).unwrap();
 
 		// "Post-reboot": rebuild EVERYTHING from only (root, height) — fresh ctx, no
 		// carried secnonce/round state — exactly what the re-derived signer does.
-		let (lp_ctx_b, lp_idx_b) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
+		let (lp_ctx_b, lp_idx_b) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
 		let pn_after = local_pubnonce(lp_ctx_b, lp_idx_b, &lp_root, height).unwrap();
 		assert_eq!(
 			pn_before.serialize(),
@@ -521,7 +526,7 @@ mod tests {
 		);
 
 		// And the post-reboot partial still produces a valid aggregate sig.
-		let (lp_ctx_c, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
+		let (lp_ctx_c, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
 		let (lp_partial, lp_pn) = our_key_path_partial(
 			lp_ctx_c, lp_idx, hop_idx, lp_sec, &lp_root, height, hop_pn.clone(), msg,
 		)
@@ -529,15 +534,15 @@ mod tests {
 		assert_eq!(lp_pn.serialize(), pn_after.serialize(), "partial uses the same re-derived nonce");
 
 		let (hop_sec, _) = keypair(0x44);
-		let (hop_ctx2, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub).unwrap();
+		let (hop_ctx2, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &hop_pub, &lp_pub).unwrap();
 		let (hop_partial, _) = our_key_path_partial(
 			hop_ctx2, hop_idx, lp_idx, hop_sec, &[0x55; 32], height, pn_after.clone(), msg,
 		)
 		.unwrap();
 
-		let (agg_ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
+		let (agg_ctx, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
 		let q = aggregated_xonly(&agg_ctx);
-		let (agg_ctx2, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub).unwrap();
+		let (agg_ctx2, _) = channel_key_agg_ctx(&lp_pub, &hop_pub, &lp_pub, &lp_pub).unwrap();
 		let sig = aggregate_key_path_partials(
 			agg_ctx2, msg, lp_idx, lp_pn, lp_partial, hop_idx, hop_pn, hop_partial,
 		)

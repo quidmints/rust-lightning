@@ -1559,6 +1559,10 @@ pub struct TaprootSignerContext {
 	/// `Q` and is handled separately via `partially_sign_splice_shared_input`, which
 	/// always uses the base key; this field is for the NEW commitment scope.)
 	pub splice_parent_funding_txid: Option<bitcoin::Txid>,
+	/// §LEAF-EXIT: whether the HOLDER opened the channel (`is_outbound_from_holder`). The funding
+	/// output's taproot tweak commits to the FUNDER's exit leaf, so the aggregate `Q` depends on
+	/// which of the two funding keys is the funder's.
+	pub funder_is_holder: bool,
 }
 
 impl PartialEq for InMemorySigner {
@@ -1696,8 +1700,9 @@ impl InMemorySigner {
 			.public_key(secp_ctx)
 			.serialize();
 		let cp = ctx.counterparty_funding_pubkey.serialize();
+		let funder = if ctx.funder_is_holder { holder } else { cp };
 		let (key_agg, our_index) =
-			crate::sign::taproot_signer::channel_key_agg_ctx(&holder, &cp, &holder)
+			crate::sign::taproot_signer::channel_key_agg_ctx(&holder, &cp, &holder, &funder)
 				.map_err(|_| ())?;
 		let counterparty_index = 1 - our_index;
 		let q = crate::sign::taproot_signer::aggregated_xonly(&key_agg);

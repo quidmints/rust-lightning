@@ -489,7 +489,7 @@ impl ConstructedTransaction {
 				"shared input present but no shared input signature context".to_string()
 			})?;
 
-			if let Some((holder_funding_pk, counterparty_funding_pk)) =
+			if let Some((holder_funding_pk, counterparty_funding_pk, funder_funding_pk)) =
 				shared_input_sig.taproot_funding_pubkeys
 			{
 				// SIMPLE-TAPROOT splice: the old funding output is the key-path
@@ -521,6 +521,7 @@ impl ConstructedTransaction {
 				let agg_sig = crate::ln::chan_utils::verify_taproot_keyspend_partials(
 					&holder_funding_pk,
 					&counterparty_funding_pk,
+					funder_funding_pk == holder_funding_pk,
 					&message,
 					holder.0,
 					holder.1.clone(),
@@ -625,8 +626,8 @@ pub(crate) struct SharedInputSignature {
 	// the OLD funding output, used to KeyAgg → `Q` and aggregate the two MuSig2
 	// key-path partials into ONE 64-byte BIP340 witness at finalize. `None` for
 	// legacy P2WSH splices, which concatenate two ECDSA sigs + `witness_script`
-	// (spec §9c).
-	taproot_funding_pubkeys: Option<(PublicKey, PublicKey)>,
+	// (spec §9c). The third key is the FUNDER's (§LEAF-EXIT: the funding output's leaf).
+	taproot_funding_pubkeys: Option<(PublicKey, PublicKey, PublicKey)>,
 }
 
 impl_writeable_tlv_based!(SharedInputSignature, {
@@ -1843,14 +1844,15 @@ pub(super) struct SharedOwnedInput {
 	// the OLD funding output this splice spends, so the signing session can KeyAgg →
 	// `Q` and aggregate the two MuSig2 key-path partials into the single 64-byte
 	// witness (the old funding output is `0x5120||Q`, not a P2WSH 2-of-2, so there is
-	// no `witness_script` to push). `None` for legacy P2WSH splices (spec §9c).
-	taproot_funding_pubkeys: Option<(PublicKey, PublicKey)>,
+	// no `witness_script` to push). `None` for legacy P2WSH splices (spec §9c). The third
+	// key is the FUNDER's (§LEAF-EXIT: the funding output's leaf).
+	taproot_funding_pubkeys: Option<(PublicKey, PublicKey, PublicKey)>,
 }
 
 impl SharedOwnedInput {
 	pub fn new(
 		input: TxIn, prev_output: TxOut, local_owned: u64, holder_sig_first: bool,
-		witness_script: ScriptBuf, taproot_funding_pubkeys: Option<(PublicKey, PublicKey)>,
+		witness_script: ScriptBuf, taproot_funding_pubkeys: Option<(PublicKey, PublicKey, PublicKey)>,
 	) -> Self {
 		let value = prev_output.value.to_sat();
 		debug_assert!(

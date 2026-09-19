@@ -190,10 +190,21 @@ pub fn complete_splice_handshake<'a, 'b, 'c, 'd>(
 		.find(|c| c.channel_id == channel_id)
 		.map(|c| c.channel_type.as_ref().map(|t| t.supports_simple_taproot()).unwrap_or(false))
 		.unwrap_or(false);
+	// §LEAF-EXIT: the funding output's tweak commits to the FUNDER's (the channel opener's) exit
+	// leaf, so the derivation needs to know which of the two rotated keys is the opener's.
+	let initiator_opened = initiator
+		.node
+		.list_channels()
+		.iter()
+		.find(|c| c.channel_id == channel_id)
+		.map(|c| c.is_outbound)
+		.unwrap_or(true);
+	let funder = if initiator_opened { splice_init.funding_pubkey } else { splice_ack.funding_pubkey };
 	let new_funding_script = if is_taproot {
 		chan_utils::channel_taproot_script_pubkey(
 			&splice_init.funding_pubkey,
 			&splice_ack.funding_pubkey,
+			&funder,
 		)
 		.expect("rotated splice funding pubkeys are valid points")
 	} else {
@@ -2344,10 +2355,14 @@ fn drive_taproot_splice<'a, 'b, 'c, 'd>(
 	let ack_nonce = splice_ack.splice_nonce.clone().expect("taproot splice_ack carries a splice nonce");
 	initiator.node.handle_splice_ack(node_id_acceptor, &splice_ack);
 
-	// The NEW funding output is the rotated key-path `0x5120||Q'`.
+	// The NEW funding output is the rotated key-path `0x5120||Q'` (tweaked with the opener's exit
+	// leaf — §LEAF-EXIT; here the initiator opened the channel).
+	let initiator_opened = initiator.node.list_channels().iter().find(|c| c.channel_id == channel_id).map(|c| c.is_outbound).unwrap_or(true);
+	let funder = if initiator_opened { splice_init.funding_pubkey } else { splice_ack.funding_pubkey };
 	let new_funding_script = chan_utils::channel_taproot_script_pubkey(
 		&splice_init.funding_pubkey,
 		&splice_ack.funding_pubkey,
+		&funder,
 	)
 	.expect("rotated splice funding pubkeys are valid points");
 

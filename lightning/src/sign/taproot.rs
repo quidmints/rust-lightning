@@ -232,12 +232,14 @@ pub fn taproot_holder_commitment_signature<S: TaprootChannelSigner + ?Sized>(
 		counterparty_closing_nonce: None,
 		closing_round: 0,
 		splice_parent_funding_txid: channel_parameters.splice_parent_funding_txid,
+		funder_is_holder: channel_parameters.is_outbound_from_holder,
 	});
 	let (our_partial, our_pubnonce) =
 		signer.finalize_holder_commitment(commitment_tx, psn.clone(), secp_ctx)?;
 	let funding_spk = crate::ln::chan_utils::channel_taproot_script_pubkey(
 		&channel_parameters.holder_pubkeys.funding_pubkey,
 		&counterparty_funding_pubkey,
+		crate::ln::chan_utils::funder_funding_key(&channel_parameters.holder_pubkeys.funding_pubkey, &counterparty_funding_pubkey, channel_parameters.is_outbound_from_holder),
 	)
 	.map_err(|_| ())?;
 	let sighash = crate::ln::chan_utils::taproot_funding_keyspend_sighash(
@@ -251,6 +253,7 @@ pub fn taproot_holder_commitment_signature<S: TaprootChannelSigner + ?Sized>(
 	crate::ln::chan_utils::verify_taproot_keyspend_partials(
 		&channel_parameters.holder_pubkeys.funding_pubkey,
 		&counterparty_funding_pubkey,
+		channel_parameters.is_outbound_from_holder,
 		sighash.as_ref(),
 		our_partial,
 		our_pubnonce,
